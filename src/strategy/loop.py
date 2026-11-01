@@ -26,6 +26,8 @@ from __future__ import annotations
 import asyncio
 from typing import TYPE_CHECKING
 
+import structlog
+
 from src.infra.logging import get_logger
 
 if TYPE_CHECKING:
@@ -41,9 +43,12 @@ class DecisionLoop:
         self,
         engine: "StrategyEngine",
         tick_interval_s: float = 0.25,
+        *,
+        market: str = "",
     ) -> None:
         self._engine = engine
         self._tick_interval = max(0.05, float(tick_interval_s))
+        self._market = market or getattr(engine, "market", "")
         self._running = False
         self._task: asyncio.Task[None] | None = None
         # Serializes _evaluate() calls — see module docstring.
@@ -71,6 +76,8 @@ class DecisionLoop:
 
     async def _run(self) -> None:
         """Main loop. Each iteration is one evaluate tick."""
+        if self._market:
+            structlog.contextvars.bind_contextvars(market=self._market)
         try:
             while self._running:
                 try:
@@ -83,6 +90,9 @@ class DecisionLoop:
                 await asyncio.sleep(self._tick_interval)
         except asyncio.CancelledError:
             pass
+        finally:
+            if self._market:
+                structlog.contextvars.clear_contextvars()
 
     async def _tick(self) -> None:
         """Run a single evaluation under the inflight lock.

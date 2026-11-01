@@ -36,10 +36,25 @@ _DATA_DIR = Path(
 # should stay readable).
 VARIANTS: tuple[tuple[str, dict[str, Any]], ...] = (
     ("baseline", {}),
-    ("t4_off", {"tier_notionals": (1.0, 2.0, 4.0, 0.0)}),
-    ("t4_2u", {"tier_notionals": (1.0, 2.0, 4.0, 2.0)}),
-    ("stop_30", {"stop_loss_t4_drop_pct": 0.30}),
+    # 2026-11-01 ladder: 2 / 4 / 8 / 16 USD, no stop-loss in the baseline.
+    ("t4_off", {"tier_notionals": (2.0, 4.0, 8.0, 0.0)}),
+    ("t4_2u", {"tier_notionals": (2.0, 4.0, 8.0, 2.0)}),
+    # The baseline has STOP_LOSS_ENABLED=false; this variant re-enables the
+    # T4 post-entry stop so the "does a stop help?" comparison is real.
+    ("stop_30", {"stop_loss_enabled": True, "stop_loss_t4_drop_pct": 0.30}),
     ("z_1", {"t4_max_strike_z": 1.0}),
+    # Hard stop before T4: caps the full-loss tail of T1-T3. The paper
+    # strategy holds losing ladders to settlement, so this is the main
+    # "can a stop rescue the ladder?" experiment.
+    ("pre_stop_30", {"pre_t4_stop_pct": 0.30}),
+    ("t4_off_pre_stop_30", {
+        "tier_notionals": (2.0, 4.0, 8.0, 0.0),
+        "pre_t4_stop_pct": 0.30,
+    }),
+    ("t1_only_pre_stop_30", {
+        "tier_notionals": (2.0, 0.0, 0.0, 0.0),
+        "pre_t4_stop_pct": 0.30,
+    }),
 )
 
 

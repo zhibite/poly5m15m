@@ -139,3 +139,32 @@ def test_settlement_at_expiry() -> None:
     assert r.pnl > 0
     # 2.563 shares settle at 1.0: 2.563 - 1.0 - fee.
     assert r.pnl == pytest.approx(1 / 0.39 - 1.0 - taker_fee(1 / 0.39, 0.39, 0.07))
+
+
+def test_pre_t4_stop_caps_a_t1_full_loss() -> None:
+    """T1-only + 30% hard stop exits at ~0.27 instead of settling at 0."""
+    p = Params(tier_notionals=(1.0, 0.0, 0.0, 0.0), pre_t4_stop_pct=0.30)
+    r = replay(
+        _window({0: 0.50, 10: 0.39, 100: 0.27, 160: 0.27, 900: 0.27}),
+        p,
+    )
+    assert r.exit == "SL"
+    assert any(f.tier == "SL_PRE" for f in r.fills)
+    # A full expiry loss would be about -1.0; the stop keeps it near -0.39.
+    assert -0.5 < r.pnl < -0.2
+
+
+def test_pre_t4_stop_blocks_a_deeper_tier() -> None:
+    """A 20% hard stop on the full ladder exits before T3."""
+    p = Params(pre_t4_stop_pct=0.20)
+    r = replay(
+        _window({
+            0: 0.50, 10: 0.39,
+            100: 0.32, 120: 0.305, 200: 0.25, 260: 0.25, 900: 0.25,
+        }),
+        p,
+    )
+    assert r.exit == "SL"
+    assert any(f.tier == "SL_PRE" for f in r.fills)
+    assert not any(f.tier == "T3" and f.shares > 0 for f in r.fills)
+    assert not any(f.tier == "T4" and f.shares > 0 for f in r.fills)

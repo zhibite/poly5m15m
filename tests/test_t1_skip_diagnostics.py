@@ -119,23 +119,28 @@ async def test_t1_skip_logs_when_above_price_cap(monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
-async def test_t1_skip_labels_a_price_cap_rejection_as_cap() -> None:
-    """mid between the cap (0.40) and the pre-arm line (0.44) is a cap
-    rejection, not a drift failure (within_limit is True)."""
+async def test_t1_prearms_a_resting_gtd_between_cap_and_trigger_line() -> None:
+    """2026-11-01 GTD model: mid 0.42 is inside the pre-arm band, so T1
+    posts a resting BUY at the 0.40 cap instead of being skipped."""
+    from src.strategy.engine import ActionOpenT1
+
     eng, pc = _make_engine()
     pc.midpoint["UP_TOKEN"] = 0.42  # > ENTRY_PRICE_CAP, <= trigger 0.44
     pc.best_bid["UP_TOKEN"] = 0.42
 
-    seen: dict[str, dict[str, Any]] = {}
+    actions: list[Any] = []
 
-    def capture(reason: str, *, side: str, **fields: Any) -> None:
-        seen[reason] = {"side": side, **fields}
+    async def handler(action: Any) -> None:
+        actions.append(action)
 
-    eng._t1_skip_log = capture  # type: ignore[method-assign]
+    eng._handler = handler  # type: ignore[method-assign]
     await _drive_one_evaluate(eng)
 
-    assert "engine.t1_skip_price_cap" in seen
-    assert "engine.t1_skip_drift" not in seen
+    assert len(actions) == 1
+    assert isinstance(actions[0], ActionOpenT1)
+    assert actions[0].side == "UP"
+    assert actions[0].price == pytest.approx(0.40)
+    assert actions[0].notional == pytest.approx(2.0)
 
 
 @pytest.mark.asyncio

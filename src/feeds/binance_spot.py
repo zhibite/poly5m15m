@@ -106,7 +106,10 @@ class BinanceSpotService:
     SYMBOL = "BTCUSDT"
     HTTP_TIMEOUT = 5.0
 
-    def __init__(self) -> None:
+    def __init__(self, symbol: str | None = None) -> None:
+        # 2026-11-01: one instance per traded asset (BTCUSDT, ETHUSDT, …).
+        # Default keeps the legacy BTC-only construction working.
+        self.SYMBOL = (symbol or self.SYMBOL).upper()
         self._http: Optional[httpx.AsyncClient] = None
         self._cached_price: Optional[float] = None
         self._cached_at: Optional[datetime] = None
@@ -255,13 +258,24 @@ class BinanceFeed:
         cache: BinanceCache,
         ring: RingBuffer,
         on_connect: Optional[Callable[[], None]] = None,
+        *,
+        symbol: str | None = None,
+        url: str | None = None,
     ) -> None:
         self._cache = cache
         self._ring = ring
         self._on_connect = on_connect
         self._running = False
         self._task: asyncio.Task[None] | None = None
-        self._url = cfg().WS_URL
+        # 2026-11-01: multi-asset feeds. `symbol="ETHUSDT"` derives the
+        # Binance trade stream URL; an explicit `url` wins, and neither
+        # keeps the legacy BTCUSDT default from config.toml.
+        if url is None and symbol:
+            url = (
+                "wss://stream.binance.com:9443/ws/"
+                f"{symbol.lower()}@trade"
+            )
+        self._url = url or cfg().WS_URL
         self._base_delay = cfg().RECONNECT_BASE_S
         self._max_delay = cfg().RECONNECT_MAX_S
 

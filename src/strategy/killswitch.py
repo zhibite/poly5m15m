@@ -158,10 +158,25 @@ async def engage(state: Any, reason: str = "dashboard") -> dict[str, Any]:
         except Exception as exc:  # noqa: BLE001
             log.warning("killswitch.stop_watchers_failed", error=str(exc))
 
+    # Paper mode (2026-11-01): cancel every market's resting paper GTDs.
+    markets = getattr(state, "markets", None) or {}
+    for rt in list(markets.values()):
+        broker = getattr(rt, "broker", None)
+        if broker is None:
+            continue
+        try:
+            cancelled += await broker.cancel_all_open(reason="killswitch")
+        except Exception as exc:  # noqa: BLE001
+            log.warning(
+                "killswitch.paper_cancel_failed",
+                market=getattr(rt, "key", "?"),
+                error=str(exc),
+            )
+
     om = getattr(state, "order_manager", None)
     if om is not None:
         try:
-            cancelled = await om.cancel_all_open(reason="killswitch")
+            cancelled += await om.cancel_all_open(reason="killswitch")
         except Exception as exc:  # noqa: BLE001
             log.warning("killswitch.cancel_failed", error=str(exc))
 

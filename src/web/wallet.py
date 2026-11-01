@@ -46,7 +46,12 @@ async def wallet_snapshot(state: Any, force: bool = False) -> dict[str, Any]:
     ):
         return _cache["data"]
 
+    from src.config import strategy as _strategy
+
     clob = getattr(state, "clob", None)
+    # Only the real paper runtime (no CLOB client at all) gets the paper
+    # message; a configured-but-empty client still reports "未配置".
+    paper = bool(getattr(_strategy(), "PAPER_TRADING", False)) and clob is None
     configured = bool(
         clob is not None
         and getattr(clob, "is_configured", lambda: False)()
@@ -54,6 +59,7 @@ async def wallet_snapshot(state: Any, force: bool = False) -> dict[str, Any]:
 
     data: dict[str, Any] = {
         "configured": configured,
+        "paper": paper,
         "funder": _funder(clob) if clob is not None else "",
         "signature_type": _signature_type(clob) if clob is not None else 0,
         "balance_usd": None,
@@ -65,7 +71,11 @@ async def wallet_snapshot(state: Any, force: bool = False) -> dict[str, Any]:
     }
 
     if not configured:
-        data["error"] = "CLOB 未配置（缺少 API 凭证）"
+        data["error"] = (
+            "纸盘模式：不连接 CLOB、不使用真实资金"
+            if paper
+            else "CLOB 未配置（缺少 API 凭证）"
+        )
         _cache.update(ts=now, data=data)
         return data
 

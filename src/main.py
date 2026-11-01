@@ -42,6 +42,7 @@ from src.execution.clob_client import CLOBClient
 from src.execution.gtd_expiry_watcher import GtdExpiryWatcher
 from src.execution.heartbeat import HeartbeatLoop
 from src.execution.order_manager import OrderManager
+from src.execution.paper_broker import PaperBroker
 from src.execution.tier_watcher import TierWatcher, WatcherResult
 from src.feeds.binance_spot import BinanceCache, BinanceFeed, BinanceSpotService, RingBuffer
 from src.infra.logging import configure_logging, get_logger
@@ -50,6 +51,13 @@ from src.market.pm_client import PolymarketClient
 from src.market.window_manager import WindowManager
 from src.market.market_ws import MarketWS, PriceCache
 from src.market.user_ws import UserWS
+from src.markets import (
+    MarketSpec,
+    configured_assets,
+    default_market_key,
+    market_spec,
+    market_specs,
+)
 from src.persistence.db import DB, init_db
 from src.strategy.engine import (
     Action,
@@ -231,6 +239,18 @@ class AppState:
         self.ring = RingBuffer(retention_s=binance().BUFFER_RETENTION_S)
         self.db_conn = init_db()
         self.db = DB(self.db_conn)
+        # ── Multi-market paper runtime (2026-11-01) ──────────────────────
+        # One runtime per (asset, interval). `engine` / `wm` below remain
+        # aliases for the preferred market so legacy single-market code
+        # (wallet card, killswitch fallbacks, older tests) keeps working.
+        self.markets: dict[str, "MarketRuntime"] = {}
+        self.asset_caches: dict[str, BinanceCache] = {}
+        self.asset_rings: dict[str, RingBuffer] = {}
+        self.asset_feeds: dict[str, BinanceFeed] = {}
+        self.asset_spot: dict[str, BinanceSpotService] = {}
+        self.decision_loops: list[DecisionLoop] = []
+        self.paper_brokers: list[PaperBroker] = []
+        self.active_tokens: set[str] = set()  # currently subscribed UP/DOWN tokens
         self.current_market = None   # MarketInfo | None
         self.engine: StrategyEngine | None = None
         self.binance_feed: BinanceFeed | None = None
@@ -262,6 +282,224 @@ class AppState:
 
 
 STATE = AppState()
+
+
+# ---------------------------------------------------------------------------
+# Multi-market paper runtime (2026-11-01)
+# ---------------------------------------------------------------------------
+
+
+class MarketRuntime:
+    """Everything that belongs to one (asset, interval) paper market."""
+
+    def __init__(
+        self,
+        spec: MarketSpec,
+        *,
+        wm: WindowManager,
+        market_svc: MarketService,
+        engine: StrategyEngine,
+        broker: PaperBroker,
+        binance_cache: BinanceCache,
+    ) -> None:
+        self.spec = spec
+        self.key = spec.key
+        self.wm = wm
+        self.market_svc = market_svc
+        self.engine = engine
+        self.broker = broker
+        self.binance_cache = binance_cache
+        self.round_start_ts: int = 0
+        self.current_market = None
+
+    def __repr__(self) -> str:  # pragma: no cover - diagnostics only
+        return f"<MarketRuntime {self.key}>"
+
+
+def _on_window_baseline_rt(
+    rt: MarketRuntime,
+    asset: str,
+    price: float,
+    source: str,
+    round_start_ts: int = 0,
+) -> None:
+    """Seed one engine's BTC/underlying drift baseline."""
+    eng = rt.engine
+    if eng is None or price <= 0:
+        return
+    target_round_ts = round_start_ts or rt.round_start_ts
+    if getattr(eng, "_last_applied_baseline_round_ts", None) == target_round_ts:
+        return
+    eng.set_binance_baseline(price)
+    eng._last_applied_baseline_round_ts = target_round_ts
+    log.info(
+        "gate.baseline_applied",
+        market=rt.key,
+        asset=asset,
+        baseline=price,
+        source=source,
+        round_start_ts=target_round_ts,
+        spot_now=rt.binance_cache.last_price,
+    )
+
+
+def _on_market_discovered_rt(rt: MarketRuntime, asset: str, mkt) -> None:
+    """Per-market market discovery hook (paper mode)."""
+    state = STATE
+    prev = rt.current_market
+    if prev is not None and prev.condition_id != mkt.condition_id:
+        for old_t in (prev.token_up_id, prev.token_down_id):
+            if old_t and old_t not in (mkt.token_up_id, mkt.token_down_id):
+                state.price_cache.clear_token(old_t)
+    rt.current_market = mkt
+
+    if state.market_ws:
+        old_tokens: set[str] = set()
+        if prev is not None and prev.condition_id != mkt.condition_id:
+            old_tokens = {
+                t for t in (prev.token_up_id, prev.token_down_id) if t
+            }
+        state.active_tokens = (state.active_tokens - old_tokens) | {
+            t for t in (mkt.token_up_id, mkt.token_down_id) if t
+        }
+        try:
+            # Subscribe FIRST: set_active_tokens replaces the pending set,
+            # and subscribe_tokens skips ids already present.
+            state.market_ws.subscribe_tokens(
+                [mkt.token_up_id, mkt.token_down_id]
+            )
+            state.market_ws.set_active_tokens(state.active_tokens)
+        except Exception as exc:  # noqa: BLE001
+            log.warning(
+                "market.subscribe_failed",
+                market=rt.key,
+                cid=(mkt.condition_id or "")[:16],
+                error=str(exc),
+            )
+
+    # Late-bound market: the round may already exist without tokens.
+    try:
+        rt.engine.attach_market(mkt)
+    except Exception:
+        log.exception(
+            "market.attach_market_failed",
+            market=rt.key,
+            cid=(mkt.condition_id or "")[:16],
+        )
+
+    ctx = rt.wm.get(rt.spec.asset)
+    if (
+        ctx is not None
+        and ctx.skip_until_next_window
+        and rt.engine._round is not None
+        and not rt.engine._round.skip_reason
+    ):
+        rt.engine._round.skip_reason = "window_precheck"
+
+    round_ts = mkt.round_start_ts or rt.round_start_ts
+    if round_ts:
+        rt.broker.set_round_meta(round_ts, mkt)
+
+    log.info(
+        "market.discovered",
+        market=rt.key,
+        slug=mkt.slug or "",
+        cid=(mkt.condition_id or "")[:16],
+        up=(mkt.token_up_id or "")[:16],
+        down=(mkt.token_down_id or "")[:16],
+        round_start_ts=round_ts,
+    )
+
+
+async def _on_new_round_rt(rt: MarketRuntime, round_start_ts: int) -> None:
+    """Per-market round rollover: cancel paper orders, rotate engine state."""
+    prev = rt.round_start_ts
+    if prev > 0:
+        try:
+            cancelled = await rt.broker.cancel_round(prev)
+            if cancelled:
+                log.info(
+                    "paper.round_orders_cancelled",
+                    market=rt.key,
+                    round_start_ts=prev,
+                    count=cancelled,
+                )
+        except Exception as exc:  # noqa: BLE001
+            log.warning(
+                "paper.cancel_round_failed", market=rt.key, error=str(exc)
+            )
+        try:
+            await rt.engine.on_round_end()
+        except Exception:
+            log.exception("engine.round_end_failed", market=rt.key)
+        try:
+            STATE.db.finish_round(prev, market=rt.key)
+        except Exception as exc:  # noqa: BLE001
+            log.warning(
+                "round.finish_failed", market=rt.key, error=str(exc)
+            )
+        log.info(
+            "round.transition",
+            market=rt.key,
+            prev_round_start=prev,
+            new_round_start=round_start_ts,
+        )
+
+    rt.round_start_ts = int(round_start_ts)
+
+    # Runtime config edits (T1 windows, T4 time gates) apply next round.
+    try:
+        fresh = market_spec(rt.spec.asset, rt.spec.interval, strategy())
+        rt.spec = fresh
+        rt.engine._t1_entry_window_override = fresh.t1_entry_window_s
+        rt.engine._t4_min_remaining_override = fresh.t4_min_remaining_s
+        rt.engine._t4_bypass_min_remaining_override = (
+            fresh.t4_drift_bypass_min_remaining_s
+        )
+    except Exception as exc:  # noqa: BLE001
+        log.warning("round.spec_refresh_failed", market=rt.key, error=str(exc))
+
+    mkt = None
+    ctx = rt.wm.get(rt.spec.asset) if rt.wm else None
+    candidate = ctx.market if ctx else None
+    if (
+        candidate is not None
+        and candidate.round_start_ts
+        and int(candidate.round_start_ts) != int(round_start_ts)
+    ):
+        log.warning(
+            "round.stale_market_rejected",
+            market=rt.key,
+            round_start_ts=round_start_ts,
+            stale_market_round_ts=candidate.round_start_ts,
+        )
+        candidate = None
+    mkt = candidate
+    rt.current_market = mkt
+    if mkt is None:
+        log.warning(
+            "round.market_not_found",
+            market=rt.key,
+            round_start_ts=round_start_ts,
+            note="waiting for discovery retry; engine starts without tokens",
+        )
+
+    await rt.engine.on_new_round(round_start_ts, mkt)
+
+    if (
+        ctx is not None
+        and ctx.skip_until_next_window
+        and rt.engine._round is not None
+    ):
+        rt.engine._round.skip_reason = "window_precheck"
+        log.warning(
+            "round.skip",
+            market=rt.key,
+            round_start_ts=round_start_ts,
+            reason="window_precheck",
+        )
+
+    rt.broker.begin_round(round_start_ts, mkt)
 
 
 # ---------------------------------------------------------------------------
@@ -2244,8 +2482,10 @@ async def _resolve_rounds_once(
     if pm is None or db is None:
         return 0
 
-    period = int(general().ROUND_PERIOD_S)
-    before_ts = int(time.time() - period - _RESOLUTION_GRACE_S)
+    now = time.time()
+    # Query anything older than the SHORTEST window; the per-row check
+    # below then enforces each market's own 300 s / 900 s period.
+    before_ts = int(now - 300 - _RESOLUTION_GRACE_S)
     try:
         rows = db.unresolved_rounds(
             before_ts=before_ts,
@@ -2257,16 +2497,28 @@ async def _resolve_rounds_once(
         return 0
 
     resolved_count = 0
-    for round_ts, cid, slug, up_token, down_token in rows:
+    for row in rows:
+        # Real DB rows carry (round_ts, cid, slug, up, down, market,
+        # asset, interval); older test/legacy stubs only the first five.
+        if len(row) >= 8:
+            round_ts, cid, slug, up_token, down_token, market, _asset, interval = row
+        else:
+            round_ts, cid, slug, up_token, down_token = row[:5]
+            market, interval = "BTC-15m", "15m"
+        market = str(market or "BTC-15m")
+        period_s = 300 if str(interval or "15m") == "5m" else 900
+        if float(round_ts) + period_s + _RESOLUTION_GRACE_S > now:
+            continue  # window not finished yet (5m rows appear quickly)
         # Both token ids are required to attribute the held side. Rows
         # written by very old builds may lack them; they cannot be
         # settled from Gamma's UP/DOWN outcome alone.
         if not up_token or not down_token:
             continue
-        tries = attempts.get(round_ts, 0)
+        key: object = round_ts if len(row) < 8 else (market, int(round_ts))
+        tries = attempts.get(key, 0)
         if tries >= _RESOLUTION_MAX_ATTEMPTS:
             continue
-        attempts[round_ts] = tries + 1
+        attempts[key] = tries + 1
         try:
             res = await asyncio.wait_for(
                 pm.get_market_resolution(cid, slug=slug or None),
@@ -2277,6 +2529,7 @@ async def _resolve_rounds_once(
         except Exception as exc:  # noqa: BLE001
             log.warning(
                 "round.resolve.failed",
+                market=market,
                 round_start_ts=round_ts, cid=(cid or "")[:12], error=str(exc),
             )
             continue
@@ -2284,17 +2537,24 @@ async def _resolve_rounds_once(
             continue
         up_won = bool(res.get("up_wins"))
         try:
-            db.set_round_resolution(round_ts, up_won)
+            if len(row) >= 8:
+                db.set_round_resolution(
+                    round_ts, up_won, market=market
+                )
+            else:
+                db.set_round_resolution(round_ts, up_won)
         except Exception as exc:  # noqa: BLE001
             log.warning(
                 "round.resolve.persist_failed",
+                market=market,
                 round_start_ts=round_ts, error=str(exc),
             )
             continue
-        attempts.pop(round_ts, None)
+        attempts.pop(key, None)
         resolved_count += 1
         log.info(
             "round.resolved",
+            market=market,
             round_start_ts=round_ts,
             slug=slug or "",
             up_won=up_won,
@@ -2304,7 +2564,9 @@ async def _resolve_rounds_once(
     # Bound the attempts map on a long-lived process.
     if len(attempts) > 500:
         cutoff = int(time.time()) - _RESOLUTION_LOOKBACK_S
-        for ts in [t for t in attempts if t < cutoff]:
+        for ts in [t for t in attempts if (
+            (t[1] if isinstance(t, tuple) else t) < cutoff
+        )]:
             attempts.pop(ts, None)
     return resolved_count
 
@@ -2582,6 +2844,370 @@ async def _status_loop() -> None:
 # ---------------------------------------------------------------------------
 
 async def main() -> None:
+    """Entry point: paper (default) or the legacy live stack."""
+    configure_logging()
+    try:
+        from src.web.runtime_config import apply_persisted_overrides
+
+        apply_persisted_overrides()
+    except Exception as exc:  # noqa: BLE001
+        log.warning("config.runtime_overrides_failed", error=str(exc))
+
+    if strategy().PAPER_TRADING:
+        await _main_paper()
+    else:
+        await _main_live()
+
+
+async def _paper_tick_loop(state: AppState) -> None:
+    """Drive every paper broker's resting-order fill simulation."""
+    import structlog
+
+    while True:
+        for broker in list(state.paper_brokers):
+            structlog.contextvars.bind_contextvars(market=broker.market)
+            try:
+                broker.tick()
+            except Exception:  # noqa: BLE001
+                log.exception("paper.tick_failed", market=broker.market)
+            finally:
+                structlog.contextvars.clear_contextvars()
+        # 100 ms: keep the paper fill check ahead of the engine's 250 ms
+        # cancel sweep, so a GTD whose limit the mid crossed fills at its
+        # limit instead of being cancelled into a deeper re-arm.
+        await asyncio.sleep(0.1)
+
+
+async def _midpoint_poll_loop_multi(state: AppState) -> None:
+    """Refresh the REST midpoint for every market's UP/DOWN tokens.
+
+    One shared loop keeps request volume bounded: 14 markets × 2 tokens,
+    staggered by 50 ms, on a ~2 s cycle. The strategy engines read the
+    cache only.
+    """
+    while True:
+        started = time.time()
+        pm = state.pm_client
+        if pm is None:
+            await asyncio.sleep(2.0)
+            continue
+        for rt in list(state.markets.values()):
+            mkt = rt.current_market
+            if not mkt or not mkt.token_up_id or not mkt.token_down_id:
+                continue
+            try:
+                up_mid, down_mid = await asyncio.gather(
+                    pm.get_midpoint(mkt.token_up_id),
+                    pm.get_midpoint(mkt.token_down_id),
+                )
+                if up_mid > 0:
+                    state.price_cache.midpoint[mkt.token_up_id] = up_mid
+                if down_mid > 0:
+                    state.price_cache.midpoint[mkt.token_down_id] = down_mid
+            except Exception as exc:  # noqa: BLE001
+                log.debug(
+                    "midpoint.poll_failed", market=rt.key, error=str(exc)
+                )
+            await asyncio.sleep(0.05)
+        elapsed = time.time() - started
+        await asyncio.sleep(max(0.5, 2.0 - elapsed))
+
+
+def _market_status_line(rt: MarketRuntime) -> str:
+    eng = rt.engine
+    rs = getattr(eng, "_round", None) if eng else None
+    mkt = rt.current_market
+    up_last = down_last = 0.0
+    if mkt:
+        up_last = STATE.price_cache.get_midpoint(mkt.up_token)
+        down_last = STATE.price_cache.get_midpoint(mkt.down_token)
+    period_s = rt.wm.window_period_s() if rt.wm else rt.spec.window_sec
+    remain_s = max(0.0, min(float(period_s), rt.wm.seconds_until_next())) if rt.wm else 0.0
+    entry_s = float(rt.spec.t1_entry_window_s)
+    elapsed_s = max(0.0, period_s - remain_s)
+    phase = "END" if remain_s < 1.0 else (
+        "IN_T1" if elapsed_s <= entry_s else "PAST_T1"
+    )
+    base = (
+        f"[{rt.key}] round={getattr(rs, 'round_start_ts', None)} "
+        f"{phase} remain={remain_s:.0f}s/{period_s:.0f}s "
+        f"UP={up_last:.4f} DOWN={down_last:.4f}"
+    )
+    pos = getattr(rs, "position", None) if rs else None
+    if pos is None or pos.total_qty <= 1e-9:
+        return base
+    tiers = ",".join(
+        f"T{t.tier}={'✓' if t.is_complete else ('⏳' if t.placed else '○')}"
+        for t in pos.tiers
+    )
+    held_mid = up_last if pos.entry_side == "UP" else down_last
+    upnl = (held_mid - pos.avg_cost) * pos.total_qty if held_mid > 0 else 0.0
+    return (
+        f"{base} side={pos.entry_side} tiers=[{tiers}] "
+        f"qty={pos.total_qty:.2f} avg={pos.avg_cost:.4f} "
+        f"cost=${pos.total_cost:.2f} mid={held_mid:.4f} uPnL=${upnl:+.2f}"
+    )
+
+
+async def _status_loop_multi(state: AppState) -> None:
+    """Compact STATUS line per market every 5 s."""
+    while True:
+        await asyncio.sleep(5.0)
+        ks = getattr(state, "killswitch", None)
+        stop = " [STOPPED]" if ks is not None and ks.active else ""
+        for rt in list(state.markets.values()):
+            try:
+                log.info(f"STATUS{stop}  {_market_status_line(rt)}")
+            except Exception as exc:  # noqa: BLE001
+                log.debug("status.render_failed", market=rt.key, error=str(exc))
+
+
+async def _main_paper() -> None:
+    """Start the multi-asset paper bot (no CLOB orders, no real money)."""
+    s = STATE
+    cfg = strategy()
+    log.info(
+        "bot.starting",
+        version="0.1.0",
+        mode="paper",
+        assets=configured_assets(cfg),
+        tier_notionals=cfg.tier_notionals,
+        stop_loss=cfg.STOP_LOSS_ENABLED,
+    )
+    if cfg.PAUSE_NEW_ENTRIES:
+        log.warning(
+            "paper.entries_paused",
+            note="PAUSE_NEW_ENTRIES=true — no T1/averaging will be placed. "
+                 "Clear it on /config (or in data/runtime_config.json) to "
+                 "let the paper bot trade.",
+        )
+    if s.killswitch is not None and s.killswitch.active:
+        log.warning(
+            "paper.killswitch_active",
+            since=s.killswitch.since,
+            reason=s.killswitch.reason,
+            note="emergency stop was restored from disk — release it on the "
+                 "dashboard (恢复运行) or delete data/emergency_stop.json",
+        )
+
+    # Public market data only — no credentials / heartbeat / user WS.
+    s.clob = None
+    s.user_ws = None
+    s.order_manager = None
+    s.heartbeat = None
+    s.gtd_expiry = None
+    s.router = None
+
+    s.pm_client = PolymarketClient(
+        gamma_api=cfg.GAMMA_API,
+        polymarket_host=cfg.POLYMARKET_HOST,
+    )
+    s.market_ws = MarketWS(cache=s.price_cache, on_connect=None, on_disconnect=None)
+    await s.market_ws.start()
+
+    # One Binance trade feed per asset (drift gate + T4 strike gate).
+    for asset in configured_assets(cfg):
+        cache = BinanceCache()
+        ring = RingBuffer(retention_s=binance().BUFFER_RETENTION_S)
+        spot = BinanceSpotService(symbol=f"{asset}USDT")
+        feed = BinanceFeed(cache=cache, ring=ring, symbol=f"{asset}USDT")
+        s.asset_caches[asset] = cache
+        s.asset_rings[asset] = ring
+        s.asset_spot[asset] = spot
+        s.asset_feeds[asset] = feed
+        try:
+            await feed.start()
+        except Exception as exc:  # noqa: BLE001
+            log.warning("binance_feed.start_failed", asset=asset, error=str(exc))
+
+    if "BTC" in s.asset_caches:
+        s.binance_cache = s.asset_caches["BTC"]
+        s.binance_feed = s.asset_feeds.get("BTC")
+    else:
+        first_asset = next(iter(s.asset_caches))
+        s.binance_cache = s.asset_caches[first_asset]
+        s.binance_feed = s.asset_feeds.get(first_asset)
+
+    specs = market_specs(cfg)
+    for spec in specs:
+        key = spec.key
+        cache = s.asset_caches[spec.asset]
+        svc = MarketService(
+            pm=s.pm_client,
+            threshold=0.5,
+            slug_interval=spec.slug_interval,
+            window_sec=spec.window_sec,
+        )
+        broker = PaperBroker(
+            market=key,
+            asset=spec.asset,
+            interval=spec.interval,
+            price_cache=s.price_cache,
+            db=s.db,
+            killswitch=s.killswitch,
+            t1_entry_window_s=spec.t1_entry_window_s,
+        )
+        engine = StrategyEngine(
+            cache,
+            s.price_cache,
+            broker,
+            killswitch=s.killswitch,
+            t1_entry_window_s=spec.t1_entry_window_s,
+            t4_min_remaining_s=spec.t4_min_remaining_s,
+            t4_drift_bypass_min_remaining_s=(
+                spec.t4_drift_bypass_min_remaining_s
+            ),
+            market=key,
+        )
+        broker.engine = engine
+
+        async def _on_new(ts: int, _key: str = key) -> None:
+            rt = s.markets.get(_key)
+            if rt is not None:
+                await _on_new_round_rt(rt, ts)
+
+        def _on_mkt(asset: str, mkt, _key: str = key) -> None:
+            rt = s.markets.get(_key)
+            if rt is not None:
+                _on_market_discovered_rt(rt, asset, mkt)
+
+        def _on_base(
+            asset: str,
+            price: float,
+            source: str,
+            round_ts: int = 0,
+            _key: str = key,
+        ) -> None:
+            rt = s.markets.get(_key)
+            if rt is not None:
+                _on_window_baseline_rt(rt, asset, price, source, round_ts)
+
+        wm = WindowManager(
+            market_svc=svc,
+            symbols=[spec.asset],
+            on_new_round=_on_new,
+            on_market_discovered=_on_mkt,
+            binance_spot=s.asset_spot.get(spec.asset),
+            entry_cfg=cfg,
+            round_period_s=spec.window_sec,
+            on_window_baseline=_on_base,
+            sync_prices=False,
+            retry_interval_s=15.0,
+        )
+        rt = MarketRuntime(
+            spec,
+            wm=wm,
+            market_svc=svc,
+            engine=engine,
+            broker=broker,
+            binance_cache=cache,
+        )
+        s.markets[key] = rt
+        s.paper_brokers.append(broker)
+        s.decision_loops.append(
+            DecisionLoop(engine, tick_interval_s=0.25, market=key)
+        )
+        log.info(
+            "paper.market_registered",
+            market=key,
+            window_s=spec.window_sec,
+            t1_entry_window_s=spec.t1_entry_window_s,
+            t4_min_remaining_s=spec.t4_min_remaining_s,
+        )
+
+    default_key = default_market_key(cfg)
+    default_rt = s.markets.get(default_key) or next(iter(s.markets.values()))
+    s.engine = default_rt.engine
+    s.wm = default_rt.wm
+    s.round_start_ts = default_rt.round_start_ts
+    s.current_market = default_rt.current_market
+
+    # Start window discovery with a small stagger so 14 boundary loops do
+    # not fire their Gamma lookups in the same millisecond.
+    for rt in list(s.markets.values()):
+        try:
+            await rt.wm.start()
+        except Exception as exc:  # noqa: BLE001
+            log.warning("window_mgr.start_failed", market=rt.key, error=str(exc))
+        await asyncio.sleep(0.2)
+    for loop in s.decision_loops:
+        loop.start()
+
+    paper_task = asyncio.create_task(_paper_tick_loop(s), name="paper-tick")
+    status_task = asyncio.create_task(_status_loop_multi(s), name="status")
+    midpoint_task = asyncio.create_task(
+        _midpoint_poll_loop_multi(s), name="midpoint-poll"
+    )
+    resolution_task = asyncio.create_task(_resolution_loop(), name="resolution")
+    web_task = _start_dashboard()
+
+    # Backtest runs on BTC-15m research data only; harmless in paper mode.
+    try:
+        from src.config import backtest as _backtest_cfg
+        from src.backtest.runner import get_manager as _get_backtest_manager
+
+        bt = _backtest_cfg()
+        if bt.BACKTEST_ENABLED and bt.BACKTEST_COLLECT_ON_START:
+            started = _get_backtest_manager().start(
+                days=int(bt.BACKTEST_COLLECT_DAYS),
+                refresh=False,
+                variants=bool(bt.BACKTEST_AUTO_VARIANTS),
+            )
+            if started:
+                log.info(
+                    "backtest.job_started",
+                    days=int(bt.BACKTEST_COLLECT_DAYS),
+                    variants=bool(bt.BACKTEST_AUTO_VARIANTS),
+                )
+    except Exception as exc:  # noqa: BLE001
+        log.warning("backtest.job_start_failed", error=str(exc))
+
+    def _signal_handler() -> None:
+        log.info("bot.shutdown_signal_received")
+        s._shutdown.set()
+
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop.add_signal_handler(sig, _signal_handler)
+        except (NotImplementedError, OSError):
+            pass
+
+    await s._shutdown.wait()
+
+    log.info("bot.shutdown_initiated")
+    for task in (status_task, midpoint_task, resolution_task, paper_task):
+        task.cancel()
+    if web_task is not None:
+        web_task.cancel()
+        try:
+            await web_task
+        except asyncio.CancelledError:
+            pass
+        except Exception as exc:  # noqa: BLE001
+            log.warning("web.stop_failed", error=str(exc))
+    for loop in s.decision_loops:
+        await loop.stop()
+    for broker in list(s.paper_brokers):
+        try:
+            await broker.cancel_all_open(reason="shutdown")
+        except Exception:  # noqa: BLE001
+            pass
+    for rt in list(s.markets.values()):
+        await rt.wm.stop()
+    if s.market_ws:
+        await s.market_ws.stop()
+    for feed in list(s.asset_feeds.values()):
+        await feed.stop()
+    for spot in list(s.asset_spot.values()):
+        await spot.close()
+    if s.pm_client:
+        await s.pm_client.close()
+    s.db_conn.close()
+    log.info("bot.shutdown_complete")
+
+
+async def _main_live() -> None:
     configure_logging()
     s = STATE
     log.info("bot.starting", version="0.1.0")

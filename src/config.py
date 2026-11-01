@@ -120,19 +120,37 @@ class StrategySettings(BaseSettings):
     POLYMARKET_HOST: str = "https://clob.polymarket.com"
     POLYGON_RPC_URL: str = "https://polygon-bor.publicnode.com"
 
+    # ── Paper / multi-market mode (2026-11-01) ───────────────────────────
+    # All trading is simulated locally: no CLOB POST, no real money. Every
+    # configured asset/interval runs its own strategy engine against live
+    # Polymarket prices and a local GTD fill model (see paper_broker.py).
+    PAPER_TRADING: bool = True
+    TRADE_ASSETS: str = "BTC,ETH,BNB,DOGE,SOL,XRP,HYPE"
+    ENABLE_5M_MARKETS: bool = True
+    ENABLE_15M_MARKETS: bool = True
+    # 5-minute windows only allow T1 in the first minute (operator spec
+    # 2026-11-01). The 15-minute series keeps T1_ENTRY_WINDOW_S below.
+    T1_ENTRY_WINDOW_5M_S: float = 60.0
+
     # ── Martingale tiers (USD notional per tier) ─────────────────────────
     # Four-layer budget: T1 entry followed by three averaging orders.
-    # Maximum planned exposure per round is 1 + 2 + 4 + 8 = 15 USD.
-    # T1 is a taker (market) buy: at 1 USD the share count is below the
-    # 5-share minimum that applies to resting GTDs, so it must cross the
-    # book. T2-T4 remain maker GTDs (their notionals always buy >=5 shares).
-    TIER1_NOTIONAL: float = 1.0
-    TIER2_NOTIONAL: float = 2.0
-    TIER3_NOTIONAL: float = 4.0
-    TIER4_NOTIONAL: float = 8.0
+    # Maximum planned exposure per round is 2 + 4 + 8 + 16 = 30 USD.
+    # Every tier is a GTD BUY at its strategy price. Paper mode fills a
+    # resting order as maker; one that is marketable at placement crosses
+    # as taker (taker fee applies).
+    TIER1_NOTIONAL: float = 2.0
+    TIER2_NOTIONAL: float = 4.0
+    TIER3_NOTIONAL: float = 8.0
+    TIER4_NOTIONAL: float = 16.0
 
     # ── Strategy thresholds ───────────────────────────────────────────────
     ENTRY_PRICE_CAP: float = 0.40      # max token price to enter
+    # 2026-11-01: T1 is a resting GTD BUY at ENTRY_PRICE_CAP (operator
+    # spec: "all tiers are GTD orders"). It is pre-armed while the mid is
+    # within PRICE_PRE_MARGIN of the cap and fills when the mid crosses
+    # the cap. Set False for the legacy "only place when mid <= cap"
+    # behaviour (which made T1 marketable at placement).
+    T1_GTD_ENABLED: bool = True
     TIER2_DROP_PCT: float = 0.20       # T2 triggers at baseline * (1 - 20%)
     TIER3_DROP_PCT: float = 0.40       # T3 triggers at baseline * (1 - 40%)
     TIER4_DROP_PCT: float = 0.60       # T4 triggers at baseline * (1 - 60%)
@@ -143,12 +161,13 @@ class StrategySettings(BaseSettings):
     TP_MIN_PCT: float = 0.05             # floor (5%) so TP can never lock in a loss
     BASELINE_DRIFT_LIMIT: float = 0.0015  # 0.15% BTC spot drift cap
 
-    # ── T4 post-entry stop-loss (operator decision 2026-10-31) ────────────
-    # Once T4 has filled, the round is at max planned exposure and a
-    # continuing collapse is no longer a dip the ladder can average into.
-    # Stage 1 sells a fraction at a confirmed drop below T4's fill price;
-    # stage 2 exits the remainder on a deeper drop or near expiry.
-    STOP_LOSS_ENABLED: bool = True
+    # ── T4 post-entry stop-loss ───────────────────────────────────────────
+    # Operator decision 2026-11-01: the paper strategy has NO stop-loss.
+    # A losing full ladder is held to settlement and booked as a full loss
+    # on the dashboard (到期结算), exactly as a binary position resolves.
+    # The remaining STOP_LOSS_* knobs are kept for the live/research path
+    # but are inert while this flag is false.
+    STOP_LOSS_ENABLED: bool = False
     # Trigger line = T4 average fill price × (1 − this). 0.45 → 0.55×.
     STOP_LOSS_T4_DROP_PCT: float = 0.45
     # The mid must stay below the stage-1 line for this long before selling

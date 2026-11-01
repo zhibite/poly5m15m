@@ -26,6 +26,10 @@ def configure_logging() -> None:
     structlog.configure(
         wrapper_class=structlog.make_filtering_bound_logger(level),
         processors=[
+            # 2026-11-01 multi-market paper bot: the decision loop binds
+            # `market=BTC-15m` (etc.) as a task-local context var, so every
+            # engine/executor log line is attributable to one market.
+            structlog.contextvars.merge_contextvars,
             structlog.stdlib.filter_by_level,
             structlog.stdlib.add_logger_name,
             structlog.stdlib.add_log_level,

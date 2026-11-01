@@ -278,17 +278,60 @@ async def api_health() -> dict[str, Any]:
     return {"status": "ok", "ts": int(time.time())}
 
 
+@app.get("/api/markets")
+async def api_markets(_: None = Depends(_require_auth)) -> dict[str, Any]:
+    """List the live paper markets for the dashboard switcher."""
+    from src.markets import default_market_key
+
+    state = _state()
+    runtimes = getattr(state, "markets", None) or {}
+    out: list[dict[str, Any]] = []
+    for key, rt in runtimes.items():
+        spec = getattr(rt, "spec", None)
+        eng = getattr(rt, "engine", None)
+        rs = getattr(eng, "_round", None) if eng else None
+        pos = getattr(rs, "position", None) if rs else None
+        out.append({
+            "key": key,
+            "asset": getattr(spec, "asset", "BTC"),
+            "interval": getattr(spec, "interval", "15m"),
+            "window_s": int(getattr(spec, "window_sec", 900)),
+            "t1_entry_window_s": float(
+                getattr(spec, "t1_entry_window_s", 300.0)
+            ),
+            "round_start_ts": getattr(rs, "round_start_ts", None),
+            "has_position": bool(pos is not None and pos.total_qty > 1e-9),
+        })
+    out.sort(key=lambda m: (m["interval"] != "15m", m["asset"]))
+    default_key = default_market_key()
+    if runtimes and default_key not in runtimes:
+        default_key = next(iter(runtimes))
+    return {
+        "markets": out,
+        "default": default_key,
+        "paper": bool(getattr(status_mod._strategy(), "PAPER_TRADING", False)),
+    }
+
+
 @app.get("/api/status")
-async def api_status(_: None = Depends(_require_auth)) -> dict[str, Any]:
-    return status_mod.build_status(_state())
+async def api_status(
+    market: str | None = Query(None),
+    _: None = Depends(_require_auth),
+) -> dict[str, Any]:
+    return status_mod.build_status(_state(), market=market)
 
 
 @app.get("/api/rounds")
 async def api_rounds(
     limit: int = Query(50, ge=1, le=500),
+    market: str | None = Query(None),
+    asset: str | None = Query(None),
+    interval: str | None = Query(None),
     _: None = Depends(_require_auth),
 ) -> dict[str, Any]:
-    rounds = status_mod.rounds_with_pnl(_conn(), limit)
+    rounds = status_mod.rounds_with_pnl(
+        _conn(), limit, market=market, asset=asset, interval=interval
+    )
     return {"rounds": rounds, "stats": status_mod.compute_stats(rounds)}
 
 
@@ -296,12 +339,19 @@ async def api_rounds(
 async def api_fills(
     limit: int = Query(200, ge=1, le=2000),
     offset: int = Query(0, ge=0),
+    market: str | None = Query(None),
+    asset: str | None = Query(None),
+    interval: str | None = Query(None),
     _: None = Depends(_require_auth),
 ) -> dict[str, Any]:
     conn = _conn()
     return {
-        "fills": status_mod.recent_fills(conn, limit, offset),
-        "total": status_mod.count_fills(conn),
+        "fills": status_mod.recent_fills(
+            conn, limit, offset, market=market, asset=asset, interval=interval
+        ),
+        "total": status_mod.count_fills(
+            conn, market=market, asset=asset, interval=interval
+        ),
         "limit": int(limit),
         "offset": int(offset),
     }
@@ -310,26 +360,37 @@ async def api_fills(
 @app.get("/api/trades")
 async def api_trades(
     limit: int = Query(100, ge=1, le=500),
+    market: str | None = Query(None),
+    asset: str | None = Query(None),
+    interval: str | None = Query(None),
     _: None = Depends(_require_auth),
 ) -> dict[str, Any]:
     conn = _conn()
-    rounds = status_mod.rounds_with_pnl(conn, limit)
+    rounds = status_mod.rounds_with_pnl(
+        conn, limit, market=market, asset=asset, interval=interval
+    )
     return {
         "rounds": rounds,
-        "fills": status_mod.recent_fills(conn, limit * 2),
+        "fills": status_mod.recent_fills(
+            conn, limit * 2, market=market, asset=asset, interval=interval
+        ),
         "stats": status_mod.compute_stats(rounds),
-        "quality": status_mod.execution_quality(conn),
+        "quality": status_mod.execution_quality(
+            conn, market=market, asset=asset, interval=interval
+        ),
     }
 
 
 @app.get("/api/rounds/{round_start_ts}/fills")
 async def api_round_fills(
     round_start_ts: int,
+    market: str = Query("BTC-15m"),
     _: None = Depends(_require_auth),
 ) -> dict[str, Any]:
     return {
         "round_start_ts": round_start_ts,
-        "fills": status_mod.fills_for_round(_conn(), round_start_ts),
+        "market": market,
+        "fills": status_mod.fills_for_round(_conn(), round_start_ts, market),
     }
 
 

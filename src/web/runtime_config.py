@@ -64,13 +64,15 @@ PARAMS: tuple[Param, ...] = (
           help="T1 挂单价上限；mid ≤ 上限×(1+预挂幅度) 时触发"),
     Param("PRICE_PRE_MARGIN", "预挂幅度", "入场", "float", 0.0, 1.0, 0.01,
           help="提前挂单的宽容度，例如 0.10 = mid 到上限的 110% 就挂"),
-    Param("T1_ENTRY_WINDOW_S", "T1 入场时间窗 (秒)", "入场", "int", 0, 900, 30,
-          help="窗口开启后多少秒内允许 T1；0 = 整轮都可入场"),
+    Param("T1_ENTRY_WINDOW_S", "15m T1 入场时间窗 (秒)", "入场", "int", 0, 900, 30,
+          "next_round", "15 分钟市场窗口开启后多少秒内允许 T1；0 = 整轮都可入场"),
+    Param("T1_ENTRY_WINDOW_5M_S", "5m T1 入场时间窗 (秒)", "入场", "int", 0, 300, 10,
+          "next_round", "5 分钟市场窗口开启后多少秒内允许 T1；默认 60 秒"),
 
     # ── 加仓 ────────────────────────────────────────────────────────────
     Param("TIER1_NOTIONAL", "T1 名义金额 (USDC)", "加仓", "float", 0.01, 10000, 0.5,
-          "next_round", "T1 用 taker 市价买入（1 USD 不足 5 股，不能挂 GTD）；"
-                        "下一轮生效（本轮持仓的分层金额在本轮开始时已固定）"),
+          "next_round", "T1 也是 GTD 挂单买入；下一轮生效（本轮分层金额在"
+                        "本轮开始时已固定）"),
     Param("TIER2_NOTIONAL", "T2 名义金额 (USDC)", "加仓", "float", 0.01, 10000, 0.5,
           "next_round"),
     Param("TIER3_NOTIONAL", "T3 名义金额 (USDC)", "加仓", "float", 0.01, 10000, 0.5,
@@ -115,11 +117,12 @@ PARAMS: tuple[Param, ...] = (
     Param("BTC_VOL_COOLDOWN_S", "急涨急跌冷却 (秒)", "风控", "float", 0.0, 300.0, 5.0,
           help="触发后至少暂停这么久，波动平息后才恢复"),
     Param("T4_DRIFT_BYPASS_MIN_REMAINING_S", "T4 漂移豁免剩余时间 (秒)", "风控", "float",
-          0.0, 900.0, 30.0,
-          help="窗口剩余时间 ≥ 该值时，T4 可在 BTC 漂移 FAIL 下补仓；0 = 关闭"),
+          0.0, 900.0, 30.0, "next_round",
+          help="15m 窗口剩余时间 ≥ 该值时，T4 可在漂移 FAIL 下补仓；"
+               "5m 按 1/3 缩放；0 = 关闭"),
     Param("T4_MIN_REMAINING_S", "T4 最短剩余时间 (秒)", "风控", "float",
-          0.0, 900.0, 30.0,
-          help="剩余时间少于此值时不再补 T4（300s GTD 与止盈都来不及走完）；0 = 关闭"),
+          0.0, 900.0, 30.0, "next_round",
+          help="15m 剩余时间少于此值时不再补 T4；5m 按 1/3 缩放；0 = 关闭"),
     Param("T4_STRIKE_GATE_ENABLED", "T4 行权价距离闸门", "风控", "bool",
           help="只允许在 BTC 仍接近窗口开盘价（z 分数不超限）时补 T4；"
                "避免在明确趋势中越补越深"),
@@ -135,7 +138,7 @@ PARAMS: tuple[Param, ...] = (
           help="mid 已跌到触发价下方超过该比例时不挂 T4，等价格回到预挂区；"
                "0 = 关闭（旧行为）"),
     Param("STOP_LOSS_ENABLED", "T4 后启用止损", "风控", "bool",
-          help="T4 成交后，价格继续下跌时按两段式规则自动减仓/清仓"),
+          help="默认关闭：纸盘策略不设止损，亏损仓位持有到结算并按全额记账"),
     Param("STOP_LOSS_T4_DROP_PCT", "止损触发跌幅 (相对 T4 成交价)", "风控", "float",
           0.0, 0.9, 0.05,
           help="0.45 = T4 成交价再跌 45% 触发第一段止损"),

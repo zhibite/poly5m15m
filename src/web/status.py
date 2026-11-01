@@ -28,9 +28,10 @@ from src.config import strategy as _strategy
 # otherwise a fully-exited round keeps showing 未平仓 forever.
 _DUST_QTY = 1e-2
 
-# Window length assumed when attributing a settlement that carries no
-# `resolved_at` (legacy rows). The bot only trades the 15-minute BTC series.
-_ROUND_PERIOD_S = 900
+# Window length used when attributing a settlement to the day it belongs
+# to. 5-minute and 15-minute rounds coexist in the same `rounds` table.
+_ROUND_PERIOD_S = {"5m": 300, "15m": 900}
+_DEFAULT_PERIOD_S = 900
 
 
 # ---------------------------------------------------------------------------
@@ -72,25 +73,71 @@ def _tier_payload(t: Any) -> dict[str, Any]:
 # Live status
 # ---------------------------------------------------------------------------
 
-def build_status(state: Any) -> dict[str, Any]:
+def _resolve_runtime(
+    state: Any, market: str | None = None
+) -> tuple[Any, str, str, str, Any, Any]:
+    """Return `(runtime_or_state, market_key, asset, interval, wm, engine)`.
+
+    Real multi-market state carries `state.markets`; older tests and the
+    pre-2026-11-01 live path expose `state.wm` / `state.engine` directly,
+    so keep that fallback alive.
+    """
+    markets = getattr(state, "markets", None) or {}
+    if markets:
+        # Import lazily: markets.py imports config only, no cycle, but
+        # keeping this local makes the legacy fallback obvious.
+        from src.markets import default_market_key
+
+        key = market or default_market_key()
+        rt = markets.get(key) or markets.get(default_market_key())
+        if rt is None:
+            rt = next(iter(markets.values()))
+        spec = getattr(rt, "spec", None)
+        asset = getattr(spec, "asset", "BTC")
+        interval = getattr(spec, "interval", "15m")
+        return (
+            rt,
+            getattr(spec, "key", key),
+            asset,
+            interval,
+            getattr(rt, "wm", None),
+            getattr(rt, "engine", None),
+        )
+    wm = getattr(state, "wm", None)
+    asset = "BTC"
+    interval = "15m"
+    return state, market or "BTC-15m", asset, interval, wm, getattr(state, "engine", None)
+
+
+def build_status(state: Any, market: str | None = None) -> dict[str, Any]:
     """Snapshot of the running bot, safe to serialise to JSON."""
     s = _strategy()
-    wm = getattr(state, "wm", None)
-    ctx = wm.get("BTC") if wm else None
-    mkt = getattr(ctx, "market", None) if ctx else None
-    eng = getattr(state, "engine", None)
+    rt, market_key, asset, interval, wm, eng = _resolve_runtime(state, market)
+    ctx = wm.get(asset) if wm else None
+    mkt = getattr(rt, "current_market", None) or (
+        getattr(ctx, "market", None) if ctx else None
+    )
     rs = getattr(eng, "_round", None) if eng else None
     pos = getattr(rs, "position", None) if rs else None
     pc = state.price_cache
-    bc = float(getattr(state.binance_cache, "last_price", 0.0) or 0.0)
+    asset_caches = getattr(state, "asset_caches", None) or {}
+    cache = asset_caches.get(asset) or getattr(state, "binance_cache", None)
+    bc = float(getattr(cache, "last_price", 0.0) or 0.0)
 
     up_token = (mkt.up_token if mkt else "") or ""
     down_token = (mkt.down_token if mkt else "") or ""
     up_mid = float(pc.get_midpoint(up_token)) if up_token else 0.0
     down_mid = float(pc.get_midpoint(down_token)) if down_token else 0.0
 
+    spec = getattr(rt, "spec", None)
+    t1_window = float(
+        getattr(spec, "t1_entry_window_s", None)
+        if spec is not None
+        else s.T1_ENTRY_WINDOW_S
+    )
+
     # ── Window / phase ──────────────────────────────────────────────────
-    period_s = int(wm.window_period_s()) if wm else int(s.T1_ENTRY_WINDOW_S)
+    period_s = int(wm.window_period_s()) if wm else int(t1_window)
     try:
         remain_s = max(0.0, min(float(period_s), float(wm.seconds_until_next())))
     except Exception:
@@ -98,7 +145,7 @@ def build_status(state: Any) -> dict[str, Any]:
     elapsed_s = max(0.0, period_s - remain_s)
     if remain_s < 1.0:
         phase = "END"
-    elif elapsed_s <= s.T1_ENTRY_WINDOW_S:
+    elif elapsed_s <= t1_window:
         phase = "IN_T1"
     else:
         phase = "PAST_T1"
@@ -165,24 +212,40 @@ def build_status(state: Any) -> dict[str, Any]:
             "tiers": tiers,
         }
 
-    # ── Open orders (live GTDs this round) ──────────────────────────────
+    # ── Open orders (live GTDs / paper resting orders this round) ───────
     orders: list[dict[str, Any]] = []
+    broker = getattr(rt, "broker", None)
     om = getattr(state, "order_manager", None)
-    if om is not None and rs is not None:
+    if rs is not None:
         try:
-            for o in om.open_orders_for_round(rs.round_start_ts):
-                orders.append({
-                    "client_order_id": o.client_order_id,
-                    "server_order_id": o.server_order_id,
-                    "side": o.side,
-                    "tier": o.tier_name,
-                    "price": o.price,
-                    "size": o.placed_size or o.size,
-                    "size_matched": o.size_matched,
-                    "status": o.status,
-                    "expires_at": o.expires_at,
-                    "age_s": max(0.0, time.time() - o.placed_at),
-                })
+            if broker is not None and hasattr(broker, "open_orders_for_round"):
+                for o in broker.open_orders_for_round(rs.round_start_ts):
+                    orders.append({
+                        "client_order_id": o.order_id,
+                        "server_order_id": o.order_id,
+                        "side": o.side,
+                        "tier": o.tier_name,
+                        "price": o.price,
+                        "size": o.size,
+                        "size_matched": o.size_matched,
+                        "status": o.status,
+                        "expires_at": o.expires_at,
+                        "age_s": max(0.0, time.time() - o.placed_at),
+                    })
+            elif om is not None:
+                for o in om.open_orders_for_round(rs.round_start_ts):
+                    orders.append({
+                        "client_order_id": o.client_order_id,
+                        "server_order_id": o.server_order_id,
+                        "side": o.side,
+                        "tier": o.tier_name,
+                        "price": o.price,
+                        "size": o.placed_size or o.size,
+                        "size_matched": o.size_matched,
+                        "status": o.status,
+                        "expires_at": o.expires_at,
+                        "age_s": max(0.0, time.time() - o.placed_at),
+                    })
         except Exception:
             orders = []
 
@@ -190,7 +253,10 @@ def build_status(state: Any) -> dict[str, Any]:
     now_ts = int(time.time())
     return {
         "server_time": now_ts,
-        "asset": "BTC",
+        "market": market_key,
+        "asset": asset,
+        "interval": interval,
+        "paper": bool(getattr(s, "PAPER_TRADING", False)),
         "killswitch": {
             "active": bool(getattr(ks, "active", False)),
             "since": getattr(ks, "since", 0.0) or None,
@@ -219,8 +285,10 @@ def build_status(state: Any) -> dict[str, Any]:
         "position": position,
         "orders": orders,
         "config": {
-            "t1_entry_window_s": float(s.T1_ENTRY_WINDOW_S),
+            "t1_entry_window_s": t1_window,
             "drift_limit": float(s.BASELINE_DRIFT_LIMIT),
+            "entry_price_cap": float(s.ENTRY_PRICE_CAP),
+            "tier_notionals": [float(x) for x in s.tier_notionals],
         },
     }
 
@@ -231,6 +299,9 @@ def build_status(state: Any) -> dict[str, Any]:
 
 _ROUNDS_SQL = """
 SELECT r.round_start_ts,
+       r.market,
+       r.asset,
+       r.interval,
        r.slug,
        r.started_at,
        r.finished_at,
@@ -243,25 +314,35 @@ SELECT r.round_start_ts,
        COALESCE(SUM(CASE WHEN f.side = 'SELL' THEN f.price * f.size END), 0.0) AS sell_proceeds,
        COUNT(f.fill_id) AS fill_count,
        (SELECT COUNT(*) FROM orders o
-         WHERE o.round_start_ts = r.round_start_ts) AS order_count,
+         WHERE o.round_start_ts = r.round_start_ts
+           AND o.market = r.market) AS order_count,
        (SELECT COUNT(*) FROM orders o3
          WHERE o3.round_start_ts = r.round_start_ts
+           AND o3.market = r.market
            AND o3.status = 'cancelled') AS cancel_count
 FROM rounds r
-LEFT JOIN fills f ON f.round_start_ts = r.round_start_ts
-WHERE EXISTS (SELECT 1 FROM orders o2 WHERE o2.round_start_ts = r.round_start_ts)
-   OR EXISTS (SELECT 1 FROM fills  f2 WHERE f2.round_start_ts = r.round_start_ts)
-GROUP BY r.round_start_ts
-ORDER BY r.round_start_ts DESC
+LEFT JOIN fills f
+  ON f.round_start_ts = r.round_start_ts AND f.market = r.market
+WHERE (EXISTS (SELECT 1 FROM orders o2
+                WHERE o2.round_start_ts = r.round_start_ts
+                  AND o2.market = r.market)
+    OR EXISTS (SELECT 1 FROM fills  f2
+                WHERE f2.round_start_ts = r.round_start_ts
+                  AND f2.market = r.market))
+{filters}
+GROUP BY r.round_start_ts, r.market
+ORDER BY r.round_start_ts DESC, r.market ASC
 LIMIT ?
 """
 
 
 def _round_realized_pnl(
-    conn: Any, wanted: set[int]
+    conn: Any, wanted: set[tuple[str, int]]
 ) -> tuple[
-    dict[int, float], dict[int, float], dict[int, dict[str, list[float]]],
-    dict[int, float], dict[int, int], dict[int, float], dict[int, float],
+    dict[tuple[str, int], float], dict[tuple[str, int], float],
+    dict[tuple[str, int], dict[str, list[float]]],
+    dict[tuple[str, int], float], dict[tuple[str, int], int],
+    dict[tuple[str, int], float], dict[tuple[str, int], float],
 ]:
     """Walk each round's fills in time order and return REALISED PnL.
 
@@ -288,25 +369,32 @@ def _round_realized_pnl(
     (loss) and never produce a SELL fill, so the caller needs the token
     and remaining basis to book that outcome.
     """
-    realized: dict[int, float] = {}
-    cost_sold: dict[int, float] = {}
-    pnl_today: dict[int, float] = {}
-    sells_today: dict[int, int] = {}
-    fees_total: dict[int, float] = {}
-    buy_fees: dict[int, float] = {}
+    realized: dict[tuple[str, int], float] = {}
+    cost_sold: dict[tuple[str, int], float] = {}
+    pnl_today: dict[tuple[str, int], float] = {}
+    sells_today: dict[tuple[str, int], int] = {}
+    fees_total: dict[tuple[str, int], float] = {}
+    buy_fees: dict[tuple[str, int], float] = {}
     today_start_ms = int(
         datetime.now(timezone.utc)
         .replace(hour=0, minute=0, second=0, microsecond=0)
         .timestamp() * 1000
     )
-    # round -> token_id -> [qty, cost basis]
-    state: dict[int, dict[str, list[float]]] = {}
-    for round_ts, token_id, side, price, size, ts_ms, fee in conn.execute(
-        "SELECT round_start_ts, token_id, side, price, size, ts_ms, "
-        "COALESCE(fee, 0) FROM fills "
-        "ORDER BY round_start_ts ASC, ts_ms ASC, fill_id ASC"
+    # (market, round) -> token_id -> [qty, cost basis]
+    state: dict[tuple[str, int], dict[str, list[float]]] = {}
+    # Bound the scan to the rounds being displayed. With 14 paper markets
+    # the fills table grows ~14× faster than the single-market bot, and
+    # this query runs on every /api/trades poll.
+    min_ts = min((ts for _m, ts in wanted), default=0)
+    for (round_ts, market, token_id, side, price, size, ts_ms, fee) in conn.execute(
+        "SELECT round_start_ts, COALESCE(market, 'BTC-15m'), token_id, side, "
+        "price, size, ts_ms, COALESCE(fee, 0) FROM fills "
+        "WHERE round_start_ts >= ? "
+        "ORDER BY round_start_ts ASC, ts_ms ASC, fill_id ASC",
+        (int(min_ts),),
     ):
-        if round_ts not in wanted:
+        key = (str(market or "BTC-15m"), int(round_ts))
+        if key not in wanted:
             continue
         try:
             px = float(price or 0.0)
@@ -317,13 +405,13 @@ def _round_realized_pnl(
         if px <= 0 or sz <= 0:
             continue
         tok = str(token_id or "")
-        positions = state.setdefault(round_ts, {})
+        positions = state.setdefault(key, {})
         st = positions.setdefault(tok, [0.0, 0.0])
-        fees_total[round_ts] = fees_total.get(round_ts, 0.0) + fee_f
+        fees_total[key] = fees_total.get(key, 0.0) + fee_f
         if str(side or "").upper() == "BUY":
             st[0] += sz
             st[1] += px * sz + fee_f
-            buy_fees[round_ts] = buy_fees.get(round_ts, 0.0) + fee_f
+            buy_fees[key] = buy_fees.get(key, 0.0) + fee_f
             continue
         # SELL: realise only against shares actually held. Older rows can
         # carry a blank token_id on either side; fall back to the sole
@@ -340,15 +428,15 @@ def _round_realized_pnl(
         fee_sold = fee_f * (sold / sz)
         proceeds = px * sold - fee_sold
         pnl = proceeds - avg * sold
-        realized[round_ts] = realized.get(round_ts, 0.0) + pnl
-        cost_sold[round_ts] = cost_sold.get(round_ts, 0.0) + avg * sold
+        realized[key] = realized.get(key, 0.0) + pnl
+        cost_sold[key] = cost_sold.get(key, 0.0) + avg * sold
         try:
             ts_ms_i = int(ts_ms or 0)
         except (TypeError, ValueError):
             ts_ms_i = 0
         if ts_ms_i >= today_start_ms:
-            pnl_today[round_ts] = pnl_today.get(round_ts, 0.0) + pnl
-            sells_today[round_ts] = sells_today.get(round_ts, 0) + 1
+            pnl_today[key] = pnl_today.get(key, 0.0) + pnl
+            sells_today[key] = sells_today.get(key, 0) + 1
         st[0] -= sold
         st[1] -= avg * sold
         if st[0] <= 1e-9:
@@ -360,7 +448,13 @@ def _round_realized_pnl(
     )
 
 
-def rounds_with_pnl(conn: Any, limit: int = 100) -> list[dict[str, Any]]:
+def rounds_with_pnl(
+    conn: Any,
+    limit: int = 100,
+    market: str | None = None,
+    asset: str | None = None,
+    interval: str | None = None,
+) -> list[dict[str, Any]]:
     """Rounds with realised PnL derived from fills.
 
     Realised PnL is computed per SELL fill against the round's running
@@ -378,8 +472,19 @@ def rounds_with_pnl(conn: Any, limit: int = 100) -> list[dict[str, Any]]:
     nothing was ever bought (e.g. every BUY rejected for insufficient
     balance) lingered in the history as phantom open positions.
     """
-    rows = conn.execute(_ROUNDS_SQL, (int(limit),)).fetchall()
-    wanted = {int(row[0]) for row in rows}
+    filters: list[str] = []
+    args: list[Any] = []
+    for column, value in (
+        ("r.market", market), ("r.asset", asset), ("r.interval", interval),
+    ):
+        if value:
+            filters.append(f"AND {column}=?")
+            args.append(str(value))
+    sql = _ROUNDS_SQL.replace(
+        "{filters}", "\n".join(filters)
+    )
+    rows = conn.execute(sql, (*args, int(limit))).fetchall()
+    wanted = {(str(row[1] or "BTC-15m"), int(row[0])) for row in rows}
     if wanted:
         (realized, cost_sold, open_positions, pnl_today, sells_today,
          fees_total, buy_fees) = _round_realized_pnl(conn, wanted)
@@ -393,9 +498,11 @@ def rounds_with_pnl(conn: Any, limit: int = 100) -> list[dict[str, Any]]:
     )
     out: list[dict[str, Any]] = []
     for row in rows:
-        (round_ts, slug, started_at, finished_at, resolved, up_won,
-         resolved_at, up_token, down_token, buy_cost, sell_proceeds,
-         fill_count, order_count, cancel_count) = row
+        (round_ts, row_market, row_asset, row_interval, slug, started_at,
+         finished_at, resolved, up_won, resolved_at, up_token, down_token,
+         buy_cost, sell_proceeds, fill_count, order_count,
+         cancel_count) = row
+        key = (str(row_market or "BTC-15m"), int(round_ts))
         resolved = bool(resolved)
         up_won_b = None if up_won is None else bool(up_won)
         buy_cost = float(buy_cost or 0.0)
@@ -406,7 +513,7 @@ def rounds_with_pnl(conn: Any, limit: int = 100) -> list[dict[str, Any]]:
         # Remaining inventory, per token. Ignore CLOB size-rounding dust
         # (see `_DUST_QTY`): a round whose residual cannot even be sold is
         # flat.
-        positions = open_positions.get(round_ts, {})
+        positions = open_positions.get(key, {})
         qty_open = sum(
             float(q) for q, _cost in positions.values() if q >= _DUST_QTY
         )
@@ -449,13 +556,13 @@ def rounds_with_pnl(conn: Any, limit: int = 100) -> list[dict[str, Any]]:
 
         pnl = None
         if has_sells or settle_pnl is not None:
-            pnl = float(realized.get(round_ts, 0.0)) + (settle_pnl or 0.0)
-        cost_sold_round = float(cost_sold.get(round_ts, 0.0))
+            pnl = float(realized.get(key, 0.0)) + (settle_pnl or 0.0)
+        cost_sold_round = float(cost_sold.get(key, 0.0))
         # A settled round's return is measured against everything it
-        # invested (notional + buy-side taker fees); a still-open round
-        # keeps the realised-on-sold-shares denominator.
+        # invested (notional + buy-side fees); a still-open round keeps
+        # the realised-on-sold-shares denominator.
         pnl_denom = (
-            buy_cost + float(buy_fees.get(round_ts, 0.0))
+            buy_cost + float(buy_fees.get(key, 0.0))
             if settle_pnl is not None
             else cost_sold_round
         )
@@ -464,13 +571,19 @@ def rounds_with_pnl(conn: Any, limit: int = 100) -> list[dict[str, Any]]:
         # moment Gamma answered: a round ending at 23:58 UTC must stay in
         # that day's PnL even if resolution lands after midnight (or the
         # bot was offline and backfilled the outcome the next day).
+        period_s = _ROUND_PERIOD_S.get(
+            str(row_interval or "15m"), _DEFAULT_PERIOD_S
+        )
         settled_today = bool(
             settle_pnl is not None
-            and (float(round_ts) + _ROUND_PERIOD_S) * 1000.0 >= today_start_ms
+            and (float(round_ts) + period_s) * 1000.0 >= today_start_ms
         )
 
         out.append({
             "round_start_ts": round_ts,
+            "market": key[0],
+            "asset": str(row_asset or "BTC"),
+            "interval": str(row_interval or "15m"),
             "slug": slug,
             "started_at": started_at,
             "finished_at": finished_at,
@@ -483,7 +596,7 @@ def rounds_with_pnl(conn: Any, limit: int = 100) -> list[dict[str, Any]]:
             "order_count": int(order_count or 0),
             "cancel_count": int(cancel_count or 0),
             # Taker fees recorded on this round's fills (USDC).
-            "fee_total": float(fees_total.get(round_ts, 0.0)),
+            "fee_total": float(fees_total.get(key, 0.0)),
             "status": round_status,
             "closed": round_status == "closed",
             "pnl_usd": pnl,
@@ -500,9 +613,9 @@ def rounds_with_pnl(conn: Any, limit: int = 100) -> list[dict[str, Any]]:
             # dashboard reflects a TP immediately, not at the round's end.
             # Settlement PnL is included when the market resolved today.
             "pnl_today_usd": (
-                float(pnl_today.get(round_ts, 0.0)) if has_sells else 0.0
+                float(pnl_today.get(key, 0.0)) if has_sells else 0.0
             ) + (float(settle_pnl) if settled_today else 0.0),
-            "sells_today": int(sells_today.get(round_ts, 0)),
+            "sells_today": int(sells_today.get(key, 0)),
             "settled_today": settled_today,
             "open_qty": 0.0 if settle_pnl is not None else qty_open,
         })
@@ -548,6 +661,9 @@ def compute_stats(rounds: list[dict[str, Any]]) -> dict[str, Any]:
 _FILLS_SQL = """
 SELECT f.fill_id,
        f.round_start_ts,
+       COALESCE(f.market, 'BTC-15m') AS market,
+       COALESCE(f.asset, 'BTC') AS asset,
+       COALESCE(f.interval, '15m') AS interval,
        f.side,
        f.price,
        f.size,
@@ -564,10 +680,27 @@ SELECT f.fill_id,
        END AS outcome
 FROM fills f
 LEFT JOIN orders o ON o.client_order_id = f.order_id
-LEFT JOIN rounds r ON r.round_start_ts = f.round_start_ts
+LEFT JOIN rounds r
+  ON r.round_start_ts = f.round_start_ts AND r.market = f.market
+{where}
 ORDER BY f.ts_ms DESC, f.fill_id DESC
 LIMIT ? OFFSET ?
 """
+
+
+def _fill_filters(
+    market: str | None, asset: str | None, interval: str | None
+) -> tuple[str, list[Any]]:
+    clauses: list[str] = []
+    args: list[Any] = []
+    for column, value in (
+        ("f.market", market), ("f.asset", asset), ("f.interval", interval),
+    ):
+        if value:
+            clauses.append(f"{column}=?")
+            args.append(str(value))
+    where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+    return where, args
 
 
 def _improvement_bps(side: str, price: float, limit_price: float) -> float | None:
@@ -587,14 +720,27 @@ def _improvement_bps(side: str, price: float, limit_price: float) -> float | Non
     return None
 
 
-def count_fills(conn: Any) -> int:
+def count_fills(
+    conn: Any,
+    market: str | None = None,
+    asset: str | None = None,
+    interval: str | None = None,
+) -> int:
     """Total number of fill rows (pagination denominator)."""
-    row = conn.execute("SELECT COUNT(*) FROM fills").fetchone()
+    where, args = _fill_filters(market, asset, interval)
+    row = conn.execute(
+        f"SELECT COUNT(*) FROM fills f {where}", args
+    ).fetchone()
     return int(row[0] or 0) if row else 0
 
 
 def recent_fills(
-    conn: Any, limit: int = 200, offset: int = 0
+    conn: Any,
+    limit: int = 200,
+    offset: int = 0,
+    market: str | None = None,
+    asset: str | None = None,
+    interval: str | None = None,
 ) -> list[dict[str, Any]]:
     """Fill rows, newest first.
 
@@ -602,12 +748,15 @@ def recent_fills(
     ordered by (ts_ms, fill_id) so consecutive pages neither overlap nor
     skip a row when several fills share a millisecond.
     """
+    where, args = _fill_filters(market, asset, interval)
     rows = conn.execute(
-        _FILLS_SQL, (int(limit), max(0, int(offset)))
+        _FILLS_SQL.replace("{where}", where),
+        (*args, int(limit), max(0, int(offset))),
     ).fetchall()
     out = []
-    for (fill_id, round_ts, side, price, size, ts_ms,
-         tier_name, slug, limit_price, trader_side, fee, outcome) in rows:
+    for (fill_id, round_ts, row_market, row_asset, row_interval, side,
+         price, size, ts_ms, tier_name, slug, limit_price, trader_side,
+         fee, outcome) in rows:
         price = float(price or 0.0)
         size = float(size or 0.0)
         limit_price = float(limit_price or 0.0)
@@ -616,6 +765,9 @@ def recent_fills(
         out.append({
             "fill_id": fill_id,
             "round_start_ts": round_ts,
+            "market": str(row_market or "BTC-15m"),
+            "asset": str(row_asset or "BTC"),
+            "interval": str(row_interval or "15m"),
             "side": side,
             # UP/DOWN token the fill touched; '' for legacy rows whose
             # round predates token-id storage (cannot be mapped).
@@ -634,7 +786,13 @@ def recent_fills(
     return out
 
 
-def execution_quality(conn: Any, limit: int = 500) -> dict[str, Any]:
+def execution_quality(
+    conn: Any,
+    limit: int = 500,
+    market: str | None = None,
+    asset: str | None = None,
+    interval: str | None = None,
+) -> dict[str, Any]:
     """Execution-quality stats for the dashboard.
 
     Covers the four levers we tune when adjusting the order logic:
@@ -645,15 +803,17 @@ def execution_quality(conn: Any, limit: int = 500) -> dict[str, Any]:
       * cancel rate (cancelled orders / all orders),
       * average time from placement to first fill.
     """
+    where, filter_args = _fill_filters(market, asset, interval)
     rows = conn.execute(
-        """
+        f"""
         SELECT f.side, f.price, COALESCE(o.price, 0.0), f.trader_side
         FROM fills f
         LEFT JOIN orders o ON o.client_order_id = f.order_id
+        {where}
         ORDER BY f.ts_ms DESC
         LIMIT ?
         """,
-        (int(limit),),
+        (*filter_args, int(limit)),
     ).fetchall()
 
     maker = taker = unknown = 0
@@ -675,10 +835,22 @@ def execution_quality(conn: Any, limit: int = 500) -> dict[str, Any]:
         elif str(side or "").upper() == "SELL":
             sell_improvements.append(bps)
 
+    order_filters: list[str] = []
+    order_args: list[Any] = []
+    for column, value in (
+        ("market", market), ("asset", asset), ("interval", interval),
+    ):
+        if value:
+            order_filters.append(f"{column}=?")
+            order_args.append(str(value))
+    order_where = (
+        "WHERE " + " AND ".join(order_filters) if order_filters else ""
+    )
     order_row = conn.execute(
         "SELECT COUNT(*), "
         "COALESCE(SUM(CASE WHEN status = 'cancelled' THEN 1 ELSE 0 END), 0) "
-        "FROM orders"
+        f"FROM orders {order_where}",
+        order_args,
     ).fetchone()
     total_orders = int(order_row[0] or 0) if order_row else 0
     cancelled_orders = int(order_row[1] or 0) if order_row else 0
@@ -723,17 +895,19 @@ def execution_quality(conn: Any, limit: int = 500) -> dict[str, Any]:
     }
 
 
-def fills_for_round(conn: Any, round_start_ts: int) -> list[dict[str, Any]]:
+def fills_for_round(
+    conn: Any, round_start_ts: int, market: str = "BTC-15m"
+) -> list[dict[str, Any]]:
     rows = conn.execute(
         """
         SELECT f.fill_id, f.side, f.price, f.size, f.ts_ms,
                COALESCE(o.tier_name, '') AS tier_name
         FROM fills f
         LEFT JOIN orders o ON o.client_order_id = f.order_id
-        WHERE f.round_start_ts = ?
+        WHERE f.round_start_ts = ? AND f.market = ?
         ORDER BY f.ts_ms ASC
         """,
-        (int(round_start_ts),),
+        (int(round_start_ts), market),
     ).fetchall()
     return [
         {

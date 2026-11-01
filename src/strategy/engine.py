@@ -116,10 +116,24 @@ class StrategyEngine:
         price_cache: PriceCache,
         handler: ActionHandler,
         killswitch: object | None = None,
+        *,
+        t1_entry_window_s: float | None = None,
+        t4_min_remaining_s: float | None = None,
+        t4_drift_bypass_min_remaining_s: float | None = None,
+        market: str = "",
     ) -> None:
         self._bc = binance_cache
         self._pc = price_cache
         self._handler = handler
+        # Label used by DecisionLoop's structlog context binding.
+        self.market = market
+        # Per-market overrides (2026-11-01 multi-market paper bot). The
+        # 5-minute series enters only in its first minute and scales the
+        # window-relative T4 gates; the 15-minute series passes the global
+        # values. None → read the live global config (legacy behaviour).
+        self._t1_entry_window_override = t1_entry_window_s
+        self._t4_min_remaining_override = t4_min_remaining_s
+        self._t4_bypass_min_remaining_override = t4_drift_bypass_min_remaining_s
         # Shared emergency-stop flag. When engaged `_evaluate` returns
         # immediately, so no T1 / averaging / TP action is emitted.
         self._kill = killswitch
@@ -207,6 +221,13 @@ class StrategyEngine:
 
     # H-NEW-2026-07-11: helper that reads PRICE_PRE_MARGIN safely even for
     # tests that construct engine via __new__ (bypassing __init__).
+    def _entry_window_s(self) -> float:
+        """Per-market T1 entry window (seconds), falling back to config."""
+        override = getattr(self, "_t1_entry_window_override", None)
+        if isinstance(override, (int, float)) and override >= 0:
+            return float(override)
+        return float(getattr(_s(), "T1_ENTRY_WINDOW_S", 300.0) or 0.0)
+
     def _get_price_pre_margin(self) -> float:
         if hasattr(self, "_s") and self._s is not None:
             return float(getattr(self._s, "PRICE_PRE_MARGIN", 0.0) or 0.0)
@@ -363,8 +384,11 @@ class StrategyEngine:
         zone. When the window still has enough time for a recovery, the
         operator wants T4 to average in anyway.
         """
-        min_remaining = self._cfg_float(
-            "T4_DRIFT_BYPASS_MIN_REMAINING_S", 540.0
+        override = getattr(self, "_t4_bypass_min_remaining_override", None)
+        min_remaining = (
+            float(override)
+            if isinstance(override, (int, float))
+            else self._cfg_float("T4_DRIFT_BYPASS_MIN_REMAINING_S", 540.0)
         )
         if min_remaining <= 0:
             return False
@@ -399,9 +423,14 @@ class StrategyEngine:
     # risk gate must never be able to wedge the ladder permanently.
 
     def _t4_remaining_ok(self) -> tuple[bool, float | None]:
-        """False when too little of the 15-minute window is left for T4."""
+        """False when too little of the window is left for T4."""
         remaining = self._window_remaining_s()
-        min_s = self._cfg_float("T4_MIN_REMAINING_S", 240.0)
+        override = getattr(self, "_t4_min_remaining_override", None)
+        min_s = (
+            float(override)
+            if isinstance(override, (int, float))
+            else self._cfg_float("T4_MIN_REMAINING_S", 240.0)
+        )
         if min_s <= 0 or remaining is None:
             return True, remaining
         return remaining >= min_s, remaining
@@ -1519,10 +1548,12 @@ class StrategyEngine:
                 continue
 
             # ── T1 entry time gate ───────────────────────────────────────
-            # T1 must enter within T1_ENTRY_WINDOW_S of window open.
-            # This prevents chasing at the very end of the 15-min window.
+            # T1 must enter within the market's entry window of window
+            # open (15m: 300 s, 5m: 60 s). This prevents chasing at the
+            # very end of the window.
             elapsed_in_window = time.time() - self._round.round_start_ts
-            if elapsed_in_window > s.T1_ENTRY_WINDOW_S:
+            entry_window_s = self._entry_window_s()
+            if elapsed_in_window > entry_window_s:
                 # Log exactly ONCE per round. This check runs on every
                 # decision tick (~4 Hz); the old 60 s throttle still emitted
                 # one INFO line per minute for the rest of the window
@@ -1534,24 +1565,32 @@ class StrategyEngine:
                     log.info(
                         "engine.t1_gate_closed",
                         elapsed_s=int(elapsed_in_window),
-                        limit_s=int(s.T1_ENTRY_WINDOW_S),
+                        limit_s=int(entry_window_s),
                     )
                 continue
 
-            # Price cap. `can_enter` also enforces it, but splitting the
-            # check here keeps the skip diagnostic honest: mid between the
-            # cap (0.40) and the pre-arm line (0.44) used to be logged as
-            # `t1_skip_drift` with within_limit=True.
+            # Price cap. In GTD mode (default 2026-11-01) the cap is the
+            # resting BUY limit, NOT a mid filter: the order is pre-armed
+            # while mid <= cap × (1 + margin) and fills when the mid
+            # crosses the cap. The legacy mode keeps the extra mid filter
+            # (which made T1 marketable at placement).
+            gtd_mode = self._cfg_bool("T1_GTD_ENABLED", True)
             cap = float(getattr(s, "ENTRY_PRICE_CAP", 0.0) or 0.0)
-            if cap > 0 and mid_price > cap:
+            if not gtd_mode and cap > 0 and mid_price > cap:
                 self._t1_skip_log(
                     "engine.t1_skip_price_cap",
                     side=side, mid_price=mid_price, cap=cap,
                 )
                 continue
 
-            # BTC drift gate
-            if not self._gate.can_enter(bc_now, mid_price):
+            # BTC drift gate. GTD mode places at the cap, so only the spot
+            # drift applies; the mid-based cap is already the order limit.
+            gate_ok = (
+                self._gate.can_act(bc_now)
+                if gtd_mode
+                else self._gate.can_enter(bc_now, mid_price)
+            )
+            if not gate_ok:
                 gs = self._gate.state(bc_now)
                 self._t1_skip_log(
                     "engine.t1_skip_drift",
