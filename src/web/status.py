@@ -343,6 +343,7 @@ def _round_realized_pnl(
     dict[tuple[str, int], dict[str, list[float]]],
     dict[tuple[str, int], float], dict[tuple[str, int], int],
     dict[tuple[str, int], float], dict[tuple[str, int], float],
+    dict[str, tuple[float, float | None]],
 ]:
     """Walk each round's fills in time order and return REALISED PnL.
 
@@ -364,6 +365,10 @@ def _round_realized_pnl(
       realized, cost_of_sold, open_positions, pnl_today, sells_today,
       fees_total, buy_fees
 
+    The last return value (`fill_pnl`) is keyed by fill_id and holds each
+    SELL fill's own realised `(pnl_usd, pnl_pct)` against the running
+    average cost, so the 成交明细 table can show profit on the sell row.
+
     `open_positions[round][token_id] = [qty, cost_basis]` is what allows
     settlement accounting: shares left at expiry are paid 1 (win) or 0
     (loss) and never produce a SELL fill, so the caller needs the token
@@ -375,6 +380,7 @@ def _round_realized_pnl(
     sells_today: dict[tuple[str, int], int] = {}
     fees_total: dict[tuple[str, int], float] = {}
     buy_fees: dict[tuple[str, int], float] = {}
+    fill_pnl: dict[str, tuple[float, float | None]] = {}
     today_start_ms = int(
         datetime.now(timezone.utc)
         .replace(hour=0, minute=0, second=0, microsecond=0)
@@ -386,13 +392,15 @@ def _round_realized_pnl(
     # the fills table grows ~14× faster than the single-market bot, and
     # this query runs on every /api/trades poll.
     min_ts = min((ts for _m, ts in wanted), default=0)
-    for (round_ts, market, token_id, side, price, size, ts_ms, fee) in conn.execute(
-        "SELECT round_start_ts, COALESCE(market, 'BTC-15m'), token_id, side, "
-        "price, size, ts_ms, COALESCE(fee, 0) FROM fills "
+    for row in conn.execute(
+        "SELECT fill_id, round_start_ts, COALESCE(market, 'BTC-15m'), "
+        "token_id, side, price, size, ts_ms, COALESCE(fee, 0) FROM fills "
         "WHERE round_start_ts >= ? "
         "ORDER BY round_start_ts ASC, ts_ms ASC, fill_id ASC",
         (int(min_ts),),
     ):
+        (fill_id, round_ts, market, token_id, side, price, size, ts_ms,
+         fee) = row
         key = (str(market or "BTC-15m"), int(round_ts))
         if key not in wanted:
             continue
@@ -428,8 +436,13 @@ def _round_realized_pnl(
         fee_sold = fee_f * (sold / sz)
         proceeds = px * sold - fee_sold
         pnl = proceeds - avg * sold
+        basis_sold = avg * sold
         realized[key] = realized.get(key, 0.0) + pnl
-        cost_sold[key] = cost_sold.get(key, 0.0) + avg * sold
+        cost_sold[key] = cost_sold.get(key, 0.0) + basis_sold
+        fill_pnl[str(fill_id)] = (
+            pnl,
+            (pnl / basis_sold) if basis_sold > 1e-12 else None,
+        )
         try:
             ts_ms_i = int(ts_ms or 0)
         except (TypeError, ValueError):
@@ -444,7 +457,7 @@ def _round_realized_pnl(
             st[1] = 0.0
     return (
         realized, cost_sold, state, pnl_today, sells_today, fees_total,
-        buy_fees,
+        buy_fees, fill_pnl,
     )
 
 
@@ -487,10 +500,12 @@ def rounds_with_pnl(
     wanted = {(str(row[1] or "BTC-15m"), int(row[0])) for row in rows}
     if wanted:
         (realized, cost_sold, open_positions, pnl_today, sells_today,
-         fees_total, buy_fees) = _round_realized_pnl(conn, wanted)
+         fees_total, buy_fees, _fill_pnl) = _round_realized_pnl(conn, wanted)
     else:
         (realized, cost_sold, open_positions, pnl_today, sells_today,
-         fees_total, buy_fees) = ({}, {}, {}, {}, {}, {}, {})
+         fees_total, buy_fees, _fill_pnl) = (
+            {}, {}, {}, {}, {}, {}, {}, {}
+        )
     today_start_ms = int(
         datetime.now(timezone.utc)
         .replace(hour=0, minute=0, second=0, microsecond=0)
@@ -753,6 +768,17 @@ def recent_fills(
         _FILLS_SQL.replace("{where}", where),
         (*args, int(limit), max(0, int(offset))),
     ).fetchall()
+    # Per-SELL realised PnL needs the round's earlier BUYs, so walk every
+    # fill of the rounds represented on this page (same accounting as the
+    # round records). BUY rows keep the field None.
+    wanted = {
+        (str(r[2] or "BTC-15m"), int(r[1]))
+        for r in rows
+        if r[1] is not None
+    }
+    fill_pnl: dict[str, tuple[float, float | None]] = (
+        _round_realized_pnl(conn, wanted)[7] if wanted else {}
+    )
     out = []
     for (fill_id, round_ts, row_market, row_asset, row_interval, side,
          price, size, ts_ms, tier_name, slug, limit_price, trader_side,
@@ -762,6 +788,7 @@ def recent_fills(
         limit_price = float(limit_price or 0.0)
         fee = float(fee or 0.0)
         notional = price * size
+        realized = fill_pnl.get(str(fill_id))
         out.append({
             "fill_id": fill_id,
             "round_start_ts": round_ts,
@@ -782,6 +809,8 @@ def recent_fills(
             "trader_side": str(trader_side or "").upper(),
             "fee": fee,
             "improvement_bps": _improvement_bps(side, price, limit_price),
+            "realized_pnl_usd": realized[0] if realized else None,
+            "realized_pnl_pct": realized[1] if realized else None,
         })
     return out
 

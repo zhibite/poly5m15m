@@ -153,9 +153,9 @@
     <div class="table-wrap">
       <table>
         <thead>
-          <tr><th>时间 (UTC)</th><th>轮次</th><th>层</th><th>方向</th><th>价格</th><th>数量</th><th>金额</th></tr>
+          <tr><th>时间 (UTC)</th><th>轮次</th><th>层</th><th>方向</th><th>价格</th><th>数量</th><th>金额</th><th>已实现盈亏</th></tr>
         </thead>
-        <tbody id="fills-tbody"><tr><td colspan="7" class="no-data">暂无成交</td></tr></tbody>
+        <tbody id="fills-tbody"><tr><td colspan="8" class="no-data">暂无成交</td></tr></tbody>
       </table>
     </div>
   </div>
@@ -490,10 +490,19 @@ function renderStatus(s) {
 function renderFills(fills) {
   const body = $('fills-tbody');
   if (!fills || !fills.length) {
-    body.innerHTML = '<tr><td colspan="7" class="no-data">暂无成交</td></tr>';
+    body.innerHTML = '<tr><td colspan="8" class="no-data">暂无成交</td></tr>';
     return;
   }
-  body.innerHTML = fills.slice(0, 15).map(f => `<tr>
+  body.innerHTML = fills.slice(0, 15).map(f => {
+    const pnl = f.realized_pnl_usd;
+    const pnlTxt = (pnl === null || pnl === undefined)
+      ? '<span class="muted">--</span>'
+      : `<span class="${cls(pnl)}">${money(pnl)}` +
+        (f.realized_pnl_pct === null || f.realized_pnl_pct === undefined
+          ? ''
+          : ` (${fmt(f.realized_pnl_pct * 100, 2)}%)`) +
+        '</span>';
+    return `<tr>
     <td class="mono">${f.ts_ms ? new Date(f.ts_ms).toISOString().slice(11, 19) : '--'}</td>
     <td class="mono">${utc(f.round_start_ts)}${outcomePill(f.outcome)}</td>
     <td>${f.tier || '--'}</td>
@@ -501,7 +510,9 @@ function renderFills(fills) {
     <td class="mono">${fmt(f.price, 4)}</td>
     <td class="mono">${fmt(f.size, 2)}</td>
     <td class="mono">$${fmt(f.notional, 2)}</td>
-  </tr>`).join('');
+    <td class="mono">${pnlTxt}</td>
+  </tr>`;
+  }).join('');
 }
 
 function renderStats(stats) {

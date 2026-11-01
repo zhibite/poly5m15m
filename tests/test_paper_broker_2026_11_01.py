@@ -451,3 +451,41 @@ def test_unsold_full_ladder_books_the_entire_loss(conn) -> None:
     assert r["settlement_usd"] == pytest.approx(-30.0)
     assert r["pnl_usd"] == pytest.approx(-30.0)
     assert r["open_qty"] == 0.0
+
+
+def test_sell_fill_shows_its_own_realized_pnl(conn) -> None:
+    """成交明细 SELL rows carry the fill's realised PnL vs round avg cost."""
+    db = DB(conn)
+    round_ts = 5_000
+    db.upsert_round(
+        round_start_ts=round_ts, slug="tp-round", condition_id="0xcid",
+        up_token="UP", down_token="DOWN",
+        market="BTC-15m", asset="BTC", interval="15m",
+    )
+    db.insert_order(
+        client_order_id="c1", server_order_id="c1", round_start_ts=round_ts,
+        side="BUY", token_id="UP", tier_name="T1", price=0.40, size=5.0,
+        lifetime_s=300, expires_at=round_ts + 300, placed_at=round_ts,
+        market="BTC-15m", asset="BTC", interval="15m",
+    )
+    buy_fee = 5.0 * 0.07 * 0.40 * (1 - 0.40)
+    sell_fee = 5.0 * 0.07 * 0.48 * (1 - 0.48)
+    db.insert_fill(
+        "f-buy", "c1", round_ts, "UP", "BUY", 0.40, 5.0,
+        ts_ms=1_000_000, trader_side="TAKER", fee=buy_fee,
+        market="BTC-15m", asset="BTC", interval="15m",
+    )
+    db.insert_fill(
+        "f-sell", "c1", round_ts, "UP", "SELL", 0.48, 5.0,
+        ts_ms=2_000_000, trader_side="TAKER", fee=sell_fee,
+        market="BTC-15m", asset="BTC", interval="15m",
+    )
+
+    by_id = {f["fill_id"]: f for f in status_mod.recent_fills(conn)}
+    assert by_id["f-buy"]["realized_pnl_usd"] is None
+    basis = 0.40 * 5.0 + buy_fee
+    expected = (0.48 * 5.0 - sell_fee) - basis
+    assert by_id["f-sell"]["realized_pnl_usd"] == pytest.approx(expected)
+    assert by_id["f-sell"]["realized_pnl_pct"] == pytest.approx(
+        expected / basis
+    )

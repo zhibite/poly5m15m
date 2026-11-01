@@ -98,9 +98,9 @@
     <div class="table-wrap">
       <table>
         <thead>
-          <tr><th>币种</th><th>市场</th><th>时间 (UTC)</th><th>轮次</th><th>层</th><th>方向</th><th>价格</th><th>挂价</th><th>价差</th><th>数量</th><th>金额</th><th>手续费</th><th>方式</th></tr>
+          <tr><th>币种</th><th>市场</th><th>时间 (UTC)</th><th>轮次</th><th>层</th><th>方向</th><th>价格</th><th>挂价</th><th>价差</th><th>数量</th><th>金额</th><th>手续费</th><th>已实现盈亏</th><th>方式</th></tr>
         </thead>
-        <tbody id="fills-tbody"><tr><td colspan="13" class="no-data">加载中...</td></tr></tbody>
+        <tbody id="fills-tbody"><tr><td colspan="14" class="no-data">加载中...</td></tr></tbody>
       </table>
     </div>
     <div class="pager" id="fills-pager" hidden>
@@ -251,7 +251,7 @@ function renderRounds(rounds) {
 function renderFills(fills) {
   const body = $('fills-tbody');
   if (!fills.length) {
-    body.innerHTML = '<tr><td colspan="13" class="no-data">暂无成交</td></tr>';
+    body.innerHTML = '<tr><td colspan="14" class="no-data">暂无成交</td></tr>';
     return;
   }
   body.innerHTML = fills.map(f => {
@@ -262,6 +262,15 @@ function renderFills(fills) {
     const role = (f.trader_side || '').toUpperCase();
     const roleLbl = role === 'MAKER' ? 'maker' : role === 'TAKER' ? 'taker' : '--';
     const roleCls = role === 'MAKER' ? 'watching' : role === 'TAKER' ? 'placed' : 'idle';
+    // SELL 行显示这一笔的已实现盈亏（按本轮移动平均成本、含手续费）。
+    const pnl = f.realized_pnl_usd;
+    const pnlTxt = (pnl === null || pnl === undefined)
+      ? '<span class="muted">--</span>'
+      : `<span class="${cls(pnl)}">${money(pnl)}` +
+        (f.realized_pnl_pct === null || f.realized_pnl_pct === undefined
+          ? ''
+          : ` (${fmt(f.realized_pnl_pct * 100, 2)}%)`) +
+        '</span>';
     return `<tr>
       <td><span class="pill buy">${f.asset || 'BTC'}</span></td>
       <td class="mono">${f.interval || '15m'}</td>
@@ -275,6 +284,7 @@ function renderFills(fills) {
       <td class="mono">${fmt(f.size, 2)}</td>
       <td class="mono">$${fmt(f.notional, 2)}</td>
       <td class="mono muted">${f.fee > 0 ? '$' + fmt(f.fee, 4) : '--'}</td>
+      <td class="mono">${pnlTxt}</td>
       <td><span class="pill ${roleCls}">${roleLbl}</span></td>
     </tr>`;
   }).join('');
