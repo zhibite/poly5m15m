@@ -348,10 +348,10 @@ def _on_market_discovered_rt(rt: MarketRuntime, asset: str, mkt) -> None:
     """Per-market market discovery hook (paper mode)."""
     state = STATE
     prev = rt.current_market
-    if prev is not None and prev.condition_id != mkt.condition_id:
-        for old_t in (prev.token_up_id, prev.token_down_id):
-            if old_t and old_t not in (mkt.token_up_id, mkt.token_down_id):
-                state.price_cache.clear_token(old_t)
+    # Do NOT clear the previous window's token prices here: discovery
+    # runs before `_on_new_round_rt`, and settlement needs the last
+    # UP/DOWN prices from the window that just closed. The old tokens are
+    # cleared after settlement instead.
     rt.current_market = mkt
 
     if state.market_ws:
@@ -412,6 +412,60 @@ def _on_market_discovered_rt(rt: MarketRuntime, asset: str, mkt) -> None:
     )
 
 
+# Settlement price freshness/margin when using the Polymarket UP/DOWN
+# token prices. At expiry the winner trades near 1 and the loser near 0,
+# so a wide gap is a reliable verdict; a near-50/50 book is not.
+_SETTLE_TOKEN_MAX_AGE_S = 10.0
+# Require a decisive book (e.g. 0.80/0.20) before trusting the token
+# prices over the underlying. Near-expiry books usually converge to
+# 0.99/0.01; a 0.55/0.45 print is not a settlement verdict.
+_SETTLE_TOKEN_MIN_GAP = 0.30
+
+
+def _token_price_outcome(prev_round) -> tuple[bool | None, dict]:
+    """Decide the window from the last UP/DOWN Polymarket prices.
+
+    Returns `(up_won_or_None, metrics)`. `None` means the last prices are
+    missing, stale, or too close to call — the caller then falls back to
+    the underlying's boundary prices.
+    """
+    mkt = getattr(prev_round, "market", None)
+    cache = getattr(STATE, "price_cache", None)
+    if mkt is None or cache is None:
+        return None, {"token_source": "unavailable"}
+    up_tok = getattr(mkt, "token_up_id", "") or ""
+    down_tok = getattr(mkt, "token_down_id", "") or ""
+    up_px, up_ts, up_src = cache.latest(up_tok)
+    down_px, down_ts, down_src = cache.latest(down_tok)
+    now = time.time()
+    up_age = (now - up_ts) if up_ts > 0 else None
+    down_age = (now - down_ts) if down_ts > 0 else None
+    up_ok = up_px > 0 and (up_age is None or up_age <= _SETTLE_TOKEN_MAX_AGE_S)
+    down_ok = (
+        down_px > 0 and (down_age is None or down_age <= _SETTLE_TOKEN_MAX_AGE_S)
+    )
+    gap = abs(up_px - down_px)
+    metrics = {
+        "token_up_px": up_px or None,
+        "token_down_px": down_px or None,
+        "token_up_src": up_src or None,
+        "token_down_src": down_src or None,
+        "token_up_age_s": round(up_age, 2) if up_age is not None else None,
+        "token_down_age_s": (
+            round(down_age, 2) if down_age is not None else None
+        ),
+        "token_gap": round(gap, 4),
+    }
+    if not (up_ok and down_ok):
+        metrics["token_source"] = "stale_or_missing"
+        return None, metrics
+    if gap < _SETTLE_TOKEN_MIN_GAP:
+        metrics["token_source"] = "too_close"
+        return None, metrics
+    metrics["token_source"] = "polymarket_price"
+    return up_px > down_px, metrics
+
+
 def _round_close_price(rt: MarketRuntime) -> tuple[float, str]:
     """Best available underlying price at the window boundary."""
     ctx = rt.wm.get(rt.spec.asset) if rt.wm else None
@@ -455,13 +509,20 @@ def _settle_round_at_rollover(rt: MarketRuntime, prev_round) -> None:
         open_px = float(
             getattr(mkt, "btc_spot_at_window_open", 0.0) or 0.0
         )
+    token_won, token_metrics = _token_price_outcome(prev_round)
     close_px, close_src = _round_close_price(rt)
 
-    source = "local_price"
-    if open_px > 0 and close_px > 0:
-        # Polymarket Up/Down: Up wins when the close is strictly above
-        # the open. A tie resolves Down.
+    if token_won is not None:
+        # Last UP/DOWN Polymarket prices are fresh and decisive: the side
+        # trading nearer 1 wins. This is the operator-preferred rule for
+        # paper settlement (2026-11-01).
+        up_won = token_won
+        source = "polymarket_price"
+    elif open_px > 0 and close_px > 0:
+        # Fallback: Polymarket Up/Down resolves Up when the close is
+        # strictly above the open. A tie resolves Down.
         up_won = close_px > open_px
+        source = "underlying_price"
     elif qty > 1e-9 and side in ("UP", "DOWN"):
         up_won = side == "DOWN"  # make the held side lose
         source = "forced_loss"
@@ -506,6 +567,7 @@ def _settle_round_at_rollover(rt: MarketRuntime, prev_round) -> None:
         qty=round(qty, 4),
         cost=round(cost, 4),
         wrote=wrote,
+        **token_metrics,
     )
 
 
@@ -521,6 +583,27 @@ async def _on_new_round_rt(rt: MarketRuntime, round_start_ts: int) -> None:
                 _settle_round_at_rollover(rt, prev_round)
             except Exception:
                 log.exception("round.settle_at_rollover_failed", market=rt.key)
+            # Now that the closing UP/DOWN prices have been used for
+            # settlement, drop the previous window's token cache.
+            old_mkt = getattr(prev_round, "market", None)
+            new_mkt = rt.current_market
+            if (
+                old_mkt is not None
+                and new_mkt is not None
+                and old_mkt.condition_id != new_mkt.condition_id
+            ):
+                keep = {
+                    t for t in (
+                        getattr(new_mkt, "token_up_id", ""),
+                        getattr(new_mkt, "token_down_id", ""),
+                    ) if t
+                }
+                for old_t in (
+                    getattr(old_mkt, "token_up_id", ""),
+                    getattr(old_mkt, "token_down_id", ""),
+                ):
+                    if old_t and old_t not in keep:
+                        STATE.price_cache.clear_token(old_t)
         try:
             cancelled = await rt.broker.cancel_round(prev)
             if cancelled:
@@ -2892,8 +2975,11 @@ async def _midpoint_poll_loop() -> None:
         try:
             up_mid = await s.pm_client.get_midpoint(up_token)
             down_mid = await s.pm_client.get_midpoint(down_token)
+            fetched_at = time.time()
             s.price_cache.midpoint[up_token] = up_mid
             s.price_cache.midpoint[down_token] = down_mid
+            s.price_cache.midpoint_ts[up_token] = fetched_at
+            s.price_cache.midpoint_ts[down_token] = fetched_at
 
             # B-1 fix (single-driver): the strategy decision loop is now
             # driven solely by DecisionLoop on a 250ms tick. The midpoint
@@ -3167,10 +3253,13 @@ async def _midpoint_poll_loop_multi(state: AppState) -> None:
                     pm.get_midpoint(mkt.token_up_id),
                     pm.get_midpoint(mkt.token_down_id),
                 )
+                fetched_at = time.time()
                 if up_mid > 0:
                     state.price_cache.midpoint[mkt.token_up_id] = up_mid
+                    state.price_cache.midpoint_ts[mkt.token_up_id] = fetched_at
                 if down_mid > 0:
                     state.price_cache.midpoint[mkt.token_down_id] = down_mid
+                    state.price_cache.midpoint_ts[mkt.token_down_id] = fetched_at
             except Exception as exc:  # noqa: BLE001
                 log.debug(
                     "midpoint.poll_failed", market=rt.key, error=str(exc)

@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from dataclasses import dataclass, field
 from typing import Callable
 
@@ -36,6 +37,11 @@ class PriceCache:
     last_trade_price: dict[str, float] = field(default_factory=dict)
     tick_size: dict[str, float] = field(default_factory=dict)
     midpoint: dict[str, float] = field(default_factory=dict)  # REST /midpoint poller
+    # Wall-clock timestamps for the two price sources. Settlement at the
+    # window boundary needs the freshest UP/DOWN price, not a value from
+    # an arbitrary earlier point in the round.
+    last_trade_ts: dict[str, float] = field(default_factory=dict)
+    midpoint_ts: dict[str, float] = field(default_factory=dict)
 
     def last(self, token: str) -> float:
         return self.last_trade_price.get(token, 0.0)
@@ -47,11 +53,34 @@ class PriceCache:
         """REST midpoint price — more stable than last_trade_price for strategy decisions."""
         return self.midpoint.get(token, 0.0)
 
+    def latest(self, token: str) -> tuple[float, float, str]:
+        """Freshest known price for a token: `(price, timestamp, source)`.
+
+        Prefers whichever of the WS last-trade price and the REST
+        midpoint was updated most recently. Returns `(0, 0, "")` when
+        neither source has produced a price.
+        """
+        candidates: list[tuple[float, float, str]] = []
+        trade_px = self.last_trade_price.get(token, 0.0)
+        trade_ts = self.last_trade_ts.get(token, 0.0)
+        if trade_px > 0:
+            candidates.append((trade_ts, trade_px, "last_trade"))
+        mid_px = self.midpoint.get(token, 0.0)
+        mid_ts = self.midpoint_ts.get(token, 0.0)
+        if mid_px > 0:
+            candidates.append((mid_ts, mid_px, "midpoint"))
+        if not candidates:
+            return 0.0, 0.0, ""
+        ts, px, src = max(candidates, key=lambda row: row[0])
+        return float(px), float(ts), src
+
     def clear_token(self, token: str) -> None:
         """Clear cached data for a specific token (e.g., on window change)."""
         self.last_trade_price.pop(token, None)
         self.tick_size.pop(token, None)
         self.midpoint.pop(token, None)
+        self.last_trade_ts.pop(token, None)
+        self.midpoint_ts.pop(token, None)
 
 
 MarketWSConnected = Callable[[], None]
@@ -201,6 +230,16 @@ class MarketWS:
         await ws.send(json.dumps(payload))
         log.info("market_ws.subscribed", tokens=[t[:16] for t in tokens])
 
+    def _set_last_trade(self, token: str, price: object) -> None:
+        if not token:
+            return
+        try:
+            px = float(price)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            return
+        self._cache.last_trade_price[token] = px
+        self._cache.last_trade_ts[token] = time.time()
+
     async def _process(self, raw: str) -> None:
         try:
             msg = json.loads(raw)
@@ -260,10 +299,7 @@ class MarketWS:
                 and token
                 and (not self._pending_tokens or token in self._pending_tokens)
             ):
-                try:
-                    self._cache.last_trade_price[token] = float(price_raw)
-                except (TypeError, ValueError):
-                    pass
+                self._set_last_trade(token, price_raw)
 
         # ── best_bid / best_ask ──────────────────────────────────────────────
         # Orderbook (best_bid / best_ask / book) events are intentionally
@@ -285,10 +321,7 @@ class MarketWS:
                 # trade executions, the price is the actual fill).
                 pc_price = pc.get("price")
                 if pc_price is not None and pc_price != "":
-                    try:
-                        self._cache.last_trade_price[pc_token] = float(pc_price)
-                    except (TypeError, ValueError):
-                        pass
+                    self._set_last_trade(pc_token, pc_price)
 
 
         # last_trade_price (top-level field on dedicated event_type)
@@ -296,21 +329,12 @@ class MarketWS:
             return
         ltp = msg.get("last_trade_price")
         if isinstance(ltp, list) and len(ltp) >= 1:
-            try:
-                self._cache.last_trade_price[token] = float(ltp[0])
-            except (TypeError, ValueError):
-                pass
+            self._set_last_trade(token, ltp[0])
         elif isinstance(ltp, dict):
             price = ltp.get("price") or ltp.get("last_trade_price")
             if price not in (None, ""):
-                try:
-                    self._cache.last_trade_price[token] = float(price)
-                except (TypeError, ValueError):
-                    pass
+                self._set_last_trade(token, price)
         elif isinstance(ltp, str) and ltp and token:
             # top-level last_trade_price event: { event_type, asset_id,
             # price, side, size, fee_rate_bps, timestamp }
-            try:
-                self._cache.last_trade_price[token] = float(ltp)
-            except (TypeError, ValueError):
-                pass
+            self._set_last_trade(token, ltp)

@@ -517,11 +517,36 @@ def _settle_state(monkeypatch, db):
 def _prev_round(*, open_px=100.0, qty=5.0, side="UP", cost=2.0, ts=1_000):
     return SimpleNamespace(
         round_start_ts=ts,
-        market=SimpleNamespace(btc_spot_at_window_open=open_px),
+        market=SimpleNamespace(
+            btc_spot_at_window_open=open_px,
+            token_up_id=UP,
+            token_down_id=DOWN,
+        ),
         position=SimpleNamespace(
             total_qty=qty, entry_side=side, total_cost=cost
         ),
     )
+
+
+def _settle_state_with_prices(
+    monkeypatch, db, *, up_px=0.0, down_px=0.0, age_s=0.0
+):
+    from src import main as main_mod
+
+    pc = PriceCache()
+    if up_px > 0:
+        pc.last_trade_price[UP] = up_px
+        pc.last_trade_ts[UP] = time.time() - age_s
+    if down_px > 0:
+        pc.last_trade_price[DOWN] = down_px
+        pc.last_trade_ts[DOWN] = time.time() - age_s
+    monkeypatch.setattr(
+        main_mod,
+        "STATE",
+        SimpleNamespace(db=db, price_cache=pc),
+        raising=False,
+    )
+    return main_mod
 
 
 def _runtime(*, close_px=101.0, cache_px=0.0):
@@ -571,6 +596,56 @@ def test_rollover_without_prices_books_the_held_side_as_a_loss(monkeypatch) -> N
     main_mod._settle_round_at_rollover(
         _runtime(close_px=0.0),
         _prev_round(open_px=100.0, side="UP"),
+    )
+    assert db.calls == [(1_000, False, "BTC-5m")]
+
+
+def test_price_cache_latest_prefers_the_freshest_source() -> None:
+    pc = PriceCache()
+    pc.last_trade_price[UP] = 0.40
+    pc.last_trade_ts[UP] = 100.0
+    pc.midpoint[UP] = 0.50
+    pc.midpoint_ts[UP] = 200.0
+    assert pc.latest(UP) == (0.50, 200.0, "midpoint")
+    pc.last_trade_ts[UP] = 300.0
+    assert pc.latest(UP) == (0.40, 300.0, "last_trade")
+
+
+def test_rollover_prefers_last_polymarket_updown_prices(monkeypatch) -> None:
+    """The Polymarket book says DOWN even though the underlying rose."""
+    db = _SettleDB()
+    main_mod = _settle_state_with_prices(
+        monkeypatch, db, up_px=0.02, down_px=0.98
+    )
+    main_mod._settle_round_at_rollover(
+        _runtime(close_px=101.0), _prev_round(open_px=100.0, side="UP")
+    )
+    assert db.calls == [(1_000, False, "BTC-5m")]
+
+
+def test_rollover_near_50_50_token_prices_fall_back_to_underlying(
+    monkeypatch,
+) -> None:
+    db = _SettleDB()
+    main_mod = _settle_state_with_prices(
+        monkeypatch, db, up_px=0.51, down_px=0.49
+    )
+    # Token prices are too close to call; the underlying fell -> DOWN.
+    main_mod._settle_round_at_rollover(
+        _runtime(close_px=99.0), _prev_round(open_px=100.0)
+    )
+    assert db.calls == [(1_000, False, "BTC-5m")]
+
+
+def test_rollover_stale_token_prices_fall_back_to_underlying(
+    monkeypatch,
+) -> None:
+    db = _SettleDB()
+    main_mod = _settle_state_with_prices(
+        monkeypatch, db, up_px=0.98, down_px=0.02, age_s=60.0
+    )
+    main_mod._settle_round_at_rollover(
+        _runtime(close_px=99.0), _prev_round(open_px=100.0)
     )
     assert db.calls == [(1_000, False, "BTC-5m")]
 
