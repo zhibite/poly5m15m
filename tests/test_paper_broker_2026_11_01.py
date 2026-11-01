@@ -489,3 +489,169 @@ def test_sell_fill_shows_its_own_realized_pnl(conn) -> None:
     assert by_id["f-sell"]["realized_pnl_pct"] == pytest.approx(
         expected / basis
     )
+
+
+# ---------------------------------------------------------------------------
+# Window-end settlement (2026-11-01 operator report: unsold rounds lingered)
+# ---------------------------------------------------------------------------
+
+
+class _SettleDB:
+    def __init__(self) -> None:
+        self.calls: list[tuple[int, bool, str]] = []
+
+    def set_round_resolution_if_unresolved(self, ts, up_won, *, market):
+        self.calls.append((int(ts), bool(up_won), market))
+        return True
+
+
+def _settle_state(monkeypatch, db):
+    from src import main as main_mod
+
+    monkeypatch.setattr(
+        main_mod, "STATE", SimpleNamespace(db=db), raising=False
+    )
+    return main_mod
+
+
+def _prev_round(*, open_px=100.0, qty=5.0, side="UP", cost=2.0, ts=1_000):
+    return SimpleNamespace(
+        round_start_ts=ts,
+        market=SimpleNamespace(btc_spot_at_window_open=open_px),
+        position=SimpleNamespace(
+            total_qty=qty, entry_side=side, total_cost=cost
+        ),
+    )
+
+
+def _runtime(*, close_px=101.0, cache_px=0.0):
+    ctx = SimpleNamespace(prev_window_btc_close=close_px)
+
+    class _WM:
+        def get(self, asset):  # noqa: ARG002
+            return ctx
+
+    return SimpleNamespace(
+        key="BTC-5m",
+        spec=SimpleNamespace(asset="BTC"),
+        wm=_WM(),
+        binance_cache=SimpleNamespace(last_price=cache_px, ts_ms=0),
+    )
+
+
+def test_rollover_settles_unsold_position_from_boundary_prices(monkeypatch) -> None:
+    db = _SettleDB()
+    main_mod = _settle_state(monkeypatch, db)
+
+    main_mod._settle_round_at_rollover(
+        _runtime(close_px=101.0), _prev_round(open_px=100.0)
+    )
+    assert db.calls == [(1_000, True, "BTC-5m")]
+
+    db.calls.clear()
+    main_mod._settle_round_at_rollover(
+        _runtime(close_px=99.0), _prev_round(open_px=100.0)
+    )
+    assert db.calls == [(1_000, False, "BTC-5m")]
+
+
+def test_rollover_without_prices_books_the_held_side_as_a_loss(monkeypatch) -> None:
+    db = _SettleDB()
+    main_mod = _settle_state(monkeypatch, db)
+
+    # No close price, holding DOWN -> DOWN must lose (up_won=True).
+    main_mod._settle_round_at_rollover(
+        _runtime(close_px=0.0),
+        _prev_round(open_px=100.0, side="DOWN"),
+    )
+    assert db.calls == [(1_000, True, "BTC-5m")]
+
+    db.calls.clear()
+    # Holding UP -> UP must lose (up_won=False).
+    main_mod._settle_round_at_rollover(
+        _runtime(close_px=0.0),
+        _prev_round(open_px=100.0, side="UP"),
+    )
+    assert db.calls == [(1_000, False, "BTC-5m")]
+
+
+def test_local_resolution_falls_back_to_forced_loss(conn) -> None:
+    from src import main as main_mod
+
+    db = DB(conn)
+    round_ts = int(time.time()) - 3_600
+    db.upsert_round(
+        round_start_ts=round_ts, slug="xrp-loss", condition_id="0xcid",
+        up_token="UP", down_token="DOWN",
+        market="XRP-5m", asset="XRP", interval="5m",
+    )
+    db.insert_fill(
+        "f-x", "o-x", round_ts, "UP", "BUY", 0.40, 5.0,
+        ts_ms=round_ts * 1000, market="XRP-5m", asset="XRP", interval="5m",
+    )
+
+    class _NoSpot:
+        async def fetch_boundary_price(self, ts):
+            return None
+
+    state = SimpleNamespace(
+        asset_spot={"XRP": _NoSpot()}, db=db, db_conn=conn
+    )
+    result = asyncio.run(
+        main_mod._resolve_round_locally(
+            state,
+            round_ts=round_ts,
+            period_s=300,
+            asset="XRP",
+            market="XRP-5m",
+            up_token="UP",
+            down_token="DOWN",
+            now=time.time(),
+        )
+    )
+    assert result == (False, "forced_loss")
+    row = conn.execute(
+        "SELECT resolved, up_won FROM rounds WHERE round_start_ts=? AND market=?",
+        (round_ts, "XRP-5m"),
+    ).fetchone()
+    assert row == (1, 0)
+
+
+def test_resolution_loop_uses_boundary_prices_when_gamma_is_late(conn) -> None:
+    from src import main as main_mod
+
+    db = DB(conn)
+    round_ts = int(time.time()) - 3_600
+    db.upsert_round(
+        round_start_ts=round_ts, slug="xrp-local", condition_id="0xcid",
+        up_token="UP", down_token="DOWN",
+        market="XRP-5m", asset="XRP", interval="5m",
+    )
+    db.insert_fill(
+        "f-local", "o-local", round_ts, "UP", "BUY", 0.40, 5.0,
+        ts_ms=round_ts * 1000, market="XRP-5m", asset="XRP", interval="5m",
+    )
+
+    class _PM:
+        async def get_market_resolution(self, cid, slug=None):  # noqa: ARG002
+            return {"resolved": False, "up_wins": None}
+
+    class _Spot:
+        def __init__(self):
+            self.prices = [100.0, 101.0]
+
+        async def fetch_boundary_price(self, ts):  # noqa: ARG002
+            return self.prices.pop(0)
+
+    state = SimpleNamespace(
+        pm_client=_PM(), db=db, db_conn=conn,
+        asset_spot={"XRP": _Spot()},
+    )
+    attempts: dict = {}
+    assert asyncio.run(main_mod._resolve_rounds_once(state, attempts)) == 1
+    row = conn.execute(
+        "SELECT resolved, up_won FROM rounds WHERE round_start_ts=? AND market=?",
+        (round_ts, "XRP-5m"),
+    ).fetchone()
+    assert row == (1, 1), "close 101 > open 100 should resolve UP"
+    assert attempts == {}

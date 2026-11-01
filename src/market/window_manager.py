@@ -238,11 +238,17 @@ class WindowManager:
                         )
                     except Exception:
                         close_px = None
-                    if close_px is not None and close_px > 0:
-                        for asset in self._symbols:
-                            ctx = self._ctxs.get(asset)
-                            if ctx is not None and ctx.market is not None:
-                                ctx.prev_window_btc_close = float(close_px)
+                    for asset in self._symbols:
+                        ctx = self._ctxs.get(asset)
+                        if ctx is None or ctx.market is None:
+                            continue
+                        # Always overwrite: leaving the previous boundary's
+                        # value on a failed sample made the settlement
+                        # fallback compare against a stale 5m/15m-old price.
+                        if close_px is not None and close_px > 0:
+                            ctx.prev_window_btc_close = float(close_px)
+                        else:
+                            ctx.prev_window_btc_close = None
 
                 prev = self._last_round_start
                 self._last_round_start = next_boundary

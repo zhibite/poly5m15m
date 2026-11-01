@@ -34,6 +34,7 @@ import asyncio
 import signal
 import sys
 import time
+from datetime import datetime, timezone
 from typing import Optional
 
 from src.config import binance, general, log_config, strategy
@@ -411,10 +412,115 @@ def _on_market_discovered_rt(rt: MarketRuntime, asset: str, mkt) -> None:
     )
 
 
+def _round_close_price(rt: MarketRuntime) -> tuple[float, str]:
+    """Best available underlying price at the window boundary."""
+    ctx = rt.wm.get(rt.spec.asset) if rt.wm else None
+    if ctx is not None:
+        try:
+            px = float(ctx.prev_window_btc_close or 0.0)
+        except (TypeError, ValueError):
+            px = 0.0
+        if px > 0:
+            return px, "window_boundary_sample"
+    cache = rt.binance_cache
+    px = float(getattr(cache, "last_price", 0.0) or 0.0)
+    ts_ms = getattr(cache, "ts_ms", 0) or 0
+    try:
+        age_s = time.time() - int(ts_ms) / 1000.0
+    except (TypeError, ValueError):
+        age_s = None
+    if px > 0 and (age_s is None or age_s <= 10.0):
+        return px, "binance_ws"
+    return 0.0, "unavailable"
+
+
+def _settle_round_at_rollover(rt: MarketRuntime, prev_round) -> None:
+    """Settle the just-ended paper round immediately.
+
+    Waiting for Gamma left unsold paper ladders labelled 未平仓 long
+    after their window closed (operator report 2026-11-01). The up/down
+    outcome is determined locally from the underlying's open/close price;
+    if neither price is available and a position is still held, the
+    operator's rule is to book the whole position as a loss.
+    """
+    prev = int(prev_round.round_start_ts)
+    pos = prev_round.position
+    qty = float(getattr(pos, "total_qty", 0.0) or 0.0)
+    side = getattr(pos, "entry_side", None)
+    cost = float(getattr(pos, "total_cost", 0.0) or 0.0)
+
+    open_px = 0.0
+    mkt = getattr(prev_round, "market", None)
+    if mkt is not None:
+        open_px = float(
+            getattr(mkt, "btc_spot_at_window_open", 0.0) or 0.0
+        )
+    close_px, close_src = _round_close_price(rt)
+
+    source = "local_price"
+    if open_px > 0 and close_px > 0:
+        # Polymarket Up/Down: Up wins when the close is strictly above
+        # the open. A tie resolves Down.
+        up_won = close_px > open_px
+    elif qty > 1e-9 and side in ("UP", "DOWN"):
+        up_won = side == "DOWN"  # make the held side lose
+        source = "forced_loss"
+        log.warning(
+            "round.settle_forced_loss",
+            market=rt.key,
+            round_start_ts=prev,
+            side=side,
+            qty=round(qty, 4),
+            cost=round(cost, 4),
+            open_px=open_px or None,
+            close_px=close_px or None,
+            close_source=close_src,
+            note="no boundary price available; booking the unsold paper "
+                 "position as a full loss",
+        )
+    else:
+        # No inventory (e.g. TP exited) — an arbitrary outcome is harmless
+        # because the dashboard only settles remaining shares.
+        up_won = False
+        source = "no_inventory"
+
+    try:
+        wrote = STATE.db.set_round_resolution_if_unresolved(
+            prev, bool(up_won), market=rt.key
+        )
+    except Exception as exc:  # noqa: BLE001
+        log.warning(
+            "round.settle_local_failed", market=rt.key, error=str(exc)
+        )
+        return
+    log.info(
+        "round.settled_at_window_end",
+        market=rt.key,
+        round_start_ts=prev,
+        up_won=bool(up_won),
+        source=source,
+        open_px=open_px or None,
+        close_px=close_px or None,
+        close_source=close_src,
+        side=side,
+        qty=round(qty, 4),
+        cost=round(cost, 4),
+        wrote=wrote,
+    )
+
+
 async def _on_new_round_rt(rt: MarketRuntime, round_start_ts: int) -> None:
     """Per-market round rollover: cancel paper orders, rotate engine state."""
     prev = rt.round_start_ts
     if prev > 0:
+        # The engine still holds the previous round here. Settle it before
+        # `on_round_end()` drops the position / market reference.
+        prev_round = rt.engine._round
+        if prev_round is not None and int(prev_round.round_start_ts) == prev:
+            try:
+                _settle_round_at_rollover(rt, prev_round)
+            except Exception:
+                log.exception("round.settle_at_rollover_failed", market=rt.key)
         try:
             cancelled = await rt.broker.cancel_round(prev)
             if cancelled:
@@ -2467,6 +2573,149 @@ _RESOLUTION_GRACE_S = 15.0
 _RESOLUTION_LOOKBACK_S = 30 * 86400
 _RESOLUTION_MAX_ATTEMPTS = 40
 _RESOLUTION_BATCH = 50
+# 2026-11-01: paper rounds are settled locally from Binance boundary
+# prices when Gamma has not answered `_LOCAL_SETTLE_DELAY_S` after the
+# window closed. If no price is available and a position is still held,
+# `_FORCED_LOSS_DELAY_S` later the whole position is booked as a loss
+# (operator rule: an unsold paper ladder must not stay 未平仓 forever).
+_LOCAL_SETTLE_DELAY_S = 90.0
+_FORCED_LOSS_DELAY_S = 600.0
+
+
+def _round_held_side(
+    state: AppState,
+    round_ts: int,
+    market: str,
+    up_token: str,
+    down_token: str,
+) -> str | None:
+    """Net held side from the round's fills (UP/DOWN), or None if flat."""
+    conn = getattr(state, "db_conn", None)
+    if conn is None:
+        return None
+    try:
+        rows = conn.execute(
+            "SELECT token_id, side, price, size FROM fills "
+            "WHERE round_start_ts=? AND market=?",
+            (int(round_ts), market),
+        ).fetchall()
+    except Exception:  # noqa: BLE001
+        return None
+    net: dict[str, float] = {}
+    for token_id, side, price, size in rows:
+        try:
+            px = float(price or 0.0)
+            sz = float(size or 0.0)
+        except (TypeError, ValueError):
+            continue
+        if px <= 0 or sz <= 0:
+            continue
+        tok = str(token_id or "")
+        net[tok] = net.get(tok, 0.0) + (
+            sz if str(side or "").upper() == "BUY" else -sz
+        )
+    held = [(qty, tok) for tok, qty in net.items() if qty > 1e-9]
+    if not held:
+        return None
+    token = max(held)[1]
+    if up_token and token == str(up_token):
+        return "UP"
+    if down_token and token == str(down_token):
+        return "DOWN"
+    return None
+
+
+async def _resolve_round_locally(
+    state: AppState,
+    *,
+    round_ts: int,
+    period_s: int,
+    asset: str,
+    market: str,
+    up_token: str,
+    down_token: str,
+    now: float,
+) -> tuple[bool, str] | None:
+    """Fallback settlement from Binance boundary prices.
+
+    Returns `(up_won, source)` when the round was written, else None.
+    """
+    end_ts = round_ts + period_s
+    if now < end_ts + _LOCAL_SETTLE_DELAY_S:
+        return None
+    assets = getattr(state, "asset_spot", None) or {}
+    spot = assets.get(asset)
+    if spot is None and str(asset or "").upper() == "BTC":
+        # Legacy live state only carries the single BTC spot service.
+        spot = getattr(state, "binance_spot", None)
+
+    open_px = close_px = None
+    if spot is not None:
+        try:
+            open_px = await asyncio.wait_for(
+                spot.fetch_boundary_price(
+                    datetime.fromtimestamp(round_ts, tz=timezone.utc)
+                ),
+                timeout=8.0,
+            )
+            close_px = await asyncio.wait_for(
+                spot.fetch_boundary_price(
+                    datetime.fromtimestamp(end_ts, tz=timezone.utc)
+                ),
+                timeout=8.0,
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.debug(
+                "round.resolve.local_price_failed",
+                market=market, round_start_ts=round_ts, error=str(exc),
+            )
+    if open_px and close_px and open_px > 0:
+        up_won = float(close_px) > float(open_px)
+        db = getattr(state, "db", None)
+        if db is not None:
+            wrote = db.set_round_resolution_if_unresolved(
+                round_ts, up_won, market=market
+            )
+            if wrote:
+                log.info(
+                    "round.resolved.local_price",
+                    market=market,
+                    round_start_ts=round_ts,
+                    up_won=up_won,
+                    open_px=open_px,
+                    close_px=close_px,
+                )
+                return up_won, "local_price"
+        return None
+
+    # No usable price. After a generous delay, book the held side as a
+    # full loss so the round cannot linger as 未平仓 forever.
+    if now < end_ts + _FORCED_LOSS_DELAY_S:
+        return None
+    held_side = _round_held_side(
+        state, round_ts, market, up_token, down_token
+    )
+    if held_side is None:
+        return None
+    up_won = held_side == "DOWN"
+    db = getattr(state, "db", None)
+    if db is None:
+        return None
+    wrote = db.set_round_resolution_if_unresolved(
+        round_ts, up_won, market=market
+    )
+    if wrote:
+        log.warning(
+            "round.resolved.forced_loss",
+            market=market,
+            round_start_ts=round_ts,
+            side=held_side,
+            up_won=up_won,
+            note="no Gamma outcome and no Binance boundary price; booking "
+                 "the unsold paper position as a full loss",
+        )
+        return up_won, "forced_loss"
+    return None
 
 
 async def _resolve_rounds_once(
@@ -2519,6 +2768,7 @@ async def _resolve_rounds_once(
         if tries >= _RESOLUTION_MAX_ATTEMPTS:
             continue
         attempts[key] = tries + 1
+        res = None
         try:
             res = await asyncio.wait_for(
                 pm.get_market_resolution(cid, slug=slug or None),
@@ -2532,34 +2782,51 @@ async def _resolve_rounds_once(
                 market=market,
                 round_start_ts=round_ts, cid=(cid or "")[:12], error=str(exc),
             )
-            continue
-        if not res or not res.get("resolved"):
-            continue
-        up_won = bool(res.get("up_wins"))
-        try:
-            if len(row) >= 8:
-                db.set_round_resolution(
-                    round_ts, up_won, market=market
+        if res and res.get("resolved"):
+            up_won = bool(res.get("up_wins"))
+            try:
+                if len(row) >= 8:
+                    db.set_round_resolution(
+                        round_ts, up_won, market=market
+                    )
+                else:
+                    db.set_round_resolution(round_ts, up_won)
+            except Exception as exc:  # noqa: BLE001
+                log.warning(
+                    "round.resolve.persist_failed",
+                    market=market,
+                    round_start_ts=round_ts, error=str(exc),
                 )
-            else:
-                db.set_round_resolution(round_ts, up_won)
-        except Exception as exc:  # noqa: BLE001
-            log.warning(
-                "round.resolve.persist_failed",
+                continue
+            attempts.pop(key, None)
+            resolved_count += 1
+            log.info(
+                "round.resolved",
                 market=market,
-                round_start_ts=round_ts, error=str(exc),
+                round_start_ts=round_ts,
+                slug=slug or "",
+                up_won=up_won,
+                note="settlement outcome recorded for PnL accounting",
             )
             continue
-        attempts.pop(key, None)
-        resolved_count += 1
-        log.info(
-            "round.resolved",
-            market=market,
-            round_start_ts=round_ts,
-            slug=slug or "",
-            up_won=up_won,
-            note="settlement outcome recorded for PnL accounting",
-        )
+
+        # Gamma has no outcome (lag, error, or a series it does not
+        # resolve): paper rounds fall back to the underlying's boundary
+        # prices, then to a forced full loss.
+        if len(row) >= 8:
+            local = await _resolve_round_locally(
+                state,
+                round_ts=round_ts,
+                period_s=period_s,
+                asset=str(_asset or "BTC"),
+                market=market,
+                up_token=up_token,
+                down_token=down_token,
+                now=now,
+            )
+            if local is not None:
+                attempts.pop(key, None)
+                resolved_count += 1
 
     # Bound the attempts map on a long-lived process.
     if len(attempts) > 500:

@@ -253,6 +253,35 @@ class DB:
         )
         self._c.commit()
 
+    def set_round_resolution_if_unresolved(
+        self,
+        round_start_ts: int,
+        up_won: bool,
+        *,
+        market: str = "BTC-15m",
+    ) -> bool:
+        """Record an outcome only when the round is still unresolved.
+
+        Used by the paper bot's local (Binance-price) settlement fallback:
+        an authoritative Gamma result that arrived first must not be
+        overwritten by the approximation.
+
+        Returns True when this call wrote the row.
+        """
+        cur = self._c.execute(
+            "UPDATE rounds SET resolved=1, up_won=?, resolved_at=? "
+            "WHERE round_start_ts=? AND market=? "
+            "AND COALESCE(resolved, 0) = 0",
+            (
+                1 if up_won else 0,
+                datetime.now(timezone.utc).isoformat(),
+                int(round_start_ts),
+                market,
+            ),
+        )
+        self._c.commit()
+        return cur.rowcount > 0
+
     def set_round_resolution(
         self,
         round_start_ts: int,
