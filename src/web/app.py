@@ -321,18 +321,39 @@ async def api_status(
     return status_mod.build_status(_state(), market=market)
 
 
+# Stats are computed over a stable recent window, independent of the
+# currently visible page, so paging the 轮次记录 table does not make the
+# headline PnL/win-rate jump around.
+_STATS_ROUND_LIMIT = 500
+
+
 @app.get("/api/rounds")
 async def api_rounds(
     limit: int = Query(50, ge=1, le=500),
+    offset: int = Query(0, ge=0),
     market: str | None = Query(None),
     asset: str | None = Query(None),
     interval: str | None = Query(None),
     _: None = Depends(_require_auth),
 ) -> dict[str, Any]:
+    conn = _conn()
     rounds = status_mod.rounds_with_pnl(
-        _conn(), limit, market=market, asset=asset, interval=interval
+        conn, limit, offset=offset,
+        market=market, asset=asset, interval=interval,
     )
-    return {"rounds": rounds, "stats": status_mod.compute_stats(rounds)}
+    stats_rounds = status_mod.rounds_with_pnl(
+        conn, _STATS_ROUND_LIMIT,
+        market=market, asset=asset, interval=interval,
+    )
+    return {
+        "rounds": rounds,
+        "total": status_mod.count_rounds(
+            conn, market=market, asset=asset, interval=interval
+        ),
+        "limit": int(limit),
+        "offset": int(offset),
+        "stats": status_mod.compute_stats(stats_rounds),
+    }
 
 
 @app.get("/api/fills")
@@ -360,6 +381,7 @@ async def api_fills(
 @app.get("/api/trades")
 async def api_trades(
     limit: int = Query(100, ge=1, le=500),
+    offset: int = Query(0, ge=0),
     market: str | None = Query(None),
     asset: str | None = Query(None),
     interval: str | None = Query(None),
@@ -367,14 +389,24 @@ async def api_trades(
 ) -> dict[str, Any]:
     conn = _conn()
     rounds = status_mod.rounds_with_pnl(
-        conn, limit, market=market, asset=asset, interval=interval
+        conn, limit, offset=offset,
+        market=market, asset=asset, interval=interval,
+    )
+    stats_rounds = status_mod.rounds_with_pnl(
+        conn, _STATS_ROUND_LIMIT,
+        market=market, asset=asset, interval=interval,
     )
     return {
         "rounds": rounds,
+        "total": status_mod.count_rounds(
+            conn, market=market, asset=asset, interval=interval
+        ),
+        "limit": int(limit),
+        "offset": int(offset),
         "fills": status_mod.recent_fills(
             conn, limit * 2, market=market, asset=asset, interval=interval
         ),
-        "stats": status_mod.compute_stats(rounds),
+        "stats": status_mod.compute_stats(stats_rounds),
         "quality": status_mod.execution_quality(
             conn, market=market, asset=asset, interval=interval
         ),

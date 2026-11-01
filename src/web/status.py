@@ -332,8 +332,37 @@ WHERE (EXISTS (SELECT 1 FROM orders o2
 {filters}
 GROUP BY r.round_start_ts, r.market
 ORDER BY r.round_start_ts DESC, r.market ASC
-LIMIT ?
+LIMIT ? OFFSET ?
 """
+
+_ROUNDS_COUNT_SQL = """
+SELECT COUNT(*) FROM (
+  SELECT r.round_start_ts, r.market
+  FROM rounds r
+  WHERE (EXISTS (SELECT 1 FROM orders o2
+                  WHERE o2.round_start_ts = r.round_start_ts
+                    AND o2.market = r.market)
+      OR EXISTS (SELECT 1 FROM fills f2
+                  WHERE f2.round_start_ts = r.round_start_ts
+                    AND f2.market = r.market))
+  {filters}
+  GROUP BY r.round_start_ts, r.market
+)
+"""
+
+
+def _round_filters(
+    market: str | None, asset: str | None, interval: str | None
+) -> tuple[str, list[Any]]:
+    filters: list[str] = []
+    args: list[Any] = []
+    for column, value in (
+        ("r.market", market), ("r.asset", asset), ("r.interval", interval),
+    ):
+        if value:
+            filters.append(f"AND {column}=?")
+            args.append(str(value))
+    return "\n".join(filters), args
 
 
 def _round_realized_pnl(
@@ -464,6 +493,8 @@ def _round_realized_pnl(
 def rounds_with_pnl(
     conn: Any,
     limit: int = 100,
+    *,
+    offset: int = 0,
     market: str | None = None,
     asset: str | None = None,
     interval: str | None = None,
@@ -485,18 +516,11 @@ def rounds_with_pnl(
     nothing was ever bought (e.g. every BUY rejected for insufficient
     balance) lingered in the history as phantom open positions.
     """
-    filters: list[str] = []
-    args: list[Any] = []
-    for column, value in (
-        ("r.market", market), ("r.asset", asset), ("r.interval", interval),
-    ):
-        if value:
-            filters.append(f"AND {column}=?")
-            args.append(str(value))
-    sql = _ROUNDS_SQL.replace(
-        "{filters}", "\n".join(filters)
-    )
-    rows = conn.execute(sql, (*args, int(limit))).fetchall()
+    filters, args = _round_filters(market, asset, interval)
+    sql = _ROUNDS_SQL.replace("{filters}", filters)
+    rows = conn.execute(
+        sql, (*args, int(limit), max(0, int(offset)))
+    ).fetchall()
     wanted = {(str(row[1] or "BTC-15m"), int(row[0])) for row in rows}
     if wanted:
         (realized, cost_sold, open_positions, pnl_today, sells_today,
@@ -635,6 +659,21 @@ def rounds_with_pnl(
             "open_qty": 0.0 if settle_pnl is not None else qty_open,
         })
     return out
+
+
+def count_rounds(
+    conn: Any,
+    *,
+    market: str | None = None,
+    asset: str | None = None,
+    interval: str | None = None,
+) -> int:
+    """Total number of rounds with activity (pagination denominator)."""
+    filters, args = _round_filters(market, asset, interval)
+    row = conn.execute(
+        _ROUNDS_COUNT_SQL.replace("{filters}", filters), args
+    ).fetchone()
+    return int(row[0] or 0) if row else 0
 
 
 def compute_stats(rounds: list[dict[str, Any]]) -> dict[str, Any]:

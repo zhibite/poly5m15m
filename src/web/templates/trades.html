@@ -91,6 +91,11 @@
         <tbody id="rounds-tbody"><tr><td colspan="13" class="no-data">加载中...</td></tr></tbody>
       </table>
     </div>
+    <div class="pager" id="rounds-pager" hidden>
+      <button class="btn btn-ghost btn-sm" id="round-prev" type="button">上一页</button>
+      <span class="pager-info" id="round-page-info">--</span>
+      <button class="btn btn-ghost btn-sm" id="round-next" type="button">下一页</button>
+    </div>
   </div>
 
   <div class="section">
@@ -131,6 +136,10 @@ const outcomePill = (o) => {
 const FILL_PAGE_SIZE = 20;
 let fillOffset = 0;
 let fillTotal = 0;
+// 轮次记录独立分页：统计卡片始终基于最近 500 轮，不随页码变化。
+const ROUND_PAGE_SIZE = 20;
+let roundOffset = 0;
+let roundTotal = 0;
 let MARKET = new URLSearchParams(location.search).get('market') || '';
 
 function marketParam() {
@@ -149,6 +158,7 @@ async function loadMarkets() {
     sel.addEventListener('change', () => {
       MARKET = sel.value;
       fillOffset = 0;
+      roundOffset = 0;
       const url = new URL(location.href);
       if (MARKET) url.searchParams.set('market', MARKET);
       else url.searchParams.delete('market');
@@ -211,7 +221,7 @@ function renderQuality(q) {
 }
 
 function renderRounds(rounds) {
-  $('round-count').textContent = rounds.length;
+  $('round-count').textContent = roundTotal || rounds.length;
   const body = $('rounds-tbody');
   if (!rounds.length) {
     body.innerHTML = '<tr><td colspan="13" class="no-data">暂无记录（下单成交后会出现在这里）</td></tr>';
@@ -290,6 +300,16 @@ function renderFills(fills) {
   }).join('');
 }
 
+function renderRoundPager() {
+  const pages = Math.max(1, Math.ceil(roundTotal / ROUND_PAGE_SIZE));
+  const page = Math.floor(roundOffset / ROUND_PAGE_SIZE) + 1;
+  $('round-count').textContent = roundTotal;
+  $('round-page-info').textContent = `第 ${page} / ${pages} 页 · 共 ${roundTotal} 轮`;
+  $('round-prev').disabled = roundOffset <= 0;
+  $('round-next').disabled = roundOffset + ROUND_PAGE_SIZE >= roundTotal;
+  $('rounds-pager').hidden = roundTotal <= ROUND_PAGE_SIZE;
+}
+
 function renderFillPager() {
   const pages = Math.max(1, Math.ceil(fillTotal / FILL_PAGE_SIZE));
   const page = Math.floor(fillOffset / FILL_PAGE_SIZE) + 1;
@@ -319,10 +339,21 @@ async function refreshFills() {
 
 async function refresh() {
   try {
-    const d = await getJSON(`/api/trades?limit=300${marketParam()}`);
+    const d = await getJSON(
+      `/api/trades?limit=${ROUND_PAGE_SIZE}&offset=${roundOffset}${marketParam()}`
+    );
+    roundTotal = Number(d.total || 0);
+    // A shrinking history (manual cleanup) must not leave us past the end.
+    const pages = Math.max(1, Math.ceil(roundTotal / ROUND_PAGE_SIZE));
+    const maxOffset = (pages - 1) * ROUND_PAGE_SIZE;
+    if (roundOffset > maxOffset) {
+      roundOffset = maxOffset;
+      return refresh();
+    }
     renderStats(d.stats);
     renderQuality(d.quality);
     renderRounds(d.rounds || []);
+    renderRoundPager();
     await refreshFills();
     setLive(true);
   } catch (e) {
@@ -330,6 +361,16 @@ async function refresh() {
   }
 }
 
+$('round-prev').addEventListener('click', () => {
+  if (roundOffset < ROUND_PAGE_SIZE) return;
+  roundOffset -= ROUND_PAGE_SIZE;
+  refresh().catch(() => setLive(false));
+});
+$('round-next').addEventListener('click', () => {
+  if (roundOffset + ROUND_PAGE_SIZE >= roundTotal) return;
+  roundOffset += ROUND_PAGE_SIZE;
+  refresh().catch(() => setLive(false));
+});
 $('fill-prev').addEventListener('click', () => {
   if (fillOffset < FILL_PAGE_SIZE) return;
   fillOffset -= FILL_PAGE_SIZE;

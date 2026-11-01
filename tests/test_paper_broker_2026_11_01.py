@@ -730,3 +730,30 @@ def test_resolution_loop_uses_boundary_prices_when_gamma_is_late(conn) -> None:
     ).fetchone()
     assert row == (1, 1), "close 101 > open 100 should resolve UP"
     assert attempts == {}
+
+
+def test_rounds_pagination_is_stable_and_counted(conn) -> None:
+    db = DB(conn)
+    for i in range(45):
+        ts = 1_000 + i * 300
+        db.upsert_round(
+            round_start_ts=ts, slug=f"r{i}",
+            market="BTC-5m", asset="BTC", interval="5m",
+        )
+        db.insert_fill(
+            f"f{i}", f"o{i}", ts, "UP", "BUY", 0.40, 5.0,
+            ts_ms=ts * 1000,
+            market="BTC-5m", asset="BTC", interval="5m",
+        )
+
+    assert status_mod.count_rounds(conn) == 45
+    page1 = status_mod.rounds_with_pnl(conn, 20, offset=0)
+    page2 = status_mod.rounds_with_pnl(conn, 20, offset=20)
+    page3 = status_mod.rounds_with_pnl(conn, 20, offset=40)
+    ts = [r["round_start_ts"] for r in page1 + page2 + page3]
+    assert len(ts) == 45
+    assert len(set(ts)) == 45, "round pages overlap or skip rows"
+    # Newest first.
+    assert ts[0] == 1_000 + 44 * 300
+    assert ts[-1] == 1_000
+    assert len(page3) == 5
