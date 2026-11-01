@@ -536,12 +536,17 @@ def rounds_with_pnl(
         .timestamp() * 1000
     )
     out: list[dict[str, Any]] = []
+    now_ts = time.time()
     for row in rows:
         (round_ts, row_market, row_asset, row_interval, slug, started_at,
          finished_at, resolved, up_won, resolved_at, up_token, down_token,
          buy_cost, sell_proceeds, fill_count, order_count,
          cancel_count) = row
         key = (str(row_market or "BTC-15m"), int(round_ts))
+        period_s = _ROUND_PERIOD_S.get(
+            str(row_interval or "15m"), _DEFAULT_PERIOD_S
+        )
+        window_ended = (float(round_ts) + period_s) <= now_ts
         resolved = bool(resolved)
         up_won_b = None if up_won is None else bool(up_won)
         buy_cost = float(buy_cost or 0.0)
@@ -585,11 +590,16 @@ def rounds_with_pnl(
         if resolved and (qty_open <= 0 or settle_pnl is not None):
             round_status = "closed"
         elif qty_open > 0:
-            round_status = "holding" if has_sells else "open"
+            # The window is over but Gamma has not answered yet: this is
+            # not an "open position" any more, it is awaiting settlement.
+            if window_ended:
+                round_status = "settling"
+            else:
+                round_status = "holding" if has_sells else "open"
         elif has_sells:
             round_status = "closed"
         elif fill_count > 0:
-            round_status = "open"
+            round_status = "settling" if window_ended else "open"
         else:
             round_status = "unfilled"
 
@@ -610,9 +620,6 @@ def rounds_with_pnl(
         # moment Gamma answered: a round ending at 23:58 UTC must stay in
         # that day's PnL even if resolution lands after midnight (or the
         # bot was offline and backfilled the outcome the next day).
-        period_s = _ROUND_PERIOD_S.get(
-            str(row_interval or "15m"), _DEFAULT_PERIOD_S
-        )
         settled_today = bool(
             settle_pnl is not None
             and (float(round_ts) + period_s) * 1000.0 >= today_start_ms
@@ -679,8 +686,13 @@ def count_rounds(
 def compute_stats(rounds: list[dict[str, Any]]) -> dict[str, Any]:
     closed = [r for r in rounds if r["status"] == "closed"]
     # "未平" includes rounds still holding inventory, whether or not they
-    # already realised some sells (same-window re-entry).
-    open_rounds = [r for r in rounds if r["status"] in ("open", "holding")]
+    # already realised some sells (same-window re-entry), plus rounds
+    # whose window ended but Gamma has not resolved yet ("settling").
+    open_rounds = [
+        r for r in rounds
+        if r["status"] in ("open", "holding", "settling")
+    ]
+    settling = [r for r in rounds if r["status"] == "settling"]
     unfilled = [r for r in rounds if r["status"] == "unfilled"]
     # Win/loss is judged on REALISED PnL per round (a holding round with a
     # profitable TP already counts; a round settled at expiry counts too,
@@ -699,6 +711,7 @@ def compute_stats(rounds: list[dict[str, Any]]) -> dict[str, Any]:
     return {
         "closed_rounds": len(closed),
         "open_rounds": len(open_rounds),
+        "settling_rounds": len(settling),
         "unfilled_rounds": len(unfilled),
         "wins": len(wins),
         "losses": len(losses),

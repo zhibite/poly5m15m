@@ -233,9 +233,11 @@ function renderRounds(rounds) {
     // all rejected / never filled has no position — label it 未成交.
     const status = r.closed
       ? '<span class="pill filled">已结算</span>'
-      : (r.fill_count > 0
-          ? '<span class="pill watching">未平仓</span>'
-          : '<span class="pill idle">未成交</span>');
+      : (r.status === 'settling'
+          ? '<span class="pill settling">结算中</span>'
+          : (r.fill_count > 0
+              ? '<span class="pill watching">未平仓</span>'
+              : '<span class="pill idle">未成交</span>'));
     // 到期时仍持有的份额按 1/0 兑付，没有 SELL 成交；单独展示这部分。
     const settle = (r.settlement_usd && Math.abs(r.settlement_usd) > 1e-9)
       ? `<span class="${cls(r.settlement_usd)}">${money(r.settlement_usd)}</span>`

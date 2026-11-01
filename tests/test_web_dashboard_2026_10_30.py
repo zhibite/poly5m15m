@@ -272,11 +272,14 @@ def test_open_round_is_not_counted_as_loss(conn) -> None:
 
     rounds = status_mod.rounds_with_pnl(conn)
     assert rounds[0]["closed"] is False
-    assert rounds[0]["status"] == "open"
+    # The window is over and Gamma has not answered: the row is awaiting
+    # settlement, not an active "open" position.
+    assert rounds[0]["status"] == "settling"
     assert rounds[0]["pnl_usd"] is None
     stats = status_mod.compute_stats(rounds)
     assert stats["closed_rounds"] == 0
     assert stats["open_rounds"] == 1
+    assert stats["settling_rounds"] == 1
     assert stats["total_pnl_usd"] == 0.0
 
 
@@ -307,7 +310,7 @@ def test_round_with_only_rounding_dust_is_closed(conn) -> None:
     assert stats["closed_rounds"] == 1
 
 
-def test_round_with_a_real_partial_residual_is_still_holding(conn) -> None:
+def test_round_with_a_real_partial_residual_is_still_open(conn) -> None:
     """The dust cutoff must not hide a genuine leftover position."""
     db = DB(conn)
     db.upsert_round(round_start_ts=5_000, slug="r5")
@@ -320,7 +323,8 @@ def test_round_with_a_real_partial_residual_is_still_holding(conn) -> None:
     db.insert_fill("f5b", "c5", 5_000, "tok", "SELL", 0.50, 5.0, 5_000_200)
 
     r = status_mod.rounds_with_pnl(conn)[0]
-    assert r["status"] == "holding"
+    # The window ended but Gamma has not resolved it yet.
+    assert r["status"] == "settling"
     assert r["closed"] is False
     assert r["open_qty"] == pytest.approx(5.0)
 
@@ -525,7 +529,7 @@ def test_partial_tp_then_settlement_books_remaining_loss(conn) -> None:
     assert r["open_qty"] == 0.0
 
 
-def test_unresolved_round_stays_open_even_if_old(conn) -> None:
+def test_unresolved_round_is_settling_not_open(conn) -> None:
     """Without a Gamma outcome the position must not be guessed closed."""
     db = DB(conn)
     round_ts = int(time.time()) - 3_600
@@ -538,7 +542,8 @@ def test_unresolved_round_stays_open_even_if_old(conn) -> None:
 
     r = status_mod.rounds_with_pnl(conn)[0]
     assert r["resolved"] is False
-    assert r["status"] == "open"
+    # Ended window + no outcome = 结算中, never a guessed closed round.
+    assert r["status"] == "settling"
     assert r["closed"] is False
     assert r["pnl_usd"] is None
     assert r["open_qty"] == pytest.approx(10.0)
