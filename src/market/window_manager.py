@@ -59,18 +59,10 @@ class WindowManager:
         round_period_s: int = 900,
         on_window_baseline: WindowBaselineCallback | None = None,
         on_window_context_changed: WindowContextCallback | None = None,
-        sync_prices: bool = True,
-        retry_interval_s: float = 5.0,
     ):
         self._svc = market_svc
         self._symbols = symbols
-        # 2026-11-01: in the multi-market paper bot a single midpoint
-        # poller refreshes every token on a faster cadence. WindowManager
-        # still discovers markets and fetches window-open BTC spot, but
-        # skips its own per-tick price REST calls (14 managers × 3 calls
-        # every 5 s would duplicate that poller).
-        self._sync_prices = bool(sync_prices)
-        self._on_new = on_new_round  # fires on every window boundary
+        self._on_new = on_new_round  # fires on every 15-min boundary
         self._on_market = on_market_discovered  # fires when market info is ready
         self._binance_spot = binance_spot
         self._entry_cfg = entry_cfg
@@ -107,9 +99,7 @@ class WindowManager:
         # True before `_on_new_window()` ran, so the guard was dead code.
         self._boot_grace_done: Dict[str, bool] = {s: False for s in symbols}
         # Retry cadence for a market that was not available at the boundary.
-        # The multi-market paper bot raises this (14 managers × 3 Gamma
-        # slug queries per retry would otherwise hit the API every 5 s).
-        self._retry_interval_s = max(1.0, float(retry_interval_s))
+        self._retry_interval_s = 5.0
 
     # ── Lifecycle (15-min boundary polling) ─────────────────────────────────────
 
@@ -238,17 +228,11 @@ class WindowManager:
                         )
                     except Exception:
                         close_px = None
-                    for asset in self._symbols:
-                        ctx = self._ctxs.get(asset)
-                        if ctx is None or ctx.market is None:
-                            continue
-                        # Always overwrite: leaving the previous boundary's
-                        # value on a failed sample made the settlement
-                        # fallback compare against a stale 5m/15m-old price.
-                        if close_px is not None and close_px > 0:
-                            ctx.prev_window_btc_close = float(close_px)
-                        else:
-                            ctx.prev_window_btc_close = None
+                    if close_px is not None and close_px > 0:
+                        for asset in self._symbols:
+                            ctx = self._ctxs.get(asset)
+                            if ctx is not None and ctx.market is not None:
+                                ctx.prev_window_btc_close = float(close_px)
 
                 prev = self._last_round_start
                 self._last_round_start = next_boundary
@@ -561,11 +545,6 @@ class WindowManager:
 
         # Fetch prices for all assets with a valid market
         active_assets = [a for a in assets if self._ctxs[a].market is not None]
-        if active_assets and not self._sync_prices:
-            return {
-                a: self._ctxs[a] for a in assets
-                if self._ctxs[a].market is not None
-            }
         if active_assets:
             price_tasks = {a: self._svc.fetch_prices(self._ctxs[a].market) for a in active_assets}
             price_results = await asyncio.gather(*price_tasks.values(), return_exceptions=True)

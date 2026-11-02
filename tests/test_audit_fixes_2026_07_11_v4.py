@@ -361,19 +361,17 @@ def test_h_v4_2_stake_cap_counts_inflight_notional() -> None:
     pos.record_fill(pos.tier1, price=0.40, size=2.5)
 
     assert pos._total_cost == pytest.approx(1.0)
-    # Four-layer strategy. Total max exposure is 2+4+8+16=30 USD. T1's
-    # placed notional (2.0) reserves the whole tier even though only 1.0
-    # filled, so 30 - 2 = 28 remains.
-    assert pos.stake_cap_remaining == pytest.approx(28.0)
+    # Four-layer strategy. Total max exposure is 1+2+4+8=15 USD.
+    # 15 - 1 (T1 filled) = 14.
+    assert pos.stake_cap_remaining == pytest.approx(14.0)
 
     # Mark T2 as placed (in-flight) without any fill yet.
     pos.tier2.placed = True
     pos.tier2.server_order_id = "0xt2"
 
-    # T2 reserves 4 USD and T1's placed notional is 2 USD:
-    # 30 - (2 + 4) = 24.
-    assert pos.total_notional_committed == pytest.approx(6.0)
-    assert pos.stake_cap_remaining == pytest.approx(24.0), (
+    # T2 reserves 2 USD, so 15 - (1 + 2) = 12.
+    assert pos.total_notional_committed == pytest.approx(3.0)
+    assert pos.stake_cap_remaining == pytest.approx(12.0), (
         "H-V4-2 violation: stake_cap_remaining did not account for "
         "T2's in-flight notional. Use total_notional_committed, not "
         "_total_cost."
@@ -388,8 +386,8 @@ def test_h_v4_2_stake_cap_no_inflight_unchanged() -> None:
     pos.tier1.size_expected = 2.5
     pos.record_fill(pos.tier1, price=0.40, size=2.5)
     # No in-flight.
-    # T1's placed notional (2.0) is still committed: 30 - 2 = 28.
-    assert pos.stake_cap_remaining == pytest.approx(28.0)
+    # No in-flight orders: 15 - 1 (T1 filled) = 14.
+    assert pos.stake_cap_remaining == pytest.approx(14.0)
 
 
 # ---------------------------------------------------------------------------

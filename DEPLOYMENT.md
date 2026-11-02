@@ -1,11 +1,5 @@
 # Polymarket GTD Bot — 部署指南
 
-> **2026-11-01 起默认是纸盘模式（`PAPER_TRADING=true`）**：机器人同时跑
-> BTC/ETH/BNB/DOGE/SOL/XRP/HYPE 的 5m 与 15m 共 14 个市场，全部在本地
-> 模拟 GTD 成交，不会向 CLOB 下单。纸盘模式不需要 API Key / pUSD；下文
-> 的凭证与余额配置只在使用 `PAPER_TRADING=false` 的旧实盘路径时需要。
-> 策略参数见 `.env.docker` 的 `TIER*_NOTIONAL` / `T1_ENTRY_WINDOW*`。
-
 ## 环境要求
 
 - Python 3.11+

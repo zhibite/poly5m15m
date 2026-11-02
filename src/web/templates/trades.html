@@ -22,16 +22,6 @@
 </nav>
 
 <div class="container">
-  <div class="control-bar" id="market-bar">
-    <div class="control-status">
-      <span class="control-label">币种 / 市场</span>
-      <select id="market-filter" class="market-select">
-        <option value="">全部市场</option>
-      </select>
-      <span class="control-meta" id="market-meta"></span>
-    </div>
-  </div>
-
   <div class="stats-row">
     <div class="stat-card">
       <div class="stat-label">今日盈亏 (UTC)</div>
@@ -84,17 +74,12 @@
       <table>
         <thead>
           <tr>
-            <th>币种</th><th>市场</th><th>开始 (UTC)</th><th>轮次</th><th>买入成本</th><th>卖出收入</th>
+            <th>开始 (UTC)</th><th>轮次</th><th>买入成本</th><th>卖出收入</th>
             <th>到期结算</th><th>手续费</th><th>盈亏</th><th>盈亏 %</th><th>成交笔数</th><th>撤单</th><th>状态</th>
           </tr>
         </thead>
-        <tbody id="rounds-tbody"><tr><td colspan="13" class="no-data">加载中...</td></tr></tbody>
+        <tbody id="rounds-tbody"><tr><td colspan="11" class="no-data">加载中...</td></tr></tbody>
       </table>
-    </div>
-    <div class="pager" id="rounds-pager" hidden>
-      <button class="btn btn-ghost btn-sm" id="round-prev" type="button">上一页</button>
-      <span class="pager-info" id="round-page-info">--</span>
-      <button class="btn btn-ghost btn-sm" id="round-next" type="button">下一页</button>
     </div>
   </div>
 
@@ -103,9 +88,9 @@
     <div class="table-wrap">
       <table>
         <thead>
-          <tr><th>币种</th><th>市场</th><th>时间 (UTC)</th><th>轮次</th><th>层</th><th>方向</th><th>价格</th><th>挂价</th><th>价差</th><th>数量</th><th>金额</th><th>手续费</th><th>已实现盈亏</th><th>方式</th></tr>
+          <tr><th>时间 (UTC)</th><th>轮次</th><th>层</th><th>方向</th><th>价格</th><th>挂价</th><th>价差</th><th>数量</th><th>金额</th><th>手续费</th><th>方式</th></tr>
         </thead>
-        <tbody id="fills-tbody"><tr><td colspan="14" class="no-data">加载中...</td></tr></tbody>
+        <tbody id="fills-tbody"><tr><td colspan="11" class="no-data">加载中...</td></tr></tbody>
       </table>
     </div>
     <div class="pager" id="fills-pager" hidden>
@@ -136,38 +121,6 @@ const outcomePill = (o) => {
 const FILL_PAGE_SIZE = 20;
 let fillOffset = 0;
 let fillTotal = 0;
-// 轮次记录独立分页：统计卡片始终基于最近 500 轮，不随页码变化。
-const ROUND_PAGE_SIZE = 20;
-let roundOffset = 0;
-let roundTotal = 0;
-let MARKET = new URLSearchParams(location.search).get('market') || '';
-
-function marketParam() {
-  return MARKET ? '&market=' + encodeURIComponent(MARKET) : '';
-}
-
-async function loadMarkets() {
-  try {
-    const d = await getJSON('/api/markets');
-    const sel = $('market-filter');
-    sel.innerHTML = '<option value="">全部市场</option>' +
-      (d.markets || []).map(m =>
-        `<option value="${m.key}">${m.asset} · ${m.interval}</option>`
-      ).join('');
-    sel.value = MARKET;
-    sel.addEventListener('change', () => {
-      MARKET = sel.value;
-      fillOffset = 0;
-      roundOffset = 0;
-      const url = new URL(location.href);
-      if (MARKET) url.searchParams.set('market', MARKET);
-      else url.searchParams.delete('market');
-      history.replaceState(null, '', url);
-      refresh();
-    });
-    $('market-meta').textContent = d.paper ? '纸盘模式' : '实盘模式';
-  } catch (e) { /* refresh handles the indicator */ }
-}
 
 function setLive(ok) {
   $('live-dot').className = 'live-dot' + (ok ? '' : ' offline');
@@ -221,10 +174,10 @@ function renderQuality(q) {
 }
 
 function renderRounds(rounds) {
-  $('round-count').textContent = roundTotal || rounds.length;
+  $('round-count').textContent = rounds.length;
   const body = $('rounds-tbody');
   if (!rounds.length) {
-    body.innerHTML = '<tr><td colspan="13" class="no-data">暂无记录（下单成交后会出现在这里）</td></tr>';
+    body.innerHTML = '<tr><td colspan="11" class="no-data">暂无记录（下单成交后会出现在这里）</td></tr>';
     return;
   }
   body.innerHTML = rounds.map(r => {
@@ -233,18 +186,14 @@ function renderRounds(rounds) {
     // all rejected / never filled has no position — label it 未成交.
     const status = r.closed
       ? '<span class="pill filled">已结算</span>'
-      : (r.status === 'settling'
-          ? '<span class="pill settling">结算中</span>'
-          : (r.fill_count > 0
-              ? '<span class="pill watching">未平仓</span>'
-              : '<span class="pill idle">未成交</span>'));
+      : (r.fill_count > 0
+          ? '<span class="pill watching">未平仓</span>'
+          : '<span class="pill idle">未成交</span>');
     // 到期时仍持有的份额按 1/0 兑付，没有 SELL 成交；单独展示这部分。
     const settle = (r.settlement_usd && Math.abs(r.settlement_usd) > 1e-9)
       ? `<span class="${cls(r.settlement_usd)}">${money(r.settlement_usd)}</span>`
       : '<span class="muted">--</span>';
     return `<tr>
-      <td><span class="pill buy">${r.asset || 'BTC'}</span></td>
-      <td class="mono">${r.interval || '15m'}</td>
       <td class="mono">${iso(r.started_at) === '--' ? utc(r.round_start_ts) : iso(r.started_at)}</td>
       <td class="mono muted">${r.slug || r.round_start_ts}</td>
       <td class="mono">$${fmt(r.buy_cost, 2)}</td>
@@ -263,7 +212,7 @@ function renderRounds(rounds) {
 function renderFills(fills) {
   const body = $('fills-tbody');
   if (!fills.length) {
-    body.innerHTML = '<tr><td colspan="14" class="no-data">暂无成交</td></tr>';
+    body.innerHTML = '<tr><td colspan="11" class="no-data">暂无成交</td></tr>';
     return;
   }
   body.innerHTML = fills.map(f => {
@@ -274,18 +223,7 @@ function renderFills(fills) {
     const role = (f.trader_side || '').toUpperCase();
     const roleLbl = role === 'MAKER' ? 'maker' : role === 'TAKER' ? 'taker' : '--';
     const roleCls = role === 'MAKER' ? 'watching' : role === 'TAKER' ? 'placed' : 'idle';
-    // SELL 行显示这一笔的已实现盈亏（按本轮移动平均成本、含手续费）。
-    const pnl = f.realized_pnl_usd;
-    const pnlTxt = (pnl === null || pnl === undefined)
-      ? '<span class="muted">--</span>'
-      : `<span class="${cls(pnl)}">${money(pnl)}` +
-        (f.realized_pnl_pct === null || f.realized_pnl_pct === undefined
-          ? ''
-          : ` (${fmt(f.realized_pnl_pct * 100, 2)}%)`) +
-        '</span>';
     return `<tr>
-      <td><span class="pill buy">${f.asset || 'BTC'}</span></td>
-      <td class="mono">${f.interval || '15m'}</td>
       <td class="mono">${f.ts_ms ? new Date(f.ts_ms).toISOString().replace('T', ' ').slice(0, 19) : '--'}</td>
       <td class="mono">${utc(f.round_start_ts)}${outcomePill(f.outcome)}</td>
       <td>${f.tier || '--'}</td>
@@ -296,20 +234,9 @@ function renderFills(fills) {
       <td class="mono">${fmt(f.size, 2)}</td>
       <td class="mono">$${fmt(f.notional, 2)}</td>
       <td class="mono muted">${f.fee > 0 ? '$' + fmt(f.fee, 4) : '--'}</td>
-      <td class="mono">${pnlTxt}</td>
       <td><span class="pill ${roleCls}">${roleLbl}</span></td>
     </tr>`;
   }).join('');
-}
-
-function renderRoundPager() {
-  const pages = Math.max(1, Math.ceil(roundTotal / ROUND_PAGE_SIZE));
-  const page = Math.floor(roundOffset / ROUND_PAGE_SIZE) + 1;
-  $('round-count').textContent = roundTotal;
-  $('round-page-info').textContent = `第 ${page} / ${pages} 页 · 共 ${roundTotal} 轮`;
-  $('round-prev').disabled = roundOffset <= 0;
-  $('round-next').disabled = roundOffset + ROUND_PAGE_SIZE >= roundTotal;
-  $('rounds-pager').hidden = roundTotal <= ROUND_PAGE_SIZE;
 }
 
 function renderFillPager() {
@@ -325,7 +252,7 @@ function renderFillPager() {
 
 async function refreshFills() {
   const d = await getJSON(
-    `/api/fills?limit=${FILL_PAGE_SIZE}&offset=${fillOffset}${marketParam()}`
+    `/api/fills?limit=${FILL_PAGE_SIZE}&offset=${fillOffset}`
   );
   fillTotal = Number(d.total || 0);
   // 记录变少（理论上不会发生）时把越界的页码拉回最后一页。
@@ -341,21 +268,10 @@ async function refreshFills() {
 
 async function refresh() {
   try {
-    const d = await getJSON(
-      `/api/trades?limit=${ROUND_PAGE_SIZE}&offset=${roundOffset}${marketParam()}`
-    );
-    roundTotal = Number(d.total || 0);
-    // A shrinking history (manual cleanup) must not leave us past the end.
-    const pages = Math.max(1, Math.ceil(roundTotal / ROUND_PAGE_SIZE));
-    const maxOffset = (pages - 1) * ROUND_PAGE_SIZE;
-    if (roundOffset > maxOffset) {
-      roundOffset = maxOffset;
-      return refresh();
-    }
+    const d = await getJSON('/api/trades?limit=300');
     renderStats(d.stats);
     renderQuality(d.quality);
     renderRounds(d.rounds || []);
-    renderRoundPager();
     await refreshFills();
     setLive(true);
   } catch (e) {
@@ -363,16 +279,6 @@ async function refresh() {
   }
 }
 
-$('round-prev').addEventListener('click', () => {
-  if (roundOffset < ROUND_PAGE_SIZE) return;
-  roundOffset -= ROUND_PAGE_SIZE;
-  refresh().catch(() => setLive(false));
-});
-$('round-next').addEventListener('click', () => {
-  if (roundOffset + ROUND_PAGE_SIZE >= roundTotal) return;
-  roundOffset += ROUND_PAGE_SIZE;
-  refresh().catch(() => setLive(false));
-});
 $('fill-prev').addEventListener('click', () => {
   if (fillOffset < FILL_PAGE_SIZE) return;
   fillOffset -= FILL_PAGE_SIZE;
@@ -386,11 +292,8 @@ $('fill-next').addEventListener('click', () => {
 
 $('clock').textContent = new Date().toISOString().slice(11, 19) + ' UTC';
 setInterval(() => { $('clock').textContent = new Date().toISOString().slice(11, 19) + ' UTC'; }, 1000);
-(async () => {
-  await loadMarkets();
-  refresh();
-  setInterval(refresh, 10000);
-})();
+refresh();
+setInterval(refresh, 10000);
 </script>
 <script src="/static/auth-nav.js?v=__ASSET_VERSION__"></script>
 </body>

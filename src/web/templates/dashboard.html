@@ -22,15 +22,6 @@
 </nav>
 
 <div class="container">
-  <!-- Market selector (7 assets × 5m/15m paper markets) -->
-  <div class="control-bar" id="market-bar">
-    <div class="control-status">
-      <span class="control-label">市场</span>
-      <select id="market-select" class="market-select"></select>
-      <span class="control-meta" id="market-meta"></span>
-    </div>
-  </div>
-
   <!-- Emergency stop -->
   <div class="control-bar" id="control-bar">
     <div class="control-status">
@@ -73,7 +64,7 @@
   <div class="price-card">
     <div class="price-head">
       <a class="price-title disabled" id="market-link" target="_blank"
-         rel="noopener noreferrer" title="市场加载中"><span id="market-title">市场加载中</span><span class="ext">↗</span></a>
+         rel="noopener noreferrer" title="市场加载中">BTC / USDT · 15m Up/Down<span class="ext">↗</span></a>
       <div>
         <span class="badge pending" id="phase-badge">--</span>
         <span class="badge pending" id="gate-badge">--</span>
@@ -153,9 +144,9 @@
     <div class="table-wrap">
       <table>
         <thead>
-          <tr><th>时间 (UTC)</th><th>轮次</th><th>层</th><th>方向</th><th>价格</th><th>数量</th><th>金额</th><th>已实现盈亏</th></tr>
+          <tr><th>时间 (UTC)</th><th>轮次</th><th>层</th><th>方向</th><th>价格</th><th>数量</th><th>金额</th></tr>
         </thead>
-        <tbody id="fills-tbody"><tr><td colspan="8" class="no-data">暂无成交</td></tr></tbody>
+        <tbody id="fills-tbody"><tr><td colspan="7" class="no-data">暂无成交</td></tr></tbody>
       </table>
     </div>
   </div>
@@ -229,36 +220,6 @@ async function getJSON(path) {
   }
   if (!r.ok) throw new Error(path + ' ' + r.status);
   return await r.json();
-}
-
-/* ── Market selector (paper bot: 7 assets × 5m/15m) ─────────────────── */
-let MARKETS = [];
-let MARKET = new URLSearchParams(location.search).get('market') || '';
-
-function marketQuery(prefix) {
-  return MARKET ? prefix + '?market=' + encodeURIComponent(MARKET) : prefix;
-}
-
-async function loadMarkets() {
-  try {
-    const d = await getJSON('/api/markets');
-    MARKETS = d.markets || [];
-    if (!MARKET) MARKET = d.default || (MARKETS[0] && MARKETS[0].key) || '';
-    const sel = $('market-select');
-    sel.innerHTML = MARKETS.map(m =>
-      `<option value="${m.key}">${m.asset} · ${m.interval}</option>`
-    ).join('');
-    sel.value = MARKET;
-    sel.addEventListener('change', () => {
-      MARKET = sel.value;
-      const url = new URL(location.href);
-      url.searchParams.set('market', MARKET);
-      history.replaceState(null, '', url);
-      refreshStatus();
-      refreshTrades();
-    });
-    $('market-meta').textContent = d.paper ? '纸盘模式' : '实盘模式';
-  } catch (e) { /* status poll handles the indicator */ }
 }
 
 /* ── Emergency stop ─────────────────────────────────────────────────── */
@@ -398,11 +359,6 @@ async function startStrategy() {
 function renderStatus(s) {
   renderKillswitch(s.killswitch);
   renderMarketLink(s.slug);
-  $('market-title').textContent =
-    `${s.asset || 'BTC'} / USDT · ${s.interval || '15m'} Up/Down`;
-  if ($('market-select') && s.market && $('market-select').value !== s.market) {
-    $('market-select').value = s.market;
-  }
 
   // window
   const w = s.window || {};
@@ -490,19 +446,10 @@ function renderStatus(s) {
 function renderFills(fills) {
   const body = $('fills-tbody');
   if (!fills || !fills.length) {
-    body.innerHTML = '<tr><td colspan="8" class="no-data">暂无成交</td></tr>';
+    body.innerHTML = '<tr><td colspan="7" class="no-data">暂无成交</td></tr>';
     return;
   }
-  body.innerHTML = fills.slice(0, 15).map(f => {
-    const pnl = f.realized_pnl_usd;
-    const pnlTxt = (pnl === null || pnl === undefined)
-      ? '<span class="muted">--</span>'
-      : `<span class="${cls(pnl)}">${money(pnl)}` +
-        (f.realized_pnl_pct === null || f.realized_pnl_pct === undefined
-          ? ''
-          : ` (${fmt(f.realized_pnl_pct * 100, 2)}%)`) +
-        '</span>';
-    return `<tr>
+  body.innerHTML = fills.slice(0, 15).map(f => `<tr>
     <td class="mono">${f.ts_ms ? new Date(f.ts_ms).toISOString().slice(11, 19) : '--'}</td>
     <td class="mono">${utc(f.round_start_ts)}${outcomePill(f.outcome)}</td>
     <td>${f.tier || '--'}</td>
@@ -510,9 +457,7 @@ function renderFills(fills) {
     <td class="mono">${fmt(f.price, 4)}</td>
     <td class="mono">${fmt(f.size, 2)}</td>
     <td class="mono">$${fmt(f.notional, 2)}</td>
-    <td class="mono">${pnlTxt}</td>
-  </tr>`;
-  }).join('');
+  </tr>`).join('');
 }
 
 function renderStats(stats) {
@@ -533,7 +478,7 @@ function renderStats(stats) {
 
 async function refreshStatus() {
   try {
-    const s = await getJSON(marketQuery('/api/status'));
+    const s = await getJSON('/api/status');
     renderStatus(s);
     setLive(true);
   } catch (e) {
@@ -543,7 +488,7 @@ async function refreshStatus() {
 
 async function refreshTrades() {
   try {
-    const d = await getJSON(marketQuery('/api/trades') + (MARKET ? '&' : '?') + 'limit=100');
+    const d = await getJSON('/api/trades?limit=100');
     renderStats(d.stats);
     renderFills(d.fills);
   } catch (e) { /* status poll handles the indicator */ }
@@ -552,14 +497,11 @@ async function refreshTrades() {
 $('clock').textContent = new Date().toISOString().slice(11, 19) + ' UTC';
 setInterval(() => { $('clock').textContent = new Date().toISOString().slice(11, 19) + ' UTC'; }, 1000);
 
-(async () => {
-  await loadAuth();
-  await loadMarkets();
-  refreshStatus();
-  refreshTrades();
-  setInterval(refreshStatus, 3000);
-  setInterval(refreshTrades, 10000);
-})();
+loadAuth();
+refreshStatus();
+refreshTrades();
+setInterval(refreshStatus, 3000);
+setInterval(refreshTrades, 10000);
 </script>
 <script src="/static/auth-nav.js?v=__ASSET_VERSION__"></script>
 </body>

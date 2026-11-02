@@ -106,15 +106,12 @@ class BinanceSpotService:
     SYMBOL = "BTCUSDT"
     HTTP_TIMEOUT = 5.0
 
-    def __init__(self, symbol: str | None = None) -> None:
-        # 2026-11-01: one instance per traded asset (BTCUSDT, ETHUSDT, …).
-        # Default keeps the legacy BTC-only construction working.
-        self.SYMBOL = (symbol or self.SYMBOL).upper()
+    def __init__(self) -> None:
         self._http: Optional[httpx.AsyncClient] = None
         self._cached_price: Optional[float] = None
         self._cached_at: Optional[datetime] = None
         self._last_log_at: Optional[datetime] = None
-        self._kline_cache: dict[object, float] = {}
+        self._kline_cache: dict[int, float] = {}
 
     async def _get_client(self) -> httpx.AsyncClient:
         if self._http is None or self._http.is_closed:
@@ -213,55 +210,6 @@ class BinanceSpotService:
             log.warning("binance_spot klines fetch failed", ts=ts_utc.isoformat(), error=str(exc))
             return None
 
-    async def fetch_boundary_price(self, ts_utc: datetime) -> Optional[float]:
-        """Spot price at an exact 1-minute boundary.
-
-        Polymarket's up/down windows open and close on 5/15-minute marks.
-        `fetch_price_at` returns the CLOSE of the containing 1-minute
-        kline (up to 60 s after the requested instant), which is wrong for
-        settlement. The price at a boundary is the OPEN of the kline
-        starting at that minute, so use that column.
-        """
-        if ts_utc.tzinfo is None:
-            ts_utc = ts_utc.replace(tzinfo=timezone.utc)
-        ts_ms = int(ts_utc.timestamp() * 1000)
-        minute_ms = (ts_ms // 60_000) * 60_000
-        cache_key = ("boundary", minute_ms)
-        if cache_key in self._kline_cache:
-            return self._kline_cache[cache_key]
-
-        client = await self._get_client()
-        try:
-            resp = await client.get(
-                self.BINANCE_KLINES_URL,
-                params={
-                    "symbol": self.SYMBOL,
-                    "interval": "1m",
-                    "startTime": minute_ms,
-                    "endTime": minute_ms + 60_000,
-                    "limit": 1,
-                },
-            )
-            resp.raise_for_status()
-            arr = resp.json()
-            if arr:
-                kline = arr[0]
-                if int(kline[0]) == minute_ms:
-                    px = float(kline[1])  # kline OPEN
-                    if px > 0:
-                        self._kline_cache[cache_key] = px
-                        return px
-        except Exception as exc:  # noqa: BLE001
-            log.warning(
-                "binance_spot boundary kline failed",
-                ts=ts_utc.isoformat(), error=str(exc),
-            )
-        # Fallback: nearest containing kline's close.
-        px = await self.fetch_price_at(ts_utc)
-        if px is not None and px > 0:
-            self._kline_cache[cache_key] = px
-        return px
-
     async def fetch_at_window_open(
         self,
         window_start: Optional[datetime] = None,
@@ -307,24 +255,13 @@ class BinanceFeed:
         cache: BinanceCache,
         ring: RingBuffer,
         on_connect: Optional[Callable[[], None]] = None,
-        *,
-        symbol: str | None = None,
-        url: str | None = None,
     ) -> None:
         self._cache = cache
         self._ring = ring
         self._on_connect = on_connect
         self._running = False
         self._task: asyncio.Task[None] | None = None
-        # 2026-11-01: multi-asset feeds. `symbol="ETHUSDT"` derives the
-        # Binance trade stream URL; an explicit `url` wins, and neither
-        # keeps the legacy BTCUSDT default from config.toml.
-        if url is None and symbol:
-            url = (
-                "wss://stream.binance.com:9443/ws/"
-                f"{symbol.lower()}@trade"
-            )
-        self._url = url or cfg().WS_URL
+        self._url = cfg().WS_URL
         self._base_delay = cfg().RECONNECT_BASE_S
         self._max_delay = cfg().RECONNECT_MAX_S
 

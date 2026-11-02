@@ -70,13 +70,6 @@ class Params:
     stop_loss_final_exit_s: float = 60.0
     stop_loss_final_mid: float = 0.50
 
-    # Optional hard stop BEFORE T4 fills: exit the whole position when the
-    # price falls this fraction below the current average cost, checked
-    # before a deeper tier is armed. 0 disables. Uses stop_loss_confirm_s.
-    # This is the "cap the full-loss tail" experiment: the live strategy
-    # has no stop at all until T4 fills.
-    pre_t4_stop_pct: float = 0.0
-
     taker_fee_rate: float = 0.07
 
     # BTC flash-move guard: (max-min)/min over the previous 1 m bar > this
@@ -393,7 +386,6 @@ def replay(w: WindowData, p: Params = Params()) -> RoundResult:
     t4_filled = False
     stage = 0
     below_since: int | None = None
-    pre_stop_below_since: int | None = None
     exit_reason = "UNRESOLVED"
 
     def _sell(t_ms: int, price: float, qty: float, role: str, tier: str) -> None:
@@ -417,21 +409,6 @@ def replay(w: WindowData, p: Params = Params()) -> RoundResult:
             continue
         remaining = (w.end_ms - t) / 1000.0
 
-        # 0) Optional pre-T4 hard stop: cap the full-loss tail before a
-        # deeper tier is reached. Checked before the tier orders so a
-        # confirmed break exits instead of averaging further.
-        if p.pre_t4_stop_pct > 0 and not t4_filled and shares > 0:
-            pre_line = avg * (1.0 - p.pre_t4_stop_pct)
-            if price <= pre_line:
-                if pre_stop_below_since is None:
-                    pre_stop_below_since = t
-                elif t - pre_stop_below_since >= p.stop_loss_confirm_s * 1000:
-                    _sell(t, price, shares, "TAKER", "SL_PRE")
-                    exit_reason = "SL"
-                    break
-            else:
-                pre_stop_below_since = None
-
         # 1) Resting BUY GTDs fill when the bar crosses their trigger.
         for idx in (1, 2, 3):
             if p.tier_notionals[idx] <= 0:
@@ -445,7 +422,6 @@ def replay(w: WindowData, p: Params = Params()) -> RoundResult:
                 shares += qty
                 gross_cost += qty * fill_price
                 avg = gross_cost / shares
-                pre_stop_below_since = None  # avg (and stop line) moved
                 tier_filled[idx] = True
                 tier_pending[idx] = False
                 n_avg += 1
@@ -487,7 +463,6 @@ def replay(w: WindowData, p: Params = Params()) -> RoundResult:
                     gross_cost += qty * price
                     buy_fees += fee
                     avg = gross_cost / shares
-                    pre_stop_below_since = None  # avg (and stop line) moved
                     tier_filled[idx] = True
                     n_avg += 1
                     result.fills.append(

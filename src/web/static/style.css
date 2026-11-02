@@ -64,7 +64,6 @@ tr:last-child td { border-bottom: none; }
 .pill.watching { background: #1e1b4b; color: #a78bfa; }
 .pill.placed { background: #3a2f10; color: #fbbf24; }
 .pill.idle { background: #1e1e3a; color: #6b7280; }
-.pill.settling { background: #3a2f10; color: #fbbf24; }
 .pager { display: flex; align-items: center; justify-content: flex-end; gap: 10px; padding-top: 14px; }
 .pager[hidden] { display: none; }
 .pager-info { font-size: 12px; color: #6b7280; font-variant-numeric: tabular-nums; }
@@ -159,11 +158,6 @@ button.btn:disabled { opacity: .45; cursor: default; filter: none; }
 .control-label { font-size: 14px; font-weight: 600; }
 .control-bar.stopped .control-label { color: #f87171; }
 .control-meta { font-size: 12px; color: #6b7280; }
-.market-select {
-  background: #0a0a18; color: #e5e7eb; border: 1px solid #2a2a50;
-  border-radius: 8px; padding: 6px 10px; font-size: 13px; outline: none;
-}
-.market-select:focus { border-color: #6366f1; }
 .control-actions { display: flex; gap: 10px; }
 .btn-danger { background: #dc2626; color: #fff; }
 .btn-danger:hover { background: #ef4444; }
