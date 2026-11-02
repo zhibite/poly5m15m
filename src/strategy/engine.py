@@ -117,7 +117,6 @@ class StrategyEngine:
         handler: ActionHandler,
         killswitch: object | None = None,
         *,
-        trading_pause: object | None = None,
         signals: object | None = None,
     ) -> None:
         self._bc = binance_cache
@@ -126,9 +125,6 @@ class StrategyEngine:
         # Shared emergency-stop flag. When engaged `_evaluate` returns
         # immediately, so no T1 / averaging / TP action is emitted.
         self._kill = killswitch
-        # Live-trading start latch (2026-11-02). Every process starts
-        # paused; only an explicit dashboard "恢复实盘交易" releases it.
-        self._pause = trading_pause
         # External-signal gate layer (2026-11-02). Optional: when absent
         # the engine behaves exactly as before.
         self._signals = signals
@@ -516,15 +512,10 @@ class StrategyEngine:
     def _trading_paused(self) -> bool:
         """True when new entries/averaging must not be placed.
 
-        Two independent brakes are honoured:
-          * the in-memory live-trading start latch (default ON for every
-            process; released only from the dashboard), and
-          * the legacy PAUSE_NEW_ENTRIES config/env flag.
-        Take-profit and stop-loss are deliberately NOT affected.
+        The live/paper mode is selected separately (PAPER_TRADING); this
+        flag is only the optional operator pause in the config. TP and
+        stop-loss are deliberately NOT affected.
         """
-        pause = getattr(self, "_pause", None)
-        if pause is not None and getattr(pause, "paused", False):
-            return True
         return self._cfg_bool("PAUSE_NEW_ENTRIES", False)
 
     def _signal_decision(
@@ -630,16 +621,10 @@ class StrategyEngine:
         if getattr(self, "_pause_logged_round", None) == rt:
             return
         self._pause_logged_round = rt
-        pause = getattr(self, "_pause", None)
-        source = (
-            "live_trading_pause"
-            if pause is not None and getattr(pause, "paused", False)
-            else "PAUSE_NEW_ENTRIES"
-        )
         log.info(
             "engine.entries_paused",
             round_start_ts=rt,
-            source=source,
+            source="PAUSE_NEW_ENTRIES",
             note="new entries/averaging blocked; TP and stop-loss stay active",
         )
 

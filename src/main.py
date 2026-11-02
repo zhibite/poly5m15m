@@ -41,7 +41,9 @@ from src.clob_l1_auth import create_or_derive_clob_api_creds, ClobL1Error
 from src.execution.clob_client import CLOBClient
 from src.execution.gtd_expiry_watcher import GtdExpiryWatcher
 from src.execution.heartbeat import HeartbeatLoop
+from src.execution.mode_router import ModeRouter
 from src.execution.order_manager import OrderManager
+from src.execution.paper_broker import PaperBroker
 from src.execution.tier_watcher import TierWatcher, WatcherResult
 from src.feeds.binance_futures import MacroSignals
 from src.feeds.binance_spot import BinanceCache, BinanceFeed, BinanceSpotService, RingBuffer
@@ -66,7 +68,6 @@ from src.strategy import event_calendar
 from src.strategy.killswitch import KillSwitch
 from src.strategy.loop import DecisionLoop
 from src.strategy.signals import SignalEngine
-from src.strategy.trading_pause import TradingPause
 
 log = get_logger(__name__)
 
@@ -231,9 +232,6 @@ class AppState:
         # Emergency stop. Loaded from disk so a restart/redeploy does not
         # silently resume trading after the operator pressed stop.
         self.killswitch = KillSwitch.load()
-        # Live-trading start latch (2026-11-02): every process starts
-        # paused. Only the dashboard can release it, for this process only.
-        self.trading_pause = TradingPause.load()
         # External-signal layer (2026-11-02).
         self.event_calendar = None
         self.macro_signals: MacroSignals | None = None
@@ -252,6 +250,7 @@ class AppState:
         self.market_ws: MarketWS | None = None
         self.user_ws: UserWS | None = None
         self.order_manager: OrderManager | None = None
+        self.paper_broker: PaperBroker | None = None
         self.heartbeat: HeartbeatLoop | None = None
         self.gtd_expiry: GtdExpiryWatcher | None = None
         self.decision_loop: DecisionLoop | None = None
@@ -2024,6 +2023,11 @@ def _on_market_discovered(asset: str, mkt) -> None:
             down_token=mkt.token_down_id or None,
             tick_size=mkt.tick_size,
         )
+    if getattr(state, 'paper_broker', None) is not None and round_ts:
+        try:
+            state.paper_broker.set_round_meta(round_ts, mkt)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("paper.round_meta_failed", error=str(exc))
 
     if state.market_ws:
         try:
@@ -2192,6 +2196,11 @@ async def _on_new_round(round_start_ts: int) -> None:
     # — see main.py / window_manager.py.
     if state.engine:
         await state.engine.on_new_round(round_start_ts, mkt)
+    if getattr(state, 'paper_broker', None) is not None:
+        try:
+            state.paper_broker.begin_round(round_start_ts, mkt)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("paper.begin_round_failed", error=str(exc))
         # Honour the WindowManager window pre-checks (late boot / big
         # cross-window BTC gap). Previously these flags were set but never
         # consumed, so the "skip this window" protection did nothing.
@@ -2344,6 +2353,18 @@ async def _resolution_loop() -> None:
 # ---------------------------------------------------------------------------
 # REST midpoint poller (stable prices for strategy decisions)
 # ---------------------------------------------------------------------------
+
+async def _paper_tick_loop(state: AppState) -> None:
+    """Drive the paper broker's resting GTD fill/expiry simulation."""
+    while True:
+        broker = state.paper_broker
+        if broker is not None:
+            try:
+                broker.tick()
+            except Exception:  # noqa: BLE001
+                log.exception("paper.tick_failed")
+        await asyncio.sleep(0.1)
+
 
 async def _midpoint_poll_loop() -> None:
     """Poll /midpoint REST API every 2s to keep stable price cache updated."""
@@ -2604,15 +2625,8 @@ async def _status_loop() -> None:
 
         ks = getattr(s, "killswitch", None)
         stop_str = " [STOPPED]" if (ks is not None and ks.active) else ""
-        # Surface the new-entry pause latch (default ON at every start).
-        paused = bool(
-            s.engine is not None
-            and hasattr(s.engine, "_trading_paused")
-            and s.engine._trading_paused()
-        )
-        pause_str = " [PAUSED]" if (paused and not stop_str) else ""
         log.info(
-            f"STATUS{stop_str}{pause_str}  binance={bc:,.1f}  {gate_str}"
+            f"STATUS{stop_str}  binance={bc:,.1f}  {gate_str}"
             f"  {window_str}  "
             f"UP={up_last:.4f}  DOWN={down_last:.4f}{pos_str}"
         )
@@ -2767,21 +2781,35 @@ async def main() -> None:
         events=s.event_calendar,
     )
 
-    # ── Action router + Strategy engine ──────────────────────────────────
-    router = ActionRouter(s)
+    # ── Live/paper execution router + Strategy engine ────────────────────
+    # Both executors stay live so PAPER_TRADING can be toggled from the
+    # config page without a restart. The mode is locked per round at T1.
+    live_router = ActionRouter(s)
+    s.paper_broker = PaperBroker(
+        market="BTC-15m",
+        asset="BTC",
+        interval="15m",
+        price_cache=s.price_cache,
+        db=s.db,
+        killswitch=s.killswitch,
+        t1_entry_window_s=float(cfg_strategy.T1_ENTRY_WINDOW_S),
+    )
+    mode_router = ModeRouter(s, live_router, s.paper_broker)
     s.engine = StrategyEngine(
         s.binance_cache,
         s.price_cache,
-        router,
+        mode_router,
         killswitch=s.killswitch,
-        trading_pause=s.trading_pause,
         signals=s.signals,
     )
-    log.warning(
-        "live_trading.starts_paused",
-        note="every process starts paused; click 恢复实盘交易 on the "
-             "dashboard before any new live entry is allowed. TP and "
-             "stop-loss remain active.",
+    s.paper_broker.engine = s.engine
+    mode_router.engine = s.engine
+    s.router = mode_router
+    log.info(
+        "execution.mode",
+        configured=("paper" if cfg_strategy.PAPER_TRADING else "live"),
+        note="mode is applied to the next T1; an open round keeps its "
+             "entry mode",
     )
     log.info(
         "signals.configured",
@@ -2911,6 +2939,7 @@ async def main() -> None:
     status_task = asyncio.create_task(_status_loop())
     midpoint_task = asyncio.create_task(_midpoint_poll_loop())
     resolution_task = asyncio.create_task(_resolution_loop())
+    paper_task = asyncio.create_task(_paper_tick_loop(s))
 
     # ── Graceful shutdown ───────────────────────────────────────────────
     def _signal_handler() -> None:
@@ -2931,6 +2960,7 @@ async def main() -> None:
     status_task.cancel()
     midpoint_task.cancel()
     resolution_task.cancel()
+    paper_task.cancel()
     # Stop the dashboard first: its routes read `db_conn`, which is closed
     # at the very end of shutdown.
     if web_task is not None:

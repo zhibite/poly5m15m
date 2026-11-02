@@ -1160,6 +1160,9 @@ class RoundState:
     tick_size: float = field(init=False, default=0.01)
 
     position: Position = field(default_factory=Position)
+    # Execution mode locked when T1 enters: "paper" | "live". Empty until
+    # the ModeRouter selects one.
+    mode: str = ""
     finished: bool = False
     # Set by main._on_new_round when the window pre-check (late boot /
     # cross-window BTC gap) says "do not trade this round". The engine

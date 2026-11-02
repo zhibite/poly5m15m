@@ -22,6 +22,18 @@
 </nav>
 
 <div class="container">
+  <div class="control-bar" id="mode-bar">
+    <div class="control-status">
+      <span class="control-label">交易模式</span>
+      <select id="mode-filter" class="market-select">
+        <option value="">全部</option>
+        <option value="live">实盘</option>
+        <option value="paper">纸盘</option>
+      </select>
+      <span class="control-meta" id="mode-meta"></span>
+    </div>
+  </div>
+
   <div class="stats-row">
     <div class="stat-card">
       <div class="stat-label">今日盈亏 (UTC)</div>
@@ -74,11 +86,11 @@
       <table>
         <thead>
           <tr>
-            <th>开始 (UTC)</th><th>轮次</th><th>买入成本</th><th>卖出收入</th>
+            <th>模式</th><th>开始 (UTC)</th><th>轮次</th><th>买入成本</th><th>卖出收入</th>
             <th>到期结算</th><th>手续费</th><th>盈亏</th><th>盈亏 %</th><th>成交笔数</th><th>撤单</th><th>状态</th>
           </tr>
         </thead>
-        <tbody id="rounds-tbody"><tr><td colspan="11" class="no-data">加载中...</td></tr></tbody>
+        <tbody id="rounds-tbody"><tr><td colspan="12" class="no-data">加载中...</td></tr></tbody>
       </table>
     </div>
   </div>
@@ -88,9 +100,9 @@
     <div class="table-wrap">
       <table>
         <thead>
-          <tr><th>时间 (UTC)</th><th>轮次</th><th>层</th><th>方向</th><th>价格</th><th>挂价</th><th>价差</th><th>数量</th><th>金额</th><th>手续费</th><th>方式</th></tr>
+          <tr><th>模式</th><th>时间 (UTC)</th><th>轮次</th><th>层</th><th>方向</th><th>价格</th><th>挂价</th><th>价差</th><th>数量</th><th>金额</th><th>手续费</th><th>方式</th></tr>
         </thead>
-        <tbody id="fills-tbody"><tr><td colspan="11" class="no-data">加载中...</td></tr></tbody>
+        <tbody id="fills-tbody"><tr><td colspan="12" class="no-data">加载中...</td></tr></tbody>
       </table>
     </div>
     <div class="pager" id="fills-pager" hidden>
@@ -116,6 +128,12 @@ const outcomePill = (o) => {
   if (v !== 'UP' && v !== 'DOWN') return '';
   return ` <span class="pill ${v === 'UP' ? 'buy' : 'sell'}">${v}</span>`;
 };
+const modePill = (m) => (String(m || '').toLowerCase() === 'paper'
+  ? '<span class="pill watching">纸盘</span>'
+  : '<span class="pill buy">实盘</span>');
+
+let MODE = new URLSearchParams(location.search).get('mode') || '';
+const modeParam = () => MODE ? '&mode=' + encodeURIComponent(MODE) : '';
 
 // 成交明细分页：每页 20 条，服务端按 (ts_ms, fill_id) 倒序切片。
 const FILL_PAGE_SIZE = 20;
@@ -177,7 +195,7 @@ function renderRounds(rounds) {
   $('round-count').textContent = rounds.length;
   const body = $('rounds-tbody');
   if (!rounds.length) {
-    body.innerHTML = '<tr><td colspan="11" class="no-data">暂无记录（下单成交后会出现在这里）</td></tr>';
+    body.innerHTML = '<tr><td colspan="12" class="no-data">暂无记录（下单成交后会出现在这里）</td></tr>';
     return;
   }
   body.innerHTML = rounds.map(r => {
@@ -194,6 +212,7 @@ function renderRounds(rounds) {
       ? `<span class="${cls(r.settlement_usd)}">${money(r.settlement_usd)}</span>`
       : '<span class="muted">--</span>';
     return `<tr>
+      <td>${modePill(r.mode)}</td>
       <td class="mono">${iso(r.started_at) === '--' ? utc(r.round_start_ts) : iso(r.started_at)}</td>
       <td class="mono muted">${r.slug || r.round_start_ts}</td>
       <td class="mono">$${fmt(r.buy_cost, 2)}</td>
@@ -212,7 +231,7 @@ function renderRounds(rounds) {
 function renderFills(fills) {
   const body = $('fills-tbody');
   if (!fills.length) {
-    body.innerHTML = '<tr><td colspan="11" class="no-data">暂无成交</td></tr>';
+    body.innerHTML = '<tr><td colspan="12" class="no-data">暂无成交</td></tr>';
     return;
   }
   body.innerHTML = fills.map(f => {
@@ -224,6 +243,7 @@ function renderFills(fills) {
     const roleLbl = role === 'MAKER' ? 'maker' : role === 'TAKER' ? 'taker' : '--';
     const roleCls = role === 'MAKER' ? 'watching' : role === 'TAKER' ? 'placed' : 'idle';
     return `<tr>
+      <td>${modePill(f.mode)}</td>
       <td class="mono">${f.ts_ms ? new Date(f.ts_ms).toISOString().replace('T', ' ').slice(0, 19) : '--'}</td>
       <td class="mono">${utc(f.round_start_ts)}${outcomePill(f.outcome)}</td>
       <td>${f.tier || '--'}</td>
@@ -252,7 +272,7 @@ function renderFillPager() {
 
 async function refreshFills() {
   const d = await getJSON(
-    `/api/fills?limit=${FILL_PAGE_SIZE}&offset=${fillOffset}`
+    `/api/fills?limit=${FILL_PAGE_SIZE}&offset=${fillOffset}${modeParam()}`
   );
   fillTotal = Number(d.total || 0);
   // 记录变少（理论上不会发生）时把越界的页码拉回最后一页。
@@ -268,7 +288,7 @@ async function refreshFills() {
 
 async function refresh() {
   try {
-    const d = await getJSON('/api/trades?limit=300');
+    const d = await getJSON(`/api/trades?limit=300${modeParam()}`);
     renderStats(d.stats);
     renderQuality(d.quality);
     renderRounds(d.rounds || []);
@@ -292,6 +312,16 @@ $('fill-next').addEventListener('click', () => {
 
 $('clock').textContent = new Date().toISOString().slice(11, 19) + ' UTC';
 setInterval(() => { $('clock').textContent = new Date().toISOString().slice(11, 19) + ' UTC'; }, 1000);
+$('mode-filter').value = MODE;
+$('mode-filter').addEventListener('change', () => {
+  MODE = $('mode-filter').value;
+  fillOffset = 0;
+  const url = new URL(location.href);
+  if (MODE) url.searchParams.set('mode', MODE);
+  else url.searchParams.delete('mode');
+  history.replaceState(null, '', url);
+  refresh();
+});
 refresh();
 setInterval(refresh, 10000);
 </script>

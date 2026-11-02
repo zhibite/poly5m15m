@@ -33,6 +33,7 @@ _DB_PATH = Path(os.getenv("POLYMARKET_DB_PATH") or (_DATA_DIR / "polymarket.db")
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS rounds (
   round_start_ts  INTEGER PRIMARY KEY,
+  mode            TEXT DEFAULT 'live',
   slug            TEXT,
   condition_id    TEXT,
   up_token        TEXT,
@@ -51,6 +52,7 @@ CREATE TABLE IF NOT EXISTS orders (
   client_order_id TEXT PRIMARY KEY,
   server_order_id TEXT,
   round_start_ts  INTEGER,
+  mode            TEXT DEFAULT 'live',
   side            TEXT,
   token_id        TEXT,
   tier_name       TEXT,
@@ -67,6 +69,7 @@ CREATE TABLE IF NOT EXISTS fills (
   fill_id        TEXT PRIMARY KEY,
   order_id       TEXT,
   round_start_ts INTEGER,
+  mode           TEXT DEFAULT 'live',
   token_id       TEXT,
   side           TEXT,
   price          REAL,
@@ -122,6 +125,17 @@ def init_db(db_path: Path = _DB_PATH) -> sqlite3.Connection:
         if "resolved_at" not in round_cols:
             conn.execute("ALTER TABLE rounds ADD COLUMN resolved_at TEXT")
             log.info("db.migrate.rounds_resolved_at")
+        order_cols = {row[1] for row in conn.execute("PRAGMA table_info(orders)")}
+        for table, cols in (
+            ("rounds", round_cols),
+            ("orders", order_cols),
+            ("fills", fill_cols),
+        ):
+            if "mode" not in cols:
+                conn.execute(
+                    f"ALTER TABLE {table} ADD COLUMN mode TEXT DEFAULT 'live'"
+                )
+                log.info("db.migrate.%s_mode", table)
     except Exception as exc:  # noqa: BLE001
         log.warning("db.migrate.failed", error=str(exc))
     conn.commit()
@@ -146,6 +160,7 @@ class DB:
         down_token: str | None = None,
         tick_size: float = 0.01,
         binance_baseline: float | None = None,
+        mode: str = "live",
     ) -> None:
         # `started_at` is the WINDOW start, derived from the round key, not
         # the moment this row happened to be written. Rounds are inserted
@@ -156,17 +171,18 @@ class DB:
             int(round_start_ts), tz=timezone.utc
         ).isoformat()
         self._c.execute("""
-            INSERT INTO rounds (round_start_ts, slug, condition_id, up_token, down_token,
+            INSERT INTO rounds (round_start_ts, mode, slug, condition_id, up_token, down_token,
                                 tick_size, binance_baseline, started_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(round_start_ts) DO UPDATE SET
+              mode=excluded.mode,
               slug=COALESCE(excluded.slug, slug),
               condition_id=COALESCE(excluded.condition_id, condition_id),
               up_token=COALESCE(excluded.up_token, up_token),
               down_token=COALESCE(excluded.down_token, down_token),
               tick_size=excluded.tick_size,
               binance_baseline=COALESCE(excluded.binance_baseline, binance_baseline)
-        """, (round_start_ts, slug, condition_id, up_token, down_token,
+        """, (round_start_ts, mode, slug, condition_id, up_token, down_token,
               tick_size, binance_baseline, started_at))
         self._c.commit()
 
@@ -242,13 +258,14 @@ class DB:
         lifetime_s: int,
         expires_at: int,
         placed_at: int,
+        mode: str = "live",
     ) -> None:
         self._c.execute("""
             INSERT OR REPLACE INTO orders
-              (client_order_id, server_order_id, round_start_ts, side, token_id,
+              (client_order_id, server_order_id, round_start_ts, mode, side, token_id,
                tier_name, price, size, lifetime_s, expires_at, placed_at, status)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'placed')
-        """, (client_order_id, server_order_id, round_start_ts, side, token_id,
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'placed')
+        """, (client_order_id, server_order_id, round_start_ts, mode, side, token_id,
               tier_name, price, size, lifetime_s, expires_at, placed_at))
         self._c.commit()
 
@@ -281,13 +298,14 @@ class DB:
         confirmed: int = 0,
         trader_side: str | None = None,
         fee: float = 0.0,
+        mode: str = "live",
     ) -> None:
         self._c.execute("""
             INSERT OR IGNORE INTO fills
-              (fill_id, order_id, round_start_ts, token_id, side,
+              (fill_id, order_id, round_start_ts, mode, token_id, side,
                price, size, ts_ms, confirmed, recorded_at, trader_side, fee)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (fill_id, order_id, round_start_ts, token_id, side,
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (fill_id, order_id, round_start_ts, mode, token_id, side,
               price, size, ts_ms, confirmed,
               datetime.now(timezone.utc).isoformat(), trader_side,
               float(fee or 0.0)))

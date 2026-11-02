@@ -448,4 +448,14 @@ python -m src.main
 - 全部参数在 `.env.docker` / Coolify 环境变量或 `/config` 页面「信号」分组中。
 - 新阈值建议先设 `SIGNAL_GATES_LOG_ONLY=true` 收集几天 `engine.signal_gate` 日志（同时写入 T4 journal），确认后再改 false 强制执行。
 - 事件日历：把 `docs/event_calendar.example.json` 复制到持久卷的 `/app/data/event_calendar.json` 并按需添加 CPI/FOMC 等时间。
-- 部署/进程启动仍然默认暂停新开仓；在看板确认信号面板后点「恢复实盘交易」。
+- 进程启动默认运行，不再需要手动恢复；紧急停止按钮仍然保留。
+
+---
+
+## 实盘 / 纸盘切换（2026-11-02）
+
+- `PAPER_TRADING=true`（默认）：纸盘，本地模拟 GTD/FAK 成交，不发送真实 CLOB 订单。
+- `PAPER_TRADING=false`：实盘，真实下单。
+- 在 `/config` 页面「交易模式」分组实时切换；配置会持久化到 `/app/data/runtime_config.json`，重启/重新部署后保持。
+- 切换在下一轮 T1 生效；已经开仓的轮次按入场时的模式管理，不会出现实盘/纸盘混合持仓。
+- 交易记录（轮次 + 成交明细）新增「模式」列，并支持实盘/纸盘筛选。

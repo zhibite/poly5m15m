@@ -194,26 +194,22 @@ def build_status(state: Any) -> dict[str, Any]:
             signals = {}
 
     ks = getattr(state, "killswitch", None)
-    pause = getattr(state, "trading_pause", None)
-    pause_snap = (
-        pause.snapshot()
-        if pause is not None and hasattr(pause, "snapshot")
-        else {"paused": True, "since": None, "reason": "not initialised"}
-    )
-    config_pause = bool(getattr(s, "PAUSE_NEW_ENTRIES", False))
+    configured_mode = "paper" if bool(getattr(s, "PAPER_TRADING", True)) else "live"
+    round_mode = str(getattr(rs, "mode", "") or "") if rs else ""
     now_ts = int(time.time())
     return {
         "server_time": now_ts,
         "asset": "BTC",
+        "trading_mode": {
+            "configured": configured_mode,
+            "round": round_mode or None,
+            "effective": round_mode or configured_mode,
+            "locked": bool(round_mode),
+        },
         "killswitch": {
             "active": bool(getattr(ks, "active", False)),
             "since": getattr(ks, "since", 0.0) or None,
             "reason": getattr(ks, "reason", "") or None,
-        },
-        "trading_pause": {
-            **pause_snap,
-            "config_pause": config_pause,
-            "effective_paused": bool(pause_snap.get("paused") or config_pause),
         },
         "signals": signals,
         "round_start_ts": getattr(rs, "round_start_ts", None),
@@ -251,6 +247,7 @@ def build_status(state: Any) -> dict[str, Any]:
 
 _ROUNDS_SQL = """
 SELECT r.round_start_ts,
+       COALESCE(r.mode, 'live') AS mode,
        r.slug,
        r.started_at,
        r.finished_at,
@@ -269,9 +266,10 @@ SELECT r.round_start_ts,
            AND o3.status = 'cancelled') AS cancel_count
 FROM rounds r
 LEFT JOIN fills f ON f.round_start_ts = r.round_start_ts
-WHERE EXISTS (SELECT 1 FROM orders o2 WHERE o2.round_start_ts = r.round_start_ts)
-   OR EXISTS (SELECT 1 FROM fills  f2 WHERE f2.round_start_ts = r.round_start_ts)
-GROUP BY r.round_start_ts
+WHERE (EXISTS (SELECT 1 FROM orders o2 WHERE o2.round_start_ts = r.round_start_ts)
+    OR EXISTS (SELECT 1 FROM fills  f2 WHERE f2.round_start_ts = r.round_start_ts))
+  AND (? IS NULL OR COALESCE(r.mode, 'live') = ?)
+GROUP BY r.round_start_ts, r.mode
 ORDER BY r.round_start_ts DESC
 LIMIT ?
 """
@@ -380,7 +378,9 @@ def _round_realized_pnl(
     )
 
 
-def rounds_with_pnl(conn: Any, limit: int = 100) -> list[dict[str, Any]]:
+def rounds_with_pnl(
+    conn: Any, limit: int = 100, mode: str | None = None
+) -> list[dict[str, Any]]:
     """Rounds with realised PnL derived from fills.
 
     Realised PnL is computed per SELL fill against the round's running
@@ -398,7 +398,9 @@ def rounds_with_pnl(conn: Any, limit: int = 100) -> list[dict[str, Any]]:
     nothing was ever bought (e.g. every BUY rejected for insufficient
     balance) lingered in the history as phantom open positions.
     """
-    rows = conn.execute(_ROUNDS_SQL, (int(limit),)).fetchall()
+    rows = conn.execute(
+        _ROUNDS_SQL, (mode, mode, int(limit))
+    ).fetchall()
     wanted = {int(row[0]) for row in rows}
     if wanted:
         (realized, cost_sold, open_positions, pnl_today, sells_today,
@@ -413,9 +415,9 @@ def rounds_with_pnl(conn: Any, limit: int = 100) -> list[dict[str, Any]]:
     )
     out: list[dict[str, Any]] = []
     for row in rows:
-        (round_ts, slug, started_at, finished_at, resolved, up_won,
-         resolved_at, up_token, down_token, buy_cost, sell_proceeds,
-         fill_count, order_count, cancel_count) = row
+        (round_ts, row_mode, slug, started_at, finished_at, resolved,
+         up_won, resolved_at, up_token, down_token, buy_cost,
+         sell_proceeds, fill_count, order_count, cancel_count) = row
         resolved = bool(resolved)
         up_won_b = None if up_won is None else bool(up_won)
         buy_cost = float(buy_cost or 0.0)
@@ -491,6 +493,7 @@ def rounds_with_pnl(conn: Any, limit: int = 100) -> list[dict[str, Any]]:
 
         out.append({
             "round_start_ts": round_ts,
+            "mode": str(row_mode or "live"),
             "slug": slug,
             "started_at": started_at,
             "finished_at": finished_at,
@@ -568,6 +571,7 @@ def compute_stats(rounds: list[dict[str, Any]]) -> dict[str, Any]:
 _FILLS_SQL = """
 SELECT f.fill_id,
        f.round_start_ts,
+       COALESCE(f.mode, 'live') AS mode,
        f.side,
        f.price,
        f.size,
@@ -585,6 +589,7 @@ SELECT f.fill_id,
 FROM fills f
 LEFT JOIN orders o ON o.client_order_id = f.order_id
 LEFT JOIN rounds r ON r.round_start_ts = f.round_start_ts
+WHERE (? IS NULL OR COALESCE(f.mode, 'live') = ?)
 ORDER BY f.ts_ms DESC, f.fill_id DESC
 LIMIT ? OFFSET ?
 """
@@ -607,14 +612,18 @@ def _improvement_bps(side: str, price: float, limit_price: float) -> float | Non
     return None
 
 
-def count_fills(conn: Any) -> int:
+def count_fills(conn: Any, mode: str | None = None) -> int:
     """Total number of fill rows (pagination denominator)."""
-    row = conn.execute("SELECT COUNT(*) FROM fills").fetchone()
+    row = conn.execute(
+        "SELECT COUNT(*) FROM fills "
+        "WHERE (? IS NULL OR COALESCE(mode, 'live') = ?)",
+        (mode, mode),
+    ).fetchone()
     return int(row[0] or 0) if row else 0
 
 
 def recent_fills(
-    conn: Any, limit: int = 200, offset: int = 0
+    conn: Any, limit: int = 200, offset: int = 0, mode: str | None = None
 ) -> list[dict[str, Any]]:
     """Fill rows, newest first.
 
@@ -623,10 +632,10 @@ def recent_fills(
     skip a row when several fills share a millisecond.
     """
     rows = conn.execute(
-        _FILLS_SQL, (int(limit), max(0, int(offset)))
+        _FILLS_SQL, (mode, mode, int(limit), max(0, int(offset)))
     ).fetchall()
     out = []
-    for (fill_id, round_ts, side, price, size, ts_ms,
+    for (fill_id, round_ts, row_mode, side, price, size, ts_ms,
          tier_name, slug, limit_price, trader_side, fee, outcome) in rows:
         price = float(price or 0.0)
         size = float(size or 0.0)
@@ -636,6 +645,7 @@ def recent_fills(
         out.append({
             "fill_id": fill_id,
             "round_start_ts": round_ts,
+            "mode": str(row_mode or "live"),
             "side": side,
             # UP/DOWN token the fill touched; '' for legacy rows whose
             # round predates token-id storage (cannot be mapped).

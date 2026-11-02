@@ -120,6 +120,16 @@ class StrategySettings(BaseSettings):
     POLYMARKET_HOST: str = "https://clob.polymarket.com"
     POLYGON_RPC_URL: str = "https://polygon-bor.publicnode.com"
 
+    # ── Trading mode (2026-11-02) ────────────────────────────────────────
+    # True  = paper mode: local GTD fill simulation, no real CLOB orders.
+    # False = live mode: real CLOB orders.
+    # Editable at runtime from /config; the mode is applied to the next T1
+    # entry. An already-open round keeps the mode it entered with, so
+    # switching never leaves a live/paper position half-managed.
+    # Default is paper so a fresh deploy cannot place real orders by
+    # accident; switch to live explicitly from the config page.
+    PAPER_TRADING: bool = True
+
     # ── Martingale tiers (USD notional per tier) ─────────────────────────
     # Four-layer budget: T1 entry followed by three averaging orders.
     # Maximum planned exposure per round is 1 + 2 + 4 + 8 = 15 USD.
