@@ -6,8 +6,9 @@ and replays the live engine's decision rules. Keeping it standalone lets
 it run on a host that only has the research package.
 
 Replicated rules (see ``src/strategy/engine.py`` and ``src/config.py``):
-  * T1: 1 USD taker buy of the side whose mid is <= ENTRY_PRICE_CAP
-    (0.40), within the first T1_ENTRY_WINDOW_S seconds, BTC drift pass.
+  * T1: a GTD BUY at ENTRY_PRICE_CAP (0.40) sized from
+    tier_notionals[0]; a marketable fill is replayed as a taker at the
+    bar mid, within the first T1_ENTRY_WINDOW_S seconds, BTC drift pass.
   * T2-T4: pre-arm when mid <= trigger * (1 + PRICE_PRE_MARGIN); maker
     fill at the trigger unless the order is marketable (mid <= trigger at
     arm time, in which case it fills at the mid as taker).

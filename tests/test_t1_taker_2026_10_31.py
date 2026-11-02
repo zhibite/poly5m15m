@@ -1,14 +1,15 @@
-"""T1 taker-entry path (1/2/4/8 ladder).
+"""T1 execution: GTD entry (2026-11-02) and the legacy FAK helpers.
 
-A 1-USD T1 at ~0.40 is only ~2.5 shares, below the CLOB's 5-share
-minimum for resting GTD orders. T1 therefore enters with a FAK market
-BUY sized in USDC, while T2-T4 stay maker GTDs.
+T1 now posts a GTD BUY at the strategy price (2/4/8/16 ladder); the
+router binds tier 1 and spawns a TierWatcher. The FAK buy helpers remain
+tested because the compact-TP path still uses FAK sells, and the legacy
+taker entry code is kept in CLOBClient/OrderManager.
 
 Covered:
   * `CLOBClient.place_fak_buy` parses executed fills / aggregate amounts;
   * `OrderManager.place_market_buy` returns an already-filled order;
-  * the router binds tier 1 and feeds that fill to the engine without
-    spawning a TierWatcher.
+  * the router places a T1 GTD and spawns a TierWatcher;
+  * compact-position TP still uses a taker sell.
 """
 from __future__ import annotations
 
@@ -276,11 +277,11 @@ class _RouterEngine:
         self.tp_error = reason
 
 
-class _RouterOM:
+class _RouterGtdOM:
     def __init__(self) -> None:
         self.kwargs: dict | None = None
 
-    async def place_market_buy(self, **kwargs):  # noqa: ANN003
+    async def place_buy_by_strategy_price(self, **kwargs):  # noqa: ANN003
         self.kwargs = kwargs
         return TrackedOrder(
             client_order_id="c1",
@@ -290,13 +291,13 @@ class _RouterOM:
             token_id="tok",
             tier_name="T1",
             price=0.40,
-            size=2.5,
-            placed_size=2.5,
-            size_matched=2.5,
-            lifetime_s=0,
-            expires_at=0.0,
+            size=5.0,
+            placed_size=5.0,
+            size_matched=0.0,
+            lifetime_s=181,
+            expires_at=time.time() + 181,
             placed_at=time.time(),
-            status="filled",
+            status="live",
         )
 
 
@@ -350,9 +351,9 @@ def test_drained_position_is_cleared_after_the_grace() -> None:
 
 
 @pytest.mark.asyncio
-async def test_router_t1_taker_binds_and_feeds_the_fill() -> None:
+async def test_router_t1_places_a_gtd_and_spawns_a_watcher() -> None:
     eng = _RouterEngine()
-    om = _RouterOM()
+    om = _RouterGtdOM()
     state = SimpleNamespace(
         engine=eng,
         order_manager=om,
@@ -363,34 +364,36 @@ async def test_router_t1_taker_binds_and_feeds_the_fill() -> None:
     )
     router = ActionRouter(state)  # type: ignore[arg-type]
 
-    await router(ActionOpenT1(side="UP", token="tok", price=0.40, notional=1.0))
+    await router(ActionOpenT1(side="UP", token="tok", price=0.40, notional=2.0))
 
     assert om.kwargs is not None
-    assert om.kwargs["notional"] == pytest.approx(1.0)
-    assert om.kwargs["limit_price"] == pytest.approx(0.40)
+    assert om.kwargs["strategy_price"] == pytest.approx(0.40)
+    assert om.kwargs["notional"] == pytest.approx(2.0)
+    assert om.kwargs["tier_name"] == "T1"
     assert eng.bound and eng.bound[0]["tier"] == 1
-    assert eng.bound[0]["placed_size"] == pytest.approx(2.5)
-    assert eng.fills == [("tok", "s1", 0.40, 2.5)]
-    assert router._watchers == {}, "taker T1 must not spawn a TierWatcher"
+    assert eng.bound[0]["placed_size"] == pytest.approx(5.0)
+    assert eng.fills == [], "the watcher owns the fill lifecycle"
+    watcher = router._watchers.get((1_000, 1))
+    assert watcher is not None, "T1 GTD must spawn a TierWatcher"
+    await watcher.stop()
 
 
-class _NoFillOM:
-    last_buy_reject_reason = "FAK_no_fills"
+class _FailingGtdOM:
+    last_buy_reject_reason = "insufficient_balance"
 
-    async def place_market_buy(self, **kwargs):  # noqa: ANN003
+    async def place_buy_by_strategy_price(self, **kwargs):  # noqa: ANN003
         return None
 
 
 @pytest.mark.asyncio
-async def test_router_skips_the_window_after_a_fak_buy_no_fill() -> None:
+async def test_router_rolls_back_entry_on_t1_gtd_post_failure() -> None:
     eng = _RouterEngine()
     pos = eng._round.position
     pos.entry_token = "tok"
     pos.entry_side = "UP"
-    eng._round.skip_reason = None
     state = SimpleNamespace(
         engine=eng,
-        order_manager=_NoFillOM(),
+        order_manager=_FailingGtdOM(),
         clob=SimpleNamespace(fill_callback=None),
         round_start_ts=1_000,
         killswitch=None,
@@ -398,13 +401,14 @@ async def test_router_skips_the_window_after_a_fak_buy_no_fill() -> None:
     )
     router = ActionRouter(state)  # type: ignore[arg-type]
 
+    before = time.time()
     await router(ActionOpenT1(
-        side="UP", token="tok", price=0.40, notional=1.0
+        side="UP", token="tok", price=0.40, notional=2.0
     ))
 
-    assert eng._round.skip_reason == "t1_fak_no_fill"
     assert pos.entry_token is None
     assert pos.entry_side is None
+    assert pos.t1_retry_after_ts >= before + 14.0
 
 
 # ---------------------------------------------------------------------------

@@ -28,6 +28,7 @@ leaks between them.
 from __future__ import annotations
 
 import asyncio
+import time
 from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Any
@@ -650,3 +651,70 @@ async def test_averaging_does_not_reenter_after_full_tp_exit() -> None:
         "averaging must not re-open a position after a full TP exit; "
         f"got {[(type(a).__name__, getattr(a, 'tier', None)) for a in emitted]}"
     )
+
+
+# ---------------------------------------------------------------------------
+# T1 GTD window-end cancel (2026-11-02)
+# ---------------------------------------------------------------------------
+
+
+def _t1_gtd_tiers() -> list[_FakeTier]:
+    return [
+        _FakeTier(
+            tier=1, placed=True, is_complete=False,
+            server_order_id="0xT1srv", size_filled=0.0,
+        ),
+        _FakeTier(tier=2),
+        _FakeTier(tier=3),
+        _FakeTier(tier=4),
+    ]
+
+
+async def _run_reconcile(eng: Any) -> list[ActionCancelTier]:
+    emitted: list[ActionCancelTier] = []
+
+    async def handler(action: ActionCancelTier) -> None:
+        emitted.append(action)
+
+    eng._handler = handler
+    await eng._reconcile_inflight_buys(bc_now=100_000.0)
+    return emitted
+
+
+@pytest.mark.asyncio
+async def test_t1_window_closed_cancels_the_gtd() -> None:
+    """An unfilled T1 GTD must be pulled once T1_ENTRY_WINDOW_S closes."""
+    pos = _FakePos(
+        tiers=_t1_gtd_tiers(),
+        baseline_realized_price=None,
+        baseline_target_price=0.40,
+        tp_target=None,
+    )
+    eng = _make_engine(pos, mid=0.39)
+    eng._round.round_start_ts = int(time.time()) - 310  # past the 300 s window
+
+    emitted = await _run_reconcile(eng)
+
+    assert len(emitted) == 1
+    assert emitted[0].tier == 1
+    assert emitted[0].server_order_id == "0xT1srv"
+    assert emitted[0].reason == "t1_window_closed"
+    assert pos.tiers[0].cancel_pending is True
+
+
+@pytest.mark.asyncio
+async def test_t1_window_open_keeps_the_gtd() -> None:
+    """Inside the entry window the T1 GTD is left alone."""
+    pos = _FakePos(
+        tiers=_t1_gtd_tiers(),
+        baseline_realized_price=None,
+        baseline_target_price=0.40,
+        tp_target=None,
+    )
+    eng = _make_engine(pos, mid=0.39)
+    eng._round.round_start_ts = int(time.time()) - 100  # still inside T1 window
+
+    emitted = await _run_reconcile(eng)
+
+    assert emitted == []
+    assert pos.tiers[0].cancel_pending is False

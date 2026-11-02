@@ -73,7 +73,7 @@ PARAMS: tuple[Param, ...] = (
 
     # ── 加仓 ────────────────────────────────────────────────────────────
     Param("TIER1_NOTIONAL", "T1 名义金额 (USDC)", "加仓", "float", 0.01, 10000, 0.5,
-          "next_round", "T1 用 taker 市价买入（1 USD 不足 5 股，不能挂 GTD）；"
+          "next_round", "T1 用 GTD 买单，需 ≥5 股（2 USD 在 0.40 正好 5 股）；"
                         "下一轮生效（本轮持仓的分层金额在本轮开始时已固定）"),
     Param("TIER2_NOTIONAL", "T2 名义金额 (USDC)", "加仓", "float", 0.01, 10000, 0.5,
           "next_round"),

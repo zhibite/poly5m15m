@@ -132,14 +132,13 @@ class StrategySettings(BaseSettings):
 
     # ── Martingale tiers (USD notional per tier) ─────────────────────────
     # Four-layer budget: T1 entry followed by three averaging orders.
-    # Maximum planned exposure per round is 1 + 2 + 4 + 8 = 15 USD.
-    # T1 is a taker (market) buy: at 1 USD the share count is below the
-    # 5-share minimum that applies to resting GTDs, so it must cross the
-    # book. T2-T4 remain maker GTDs (their notionals always buy >=5 shares).
-    TIER1_NOTIONAL: float = 1.0
-    TIER2_NOTIONAL: float = 2.0
-    TIER3_NOTIONAL: float = 4.0
-    TIER4_NOTIONAL: float = 8.0
+    # Maximum planned exposure per round is 2 + 4 + 8 + 16 = 30 USD.
+    # T1..T4 are all GTD BUYs. T1 must buy >= 5 shares (CLOB minimum):
+    # with ENTRY_PRICE_CAP=0.40, 2 USD is exactly 5 shares at the cap.
+    TIER1_NOTIONAL: float = 2.0
+    TIER2_NOTIONAL: float = 4.0
+    TIER3_NOTIONAL: float = 8.0
+    TIER4_NOTIONAL: float = 16.0
 
     # ── Strategy thresholds ───────────────────────────────────────────────
     ENTRY_PRICE_CAP: float = 0.40      # max token price to enter
@@ -300,7 +299,7 @@ class StrategySettings(BaseSettings):
     T4_DRIFT_BYPASS_MIN_REMAINING_S: float = 540.0
 
     # ── T4 entry gates (operator decision 2026-10-31) ─────────────────────
-    # T4 adds 8 of the 15 USD planned exposure at a price 60% below T1.
+    # T4 adds 16 of the 30 USD planned exposure at a price 60% below T1.
     # A fixed price drop alone cannot tell a trend (do not add) from an
     # overreaction (add), so the largest step is additionally conditioned
     # on the underlying's distance from the window strike and on the time

@@ -108,11 +108,12 @@ def test_paper_t1_is_a_taker_fill_and_records_paper_mode(tmp_path) -> None:
     broker.begin_round(1_000, mkt)
 
     asyncio.run(broker(ActionOpenT1(
-        side="UP", token="UP", price=0.40, notional=1.0
+        side="UP", token="UP", price=0.40, notional=2.0
     )))
 
     pos = eng._round.position
-    assert pos.total_qty == pytest.approx(1.0 / 0.39)
+    # GTD size = notional / limit (2.0 / 0.40 = 5 shares), filled at mid.
+    assert pos.total_qty == pytest.approx(2.0 / 0.40)
     assert pos.avg_cost == pytest.approx(0.39)
 
     rounds = status_mod.rounds_with_pnl(conn)
@@ -157,7 +158,7 @@ def test_paper_t2_is_a_resting_gtd_and_fills_on_cross(tmp_path) -> None:
     broker.begin_round(1_000, mkt)
 
     asyncio.run(broker(ActionOpenT1(
-        side="UP", token="UP", price=0.40, notional=1.0
+        side="UP", token="UP", price=0.40, notional=2.0
     )))
     # T2 pre-armed above its limit: the GTD rests.
     asyncio.run(broker(ActionOpenTN(

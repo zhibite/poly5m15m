@@ -1213,84 +1213,75 @@ class ActionRouter:
         round_ts = self._state.round_start_ts
 
         if isinstance(action, ActionOpenT1):
-            # T1 is a TAKER market buy. At the 1-USD tier a resting GTD
-            # would be ~2.5 shares, below the CLOB's 5-share minimum; a
-            # market BUY is sized in USDC and crosses the book. The fill
-            # is synchronous, so bind tier 1 and feed the fill to the
-            # engine directly — no TierWatcher is needed.
-            order = await om.place_market_buy(
+            # T1 is a GTD BUY at the strategy price, with the same
+            # lifecycle as T2-T4. The engine requires notional / price
+            # >= 5 shares; a marketable limit crosses immediately as a
+            # taker, otherwise the order rests on the book until filled
+            # or the GTD expires.
+            order = await om.place_buy_by_strategy_price(
                 token_id=action.token,
+                strategy_price=action.price,
                 notional=action.notional,
-                limit_price=action.price,
                 round_start_ts=round_ts,
                 tier_name="T1",
                 tick_size=tick_size,
             )
             if order:
-                server_id = order.server_order_id or ""
+                expires = order.expires_at
                 eng.bind_server_order_id(
                     tier=1,
-                    server_order_id=server_id,
+                    server_order_id=order.server_order_id or "",
                     token_id=action.token,
-                    expires_at=0.0,
+                    expires_at=expires,
                     expected_price=order.price,
-                    placed_size=order.size,
+                    placed_size=order.placed_size if order.placed_size > 0 else None,
                 )
-                # place_market_buy already booked this fill in OrderManager
-                # (size_matched == filled), so any late WS/polling
-                # observation is a no-op. Feed the single delta to the
-                # engine now that tier 1 is bound.
-                eng.on_order_filled(
-                    action.token, server_id, order.price, order.size
+                self._state.clob.fill_callback = self._make_fill_callback()
+                size_expected = (
+                    order.placed_size
+                    if order.placed_size > 0
+                    else (action.notional / action.price)
+                )
+                self._spawn_tier_watcher(
+                    round_start_ts=round_ts,
+                    tier=1,
+                    server_order_id=order.server_order_id or "",
+                    token_id=action.token,
+                    strategy_price=order.price,
+                    size_expected=size_expected,
+                    expires_at=expires,
                 )
                 log.info(
-                    "router.t1_taker_filled",
+                    "router.t1_placed",
                     side=action.side,
                     token=action.token[:16],
-                    notional=action.notional,
-                    shares=order.size,
-                    avg_price=order.price,
-                    server_id=server_id or "none",
+                    strategy_price=action.price,
+                    size=order.size,
+                    server_id=order.server_order_id or "none",
+                    watcher=True,
                 )
             else:
                 reject_reason = (
                     getattr(om, "last_buy_reject_reason", "")
-                    or "om.place_market_buy returned None"
+                    or "om.place_buy_by_strategy_price returned None"
                 )
                 eng._round.position.entry_side = None
                 eng._round.position.entry_token = None
-                if reject_reason == "FAK_no_fills":
-                    # A marketable order with no resting match is a normal
-                    # no-fill, not a POST failure. One attempt per window:
-                    # mark the round skipped instead of retrying into the
-                    # same book (operator decision 2026-10-31).
-                    eng._round.skip_reason = "t1_fak_no_fill"
-                    log.warning(
-                        "router.t1_no_fill_skip_window",
-                        side=action.side,
-                        token=action.token[:16],
-                        strategy_price=action.price,
-                        notional=action.notional,
-                        note="FAK buy had no resting match; skipping the "
-                             "rest of this window",
-                    )
-                else:
-                    log.error(
-                        "router.t1_failed",
-                        side=action.side,
-                        token=action.token[:16],
-                        strategy_price=action.price,
-                        notional=action.notional,
-                        reason=reject_reason,
-                    )
-                    # Backoff before the next T1 attempt (2 s) so a
-                    # rejected POST is not retried on every 250 ms tick.
-                    # An empty wallet is not fixed by retrying — back off
-                    # much longer and let the balance cache expire.
-                    eng._round.position.t1_retry_after_ts = time.time() + (
-                        15.0 if reject_reason == "insufficient_balance"
-                        else 2.0
-                    )
+                log.error(
+                    "router.t1_failed",
+                    side=action.side,
+                    token=action.token[:16],
+                    strategy_price=action.price,
+                    notional=action.notional,
+                    reason=reject_reason,
+                )
+                # Backoff before the next T1 attempt (2 s) so a rejected
+                # POST is not retried on every 250 ms tick. An empty
+                # wallet is not fixed by retrying — back off much longer.
+                eng._round.position.t1_retry_after_ts = time.time() + (
+                    15.0 if reject_reason == "insufficient_balance"
+                    else 2.0
+                )
 
         elif isinstance(action, ActionOpenTN):
             order = await om.place_buy_by_strategy_price(

@@ -1,6 +1,6 @@
 """Tests for the T4 entry gates added 2026-10-31.
 
-T4 is the largest ladder step (8 of the 15 USD planned exposure) and sits
+T4 is the largest ladder step (16 of the 30 USD planned exposure) and sits
 60% below T1. A fixed price drop alone cannot tell an overreaction from a
 decisive trend, so T4 is additionally gated on:
 

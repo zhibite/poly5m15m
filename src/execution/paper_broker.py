@@ -194,10 +194,10 @@ class PaperBroker:
             return
 
         if isinstance(action, ActionOpenT1):
-            # The live BTC 15m T1 is a FAK market buy (1 USD is below the
-            # 5-share GTD minimum). Mirror it as an immediate taker fill;
-            # T2-T4 remain resting GTDs.
-            self._market_buy(action)
+            # T1 is a GTD at the strategy price, like T2-T4. `_place_buy`
+            # fills a marketable limit immediately as a taker at the mid;
+            # otherwise it rests until filled or the GTD expires.
+            self._place_buy(action, tier=1, tier_name="T1")
         elif isinstance(action, ActionOpenTN):
             self._place_buy(
                 action, tier=action.tier, tier_name=f"T{action.tier}"
@@ -212,63 +212,6 @@ class PaperBroker:
     # ------------------------------------------------------------------
     # BUY side
     # ------------------------------------------------------------------
-
-    def _market_buy(self, action: Any) -> None:
-        """Simulate the live T1 FAK market buy synchronously."""
-        eng = self.engine
-        if eng is None or eng._round is None:
-            return
-        if eng._round.round_start_ts != self.round_start_ts:
-            return
-        limit = float(action.price)
-        notional = float(action.notional)
-        if limit <= 0 or notional <= 0:
-            return
-        mid = self._mid(action.token)
-        fill_price = min(mid, limit) if mid > 0 else limit
-        if fill_price <= 0:
-            return
-        size = notional / fill_price
-        order_id = self._new_order_id()
-        eng.bind_server_order_id(
-            tier=1,
-            server_order_id=order_id,
-            token_id=action.token,
-            expires_at=0.0,
-            expected_price=fill_price,
-            placed_size=size,
-        )
-        tier_snap = eng._round.position.tiers[0]
-        tier_snap.watching = False
-        order = PaperOrder(
-            order_id=order_id,
-            market=self.market,
-            asset=self.asset,
-            interval=self.interval,
-            round_start_ts=self.round_start_ts,
-            side="BUY",
-            token_id=action.token,
-            tier_name="T1",
-            price=fill_price,
-            size=size,
-            expires_at=time.time(),
-            placed_at=time.time(),
-            tier=1,
-        )
-        self._orders[order_id] = order
-        self._ensure_round_row()
-        self._db_insert_order(order)
-        log.info(
-            "paper.t1_market_buy",
-            market=self.market,
-            side="BUY",
-            token=action.token[:16],
-            price=fill_price,
-            shares=round(size, 4),
-            notional=round(notional, 2),
-            limit=limit,
-        )
-        self._fill_buy(order, fill_price=fill_price, role="TAKER")
 
     def _place_buy(self, action: Any, *, tier: int, tier_name: str) -> None:
         eng = self.engine

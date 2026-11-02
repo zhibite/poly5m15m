@@ -95,7 +95,7 @@ def _engine(*, paused: bool, mid: float = 0.39):
         TP_DECREMENT_PCT=0.03,
         TP_MIN_PCT=0.05,
         T1_ENTRY_WINDOW_S=300.0,
-        TIER1_NOTIONAL=1.0,
+        TIER1_NOTIONAL=2.0,
         BASELINE_DRIFT_LIMIT=0.0015,
         PAUSE_NEW_ENTRIES=paused,
     )

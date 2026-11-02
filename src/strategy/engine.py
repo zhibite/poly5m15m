@@ -50,7 +50,7 @@ def _ts(value) -> float:
 class ActionOpenT1:
     side: Literal["UP", "DOWN"]
     token: str
-    price: float    # best_bid at moment of decision
+    price: float    # GTD limit (ENTRY_PRICE_CAP / strategy price)
     notional: float
 
 
@@ -395,7 +395,7 @@ class StrategyEngine:
 
     # ── T4 entry gates (2026-10-31) ──────────────────────────────────────
     #
-    # T4 is the largest ladder step (8 of 15 USD) and sits 60% below T1.
+    # T4 is the largest ladder step (16 of 30 USD) and sits 60% below T1.
     # A fixed price drop cannot distinguish "the market overreacted" from
     # "BTC has decisively left the strike"; these gates add that context:
     #   * enough window time left for a recovery,
@@ -1406,6 +1406,44 @@ class StrategyEngine:
             snap = pos.snapshot()
         if snap.entry_token is None:
             return
+
+        # T1 GTD must not outlive the T1 entry window: a late fill would
+        # open a position the strategy no longer intends. PaperBroker
+        # expires T1 at the same boundary. The `elapsed < period_s` guard
+        # keeps stale/rolled-over round objects out of this path.
+        entry_window_s = float(
+            getattr(self._s, "T1_ENTRY_WINDOW_S", 0.0) or 0.0
+        )
+        round_start_ts = int(
+            getattr(self._round, "round_start_ts", 0) or 0
+        )
+        period_s = float(getattr(self._s, "ROUND_PERIOD_S", 900.0) or 900.0)
+        now = time.time()
+        elapsed_s = now - round_start_ts
+        if entry_window_s > 0 and entry_window_s <= elapsed_s < period_s:
+            tier1 = pos.tiers[0]
+            if (
+                tier1.placed
+                and not tier1.is_complete
+                and tier1.server_order_id
+                and not tier1.cancel_pending
+                and now >= _ts(getattr(tier1, "cancel_retry_after_ts", 0.0))
+            ):
+                tier1.cancel_pending = True
+                log.info(
+                    "engine.reconcile.cancel_t1_window_closed",
+                    tier=1,
+                    server_id=tier1.server_order_id[:16],
+                    elapsed_s=round(elapsed_s, 1),
+                    limit_s=entry_window_s,
+                    size_filled=tier1.size_filled,
+                )
+                await self._handler(ActionCancelTier(
+                    tier=1,
+                    server_order_id=tier1.server_order_id,
+                    reason="t1_window_closed",
+                ))
+
         mid_price = self._pc.get_midpoint(snap.entry_token)
         if mid_price <= 0:
             return
@@ -1614,11 +1652,23 @@ class StrategyEngine:
         # Fire when mid has dropped to (or below) strategy_price * (1 + margin).
         trigger_line = strategy_price * (1.0 + margin)
 
-        # NOTE: T1 is a TAKER market buy, so the 5-share minimum that
-        # applies to resting GTDs does not gate it. A 1-USD tier at 0.40
-        # buys ~2.5 shares via a market order; the router sends the FAK
-        # BUY sized in USDC. The old `t1_skip_below_min_size` check is
-        # removed accordingly.
+        # T1 is a resting GTD BUY: the CLOB rejects GTDs below 5 shares.
+        # Catch a misconfigured TIER1_NOTIONAL here instead of POSTing a
+        # guaranteed rejection on every tick. With the 2/4/8/16 ladder this
+        # is 2.0 / 0.40 = 5.0 shares — exactly at the minimum.
+        min_shares = 5.0
+        if (
+            strategy_price > 0
+            and s.TIER1_NOTIONAL / strategy_price < min_shares - 1e-9
+        ):
+            self._t1_skip_log(
+                "engine.t1_skip_below_min_size",
+                side="BOTH",
+                notional=s.TIER1_NOTIONAL,
+                strategy_price=strategy_price,
+                min_shares=min_shares,
+            )
+            return
 
         for side, token in [("UP", up_tok), ("DOWN", down_tok)]:
             mid_price = self._pc.get_midpoint(token)
@@ -1629,9 +1679,11 @@ class StrategyEngine:
                 )
                 continue
 
-            # ── Pre-arm trigger: fire when mid <= strategy_price * (1 + margin) ──
-            # We do NOT require mid <= strategy_price exactly — the new model
-            # pre-arms the GTD ahead of time so it can sit on the book.
+            # ── Pre-arm trigger: mid <= strategy_price * (1 + margin) ──
+            # The explicit ENTRY_PRICE_CAP check below still requires
+            # mid <= strategy_price (operator decision 2026-11-02: keep
+            # the current trigger). This wider line remains an early
+            # filter/diagnostic boundary.
             if mid_price > trigger_line:
                 self._t1_skip_log(
                     "engine.t1_skip_too_expensive",
@@ -1746,9 +1798,9 @@ class StrategyEngine:
             # operator sees the cap-spell duration in INFO alongside the
             # actual entry decision.
             self._t1_cap_reject_summary()
-            # T1 enters as a TAKER market buy with `strategy_price` as the
-            # worst-case limit (see ActionRouter): the 1-USD tier is below
-            # the 5-share minimum for resting GTDs, so it must cross.
+            # T1 is posted as a GTD BUY at `strategy_price`. A marketable
+            # limit crosses immediately as a taker; otherwise it rests on
+            # the book until filled or the GTD expires (see ActionRouter).
             await self._handler(ActionOpenT1(
                 side=side,
                 token=token,
