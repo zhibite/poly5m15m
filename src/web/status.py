@@ -186,6 +186,13 @@ def build_status(state: Any) -> dict[str, Any]:
         except Exception:
             orders = []
 
+    signals: dict[str, Any] = {}
+    if eng is not None and hasattr(eng, "signal_snapshot"):
+        try:
+            signals = eng.signal_snapshot()
+        except Exception:  # noqa: BLE001
+            signals = {}
+
     ks = getattr(state, "killswitch", None)
     pause = getattr(state, "trading_pause", None)
     pause_snap = (
@@ -208,6 +215,7 @@ def build_status(state: Any) -> dict[str, Any]:
             "config_pause": config_pause,
             "effective_paused": bool(pause_snap.get("paused") or config_pause),
         },
+        "signals": signals,
         "round_start_ts": getattr(rs, "round_start_ts", None),
         "slug": getattr(rs, "slug", None) or getattr(mkt, "slug", None),
         "condition_id": getattr(mkt, "condition_id", None),

@@ -80,6 +80,10 @@ class RingBuffer:
         """All prices where lo <= ts < hi."""
         return [p for _, p in self._deque if lo <= _ < hi]
 
+    def samples_with_ts(self, lo: float, hi: float) -> list[tuple[float, float]]:
+        """All `(ts_seconds, price)` samples where lo <= ts < hi."""
+        return [(t, p) for t, p in self._deque if lo <= t < hi]
+
     def __len__(self) -> int:
         return len(self._deque)
 

@@ -118,6 +118,7 @@ class StrategyEngine:
         killswitch: object | None = None,
         *,
         trading_pause: object | None = None,
+        signals: object | None = None,
     ) -> None:
         self._bc = binance_cache
         self._pc = price_cache
@@ -128,6 +129,11 @@ class StrategyEngine:
         # Live-trading start latch (2026-11-02). Every process starts
         # paused; only an explicit dashboard "恢复实盘交易" releases it.
         self._pause = trading_pause
+        # External-signal gate layer (2026-11-02). Optional: when absent
+        # the engine behaves exactly as before.
+        self._signals = signals
+        self._last_signal_snapshot: dict = {}
+        self._signal_log_last_ts: dict[str, float] = {}
         self._round: RoundState | None = None
         self._gate: GateKeeper | None = None
         self._s = _s()
@@ -520,6 +526,78 @@ class StrategyEngine:
         if pause is not None and getattr(pause, "paused", False):
             return True
         return self._cfg_bool("PAUSE_NEW_ENTRIES", False)
+
+    def _signal_decision(
+        self, kind: str, side: str, token: str, mid: float
+    ):
+        """Evaluate the external-signal gates; None means unavailable."""
+        sig = getattr(self, "_signals", None)
+        if sig is None or self._round is None or self._gate is None:
+            return None
+        try:
+            decision = sig.evaluate(
+                kind=kind,
+                side=side,
+                token=token,
+                mid=float(mid),
+                spot=float(getattr(self._bc, "last_price", 0.0) or 0.0),
+                strike=float(getattr(self._gate, "baseline", 0.0) or 0.0),
+                remaining_s=self._window_remaining_s(),
+                sigma_1m=self._btc_sigma_1m(),
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning(
+                "engine.signal_eval_failed", kind=kind, error=str(exc)
+            )
+            return None
+        self._last_signal_snapshot = decision.snapshot
+        return decision
+
+    def _log_signal_decision(
+        self, decision, *, kind: str, side: str, mid: float
+    ) -> None:
+        """Journal a signal verdict (blocking verdicts are always logged)."""
+        now = time.time()
+        key = f"{kind}|{side}"
+        table = getattr(self, "_signal_log_last_ts", None)
+        if table is None:
+            self._signal_log_last_ts = table = {}
+        last = table.get(key, 0.0)
+        if not decision.would_block and now - last < 30.0:
+            return
+        table[key] = now
+        snap = decision.snapshot
+        tf5m = snap.get("tf5m") or {}
+        macro = snap.get("macro") or {}
+        event = snap.get("event") or {}
+        log.info(
+            "engine.signal_gate",
+            kind=kind,
+            side=side,
+            mid=round(float(mid), 4),
+            mode=decision.mode,
+            allowed=decision.allowed,
+            would_block=decision.would_block,
+            reasons=list(decision.reasons),
+            edge=snap.get("edge"),
+            adverse_z=snap.get("adverse_z"),
+            fair_held=snap.get("fair_held"),
+            trend_against=snap.get("trend_against"),
+            sigma_1m_pct=snap.get("sigma_1m_pct"),
+            spread=snap.get("spread"),
+            book_imbalance=snap.get("book_imbalance"),
+            cvd_ratio=snap.get("cvd_ratio"),
+            tf5m_confirm=tf5m.get("confirm"),
+            funding_rate=macro.get("funding_rate"),
+            oi_change_pct=macro.get("oi_change_pct"),
+            dvol=macro.get("dvol"),
+            event_name=event.get("event_name"),
+            size_multiplier=decision.size_multiplier,
+        )
+
+    def signal_snapshot(self) -> dict:
+        """Latest signal snapshot for the dashboard / diagnostics."""
+        return dict(getattr(self, "_last_signal_snapshot", {}) or {})
 
     def _log_entries_paused(self) -> None:
         """One breadcrumb per round when new entries are paused."""
@@ -1602,6 +1680,24 @@ class StrategyEngine:
                 )
                 continue
 
+            # External-signal veto (2026-11-02). In log-only mode the
+            # verdict is journaled but the entry proceeds; in enforce mode
+            # a veto skips this side for the tick.
+            decision = self._signal_decision("T1", side, token, mid_price)
+            if decision is not None:
+                self._log_signal_decision(
+                    decision, kind="T1", side=side, mid=mid_price
+                )
+                if not decision.allowed:
+                    self._t1_skip_log(
+                        "engine.t1_skip_signal",
+                        side=side,
+                        mid_price=mid_price,
+                        reasons=list(decision.reasons),
+                        mode=decision.mode,
+                    )
+                    continue
+
             log.info(
                 "engine.trigger_t1",
                 side=side,
@@ -1954,6 +2050,33 @@ class StrategyEngine:
                     )
                     continue
 
+            # External-signal veto for every averaging tier. A veto stops
+            # the ladder here instead of skipping to a deeper tier: adding
+            # T3 while T2 is blocked would be the exact blind averaging the
+            # signal layer is meant to prevent.
+            decision = self._signal_decision(
+                f"T{tier.tier}",
+                snap.entry_side or "",
+                pos.entry_token or "",
+                mid_price,
+            )
+            if decision is not None:
+                self._log_signal_decision(
+                    decision,
+                    kind=f"T{tier.tier}",
+                    side=snap.entry_side or "",
+                    mid=mid_price,
+                )
+                if not decision.allowed:
+                    self._tN_skip_log(
+                        "engine.tN_skip_signal",
+                        tier=tier.tier,
+                        mid=mid_price,
+                        reasons=list(decision.reasons),
+                        mode=decision.mode,
+                    )
+                    return
+
             # Budget for THIS placement = the tier's planned USD minus what
             # has already been filled on it. This is the invariant that makes
             # re-arms after a partial fill/cancel safe: a tier can never
@@ -1963,6 +2086,12 @@ class StrategyEngine:
             # that partially filled, got cancelled, and later re-armed could
             # spend ~1.5-2x its budget.)
             order_notional = max(0.0, tier.notional - tier.cost_filled)
+            if (
+                decision is not None
+                and decision.size_multiplier < 0.999
+                and order_notional > 0
+            ):
+                order_notional *= decision.size_multiplier
             if order_notional <= 1e-9:
                 self._tN_skip_log(
                     "engine.tN_skip_budget_exhausted",

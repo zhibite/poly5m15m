@@ -42,6 +42,7 @@ _ERROR_LOG_INTERVAL_S = 60.0
 # (engine.tp_backoff_engaged, router.stop_loss_filled, ...).
 _JOURNAL_PREFIXES = (
     "engine.t4",              # t4_time_bypass, t4_journal markers
+    "engine.signal_",         # external-signal gate verdicts (2026-11-02)
     "engine.tN_skip_t4",      # late-window / strike-gate / gap-gate skips
     "engine.trigger_tp",      # TP decisions (incl. trigger_tp_taker)
     "engine.tp_",             # tp_filled / tp_backoff / tp_retreated...

@@ -43,12 +43,14 @@ from src.execution.gtd_expiry_watcher import GtdExpiryWatcher
 from src.execution.heartbeat import HeartbeatLoop
 from src.execution.order_manager import OrderManager
 from src.execution.tier_watcher import TierWatcher, WatcherResult
+from src.feeds.binance_futures import MacroSignals
 from src.feeds.binance_spot import BinanceCache, BinanceFeed, BinanceSpotService, RingBuffer
 from src.infra.logging import configure_logging, get_logger
 from src.market.market_service import MarketService
 from src.market.pm_client import PolymarketClient
 from src.market.window_manager import WindowManager
 from src.market.market_ws import MarketWS, PriceCache
+from src.market.signal_market import Signal5mFeed
 from src.market.user_ws import UserWS
 from src.persistence.db import DB, init_db
 from src.strategy.engine import (
@@ -60,8 +62,10 @@ from src.strategy.engine import (
     ActionTakeProfit,
     StrategyEngine,
 )
+from src.strategy import event_calendar
 from src.strategy.killswitch import KillSwitch
 from src.strategy.loop import DecisionLoop
+from src.strategy.signals import SignalEngine
 from src.strategy.trading_pause import TradingPause
 
 log = get_logger(__name__)
@@ -230,6 +234,13 @@ class AppState:
         # Live-trading start latch (2026-11-02): every process starts
         # paused. Only the dashboard can release it, for this process only.
         self.trading_pause = TradingPause.load()
+        # External-signal layer (2026-11-02).
+        self.event_calendar = None
+        self.macro_signals: MacroSignals | None = None
+        self.signal_5m: Signal5mFeed | None = None
+        self.signal_5m_ws: MarketWS | None = None
+        self.signal_5m_cache: PriceCache | None = None
+        self.signals: SignalEngine | None = None
         self.binance_cache = BinanceCache()
         self.price_cache = PriceCache()
         self.ring = RingBuffer(retention_s=binance().BUFFER_RETENTION_S)
@@ -2016,7 +2027,11 @@ def _on_market_discovered(asset: str, mkt) -> None:
 
     if state.market_ws:
         try:
-            state.market_ws.subscribe_tokens([mkt.token_up_id, mkt.token_down_id])
+            # set_active_tokens replaces the subscription set (the 15m bot
+            # only ever trades this one market) and subscribes the new ids.
+            state.market_ws.set_active_tokens(
+                {mkt.token_up_id, mkt.token_down_id}
+            )
         except Exception as exc:  # noqa: BLE001
             log.warning(
                 "market.subscribe_failed",
@@ -2369,6 +2384,21 @@ async def _midpoint_poll_loop() -> None:
             down_mid = await s.pm_client.get_midpoint(down_token)
             s.price_cache.midpoint[up_token] = up_mid
             s.price_cache.midpoint[down_token] = down_mid
+            # Top-5 depth for the microstructure signal gates. Failure is
+            # best-effort; the WS best bid/ask remains available.
+            try:
+                books = await asyncio.gather(
+                    s.pm_client.get_order_book(up_token),
+                    s.pm_client.get_order_book(down_token),
+                    return_exceptions=True,
+                )
+                for token, book in zip((up_token, down_token), books):
+                    if isinstance(book, dict):
+                        s.price_cache.set_book(
+                            token, book.get("bids"), book.get("asks")
+                        )
+            except Exception as exc:  # noqa: BLE001
+                log.debug("midpoint.book_failed", error=str(exc))
 
             # B-1 fix (single-driver): the strategy decision loop is now
             # driven solely by DecisionLoop on a 250ms tick. The midpoint
@@ -2722,6 +2752,21 @@ async def main() -> None:
         poll_interval_s=2.0,
     )
 
+    # ── External signal layer (2026-11-02) ──────────────────────────────
+    # The 5m confirmation feed needs the shared MarketWS, so it is bound
+    # later in the Feeds section. Everything else is independent.
+    s.event_calendar = event_calendar.from_config()
+    s.macro_signals = MacroSignals(
+        symbol="BTCUSDT",
+        poll_s=float(cfg_strategy.SIGNAL_MACRO_POLL_S or 60.0),
+    )
+    s.signals = SignalEngine(
+        ring=s.ring,
+        price_cache=s.price_cache,
+        macro=s.macro_signals,
+        events=s.event_calendar,
+    )
+
     # ── Action router + Strategy engine ──────────────────────────────────
     router = ActionRouter(s)
     s.engine = StrategyEngine(
@@ -2730,12 +2775,19 @@ async def main() -> None:
         router,
         killswitch=s.killswitch,
         trading_pause=s.trading_pause,
+        signals=s.signals,
     )
     log.warning(
         "live_trading.starts_paused",
         note="every process starts paused; click 恢复实盘交易 on the "
              "dashboard before any new live entry is allowed. TP and "
              "stop-loss remain active.",
+    )
+    log.info(
+        "signals.configured",
+        enabled=bool(cfg_strategy.SIGNAL_GATES_ENABLED),
+        log_only=bool(cfg_strategy.SIGNAL_GATES_LOG_ONLY),
+        event_calendar=str(s.event_calendar.path),
     )
 
     # ── Decision loop — drives StrategyEngine._evaluate() on a fixed tick ──
@@ -2754,6 +2806,25 @@ async def main() -> None:
         on_connect=None,
         on_disconnect=None,
     )
+    # Read-only BTC 5m feed used only by the 15m signal gates. It gets its
+    # own WS + cache so its token subscriptions can be pruned without
+    # touching the trading channel's active 15m tokens.
+    s.signal_5m_cache = PriceCache()
+    s.signal_5m_ws = MarketWS(
+        cache=s.signal_5m_cache,
+        on_connect=None,
+        on_disconnect=None,
+    )
+    s.signal_5m = Signal5mFeed(
+        pm=s.pm_client,
+        market_ws=s.signal_5m_ws,
+        price_cache=s.signal_5m_cache,
+        asset="BTC",
+        window_sec=300,
+        window_s=float(cfg_strategy.SIGNAL_5M_WINDOW_S or 300.0),
+    )
+    if s.signals is not None:
+        s.signals.set_tf5m(s.signal_5m)
 
     # ── User WebSocket (order events) ────────────────────────────────────
     # Use the RESOLVED credentials, not cfg_strategy.*: when the operator
@@ -2782,6 +2853,16 @@ async def main() -> None:
     await s.binance_feed.start()
     await s.market_ws.start()
     await s.wm.start()
+    # Signal feeds are best-effort: an outage must never stop the bot.
+    try:
+        if s.macro_signals is not None:
+            await s.macro_signals.start()
+        if s.signal_5m_ws is not None:
+            await s.signal_5m_ws.start()
+        if s.signal_5m is not None:
+            await s.signal_5m.start()
+    except Exception as exc:  # noqa: BLE001
+        log.warning("signals.start_failed", error=str(exc))
     s.gtd_expiry.start()
     if s.decision_loop:
         s.decision_loop.start()
@@ -2885,6 +2966,12 @@ async def main() -> None:
         await s.gtd_expiry.stop()
     if s.decision_loop:
         await s.decision_loop.stop()
+    if s.signal_5m:
+        await s.signal_5m.stop()
+    if s.signal_5m_ws:
+        await s.signal_5m_ws.stop()
+    if s.macro_signals:
+        await s.macro_signals.stop()
     if s.wm:
         await s.wm.stop()
     if s.market_ws:

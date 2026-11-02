@@ -60,6 +60,17 @@ class Params:
     t4_max_gap_below_trigger_pct: float = 0.05
     t4_drift_bypass_min_remaining_s: float = 540.0
 
+    # External-signal gates (2026-11-02). Off by default for standalone
+    # research calls; `runner.live_params()` mirrors the live config.
+    signal_gates_enabled: bool = False
+    signal_min_edge: float = 0.02
+    signal_t1_min_edge: float = -0.05
+    signal_max_adverse_z: float = 2.0
+    signal_t1_max_adverse_z: float = 2.5
+    signal_max_trend_against: float = 0.70
+    signal_t1_max_trend_against: float = 0.90
+    signal_max_sigma_1m_pct: float = 0.25
+
     stop_loss_enabled: bool = True
     stop_loss_t4_drop_pct: float = 0.45
     stop_loss_confirm_s: float = 20.0
@@ -214,6 +225,101 @@ def _btc_sigma_1m(bars: list[BtcBar], t_ms: int, p: Params) -> float:
     return sigma
 
 
+def _norm_cdf(x: float) -> float:
+    import math
+    return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
+
+
+def _ema_last(values: list[float], span: int) -> float | None:
+    if not values:
+        return None
+    span = max(1, min(span, len(values)))
+    alpha = 2.0 / (span + 1.0)
+    ema = values[0]
+    for value in values[1:]:
+        ema = alpha * value + (1.0 - alpha) * ema
+    return ema
+
+
+def _btc_trend_score(
+    bars: list[BtcBar], t_ms: int, sigma: float
+) -> float:
+    """EMA(5)-EMA(15) slope in units of the expected 5-minute move."""
+    if not bars or sigma <= 0:
+        return 0.0
+    completed = [b for b in bars if b.time_ms + 60_000 <= t_ms]
+    if len(completed) < 3:
+        return 0.0
+    closes = [b.close for b in completed[-15:]]
+    fast = _ema_last(closes, 5)
+    slow = _ema_last(closes, min(15, len(closes)))
+    if fast is None or slow is None or slow <= 0:
+        return 0.0
+    normalizer = sigma * (5.0 ** 0.5)
+    if normalizer <= 0:
+        return 0.0
+    return max(-1.0, min(1.0, ((fast - slow) / slow) / normalizer))
+
+
+def _signal_ok(
+    w: WindowData,
+    t_ms: int,
+    side: str,
+    price: float,
+    *,
+    is_t1: bool,
+    p: Params,
+) -> bool:
+    """Replay the live digital-model / z / trend / volatility gates."""
+    if not p.signal_gates_enabled:
+        return True
+    baseline = _btc_baseline(w.btc, w.start_ms)
+    btc = _btc_at(w.btc, t_ms)
+    remaining = (w.end_ms - t_ms) / 1000.0
+    if remaining <= 0:
+        # No new entry/add at or after expiry — fail CLOSED, unlike an
+        # upstream data outage.
+        return False
+    if (
+        baseline is None
+        or baseline <= 0
+        or btc is None
+        or btc <= 0
+        or price <= 0
+    ):
+        return True  # fail open on missing inputs
+    sigma = _btc_sigma_1m(w.btc, t_ms, p)
+    if sigma <= 0:
+        return True
+    minutes = max(remaining / 60.0, 1.0 / 60.0)
+    import math
+    z = math.log(btc / baseline) / (sigma * math.sqrt(minutes))
+    fair_up = _norm_cdf(z)
+    side_u = str(side or "").upper()
+    fair_held = fair_up if side_u == "UP" else 1.0 - fair_up
+    edge = fair_held - price
+    adverse_z = z if side_u == "DOWN" else -z
+    max_z = (
+        p.signal_t1_max_adverse_z if is_t1 else p.signal_max_adverse_z
+    )
+    min_edge = p.signal_t1_min_edge if is_t1 else p.signal_min_edge
+    if adverse_z > max_z or edge < min_edge:
+        return False
+    trend = _btc_trend_score(w.btc, t_ms, sigma)
+    side_sign = 1.0 if side_u == "UP" else -1.0
+    trend_against = max(0.0, -(side_sign * trend))
+    max_trend = (
+        p.signal_t1_max_trend_against
+        if is_t1
+        else p.signal_max_trend_against
+    )
+    if trend_against > max_trend:
+        return False
+    if sigma * 100.0 > p.signal_max_sigma_1m_pct:
+        return False
+    return True
+
+
 class _Series:
     """Forward-filled price view over a sorted PricePoint list."""
 
@@ -283,6 +389,8 @@ def _pick_entry(
             continue
         if t == first_valid:
             price = p.entry_price_cap
+        if not _signal_ok(w, t, side, price, is_t1=True, p=p):
+            continue
         return side, t, price
     return None
 
@@ -450,6 +558,8 @@ def replay(w: WindowData, p: Params = Params()) -> RoundResult:
                 if not _drift_allows(w, t, price, t1_entry, idx, p):
                     continue
                 if _btc_vol_blocked(w.btc, t, p):
+                    continue
+                if not _signal_ok(w, t, side, price, is_t1=False, p=p):
                     continue
                 tier_armed[idx] = True
                 tier_trigger[idx] = trigger

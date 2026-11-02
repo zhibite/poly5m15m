@@ -438,3 +438,14 @@ python -m src.main
 - [ ] 数据目录 `/app/data` 已持久化（数据库路径 `/app/data/polymarket.db`）
 - [ ] 日志正常输出（无 ERROR）
 - [ ] 看到 `engine.trigger_t1` 或等待 baseline 的日志
+
+---
+
+## 外部信号闸门（2026-11-02）
+
+实盘版现在默认启用多层信号否决：数字期权公允值/edge、行权价 z、趋势/波动 regime、Polymarket 盘口与 CVD、5m 周期确认、Binance 永续 funding/OI + Deribit DVOL、事件黑名单。数据缺失时失败开放，不会因外部接口故障卡死马丁。
+
+- 全部参数在 `.env.docker` / Coolify 环境变量或 `/config` 页面「信号」分组中。
+- 新阈值建议先设 `SIGNAL_GATES_LOG_ONLY=true` 收集几天 `engine.signal_gate` 日志（同时写入 T4 journal），确认后再改 false 强制执行。
+- 事件日历：把 `docs/event_calendar.example.json` 复制到持久卷的 `/app/data/event_calendar.json` 并按需添加 CPI/FOMC 等时间。
+- 部署/进程启动仍然默认暂停新开仓；在看板确认信号面板后点「恢复实盘交易」。

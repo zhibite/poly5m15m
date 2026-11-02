@@ -172,6 +172,77 @@ class StrategySettings(BaseSettings):
     # Prevents chasing at the very end of the 15-min window.
     T1_ENTRY_WINDOW_S: float = 300.0    # 5 minutes
 
+    # ── External signal gates (2026-11-02) ────────────────────────────────
+    # The martingale used to average down on a fixed price drop alone. The
+    # signal layer vetoes new entries/averaging when the underlying model,
+    # trend/volatility regime, CLOB microstructure, 5m timeframe, macro
+    # derivatives data or the event calendar says the move is not a
+    # mean-reversion opportunity.
+    #
+    # Modes: enabled=True + log_only=False -> enforce. Set log_only=True to
+    # collect the gate metrics without blocking (recommended for the first
+    # few days after deploying a new threshold). Set enabled=False to turn
+    # the whole layer off. Missing data always fails OPEN: a signal outage
+    # must never wedge the ladder.
+    SIGNAL_GATES_ENABLED: bool = True
+    SIGNAL_GATES_LOG_ONLY: bool = False
+
+    # Digital-option model: P(up) = Phi(ln(S/K) / (sigma * sqrt(tau))).
+    # Edge = model probability of the held side - token mid. Only add when
+    # the market is cheaper than the model by this much. T1 is allowed a
+    # negative edge because the initial entry is a cap-based probe.
+    SIGNAL_MIN_EDGE: float = 0.02
+    SIGNAL_T1_MIN_EDGE: float = -0.05
+    # Adverse distance to the strike, in sigma units. Positive = the
+    # underlying has moved against the held side. T4 keeps its existing
+    # dedicated gate in addition to this.
+    SIGNAL_MAX_ADVERSE_Z: float = 2.0
+    SIGNAL_T1_MAX_ADVERSE_Z: float = 2.5
+    # Trend/variance regime: trend_score is -1..1; block adding when the
+    # trend is strongly against the position.
+    SIGNAL_MAX_TREND_AGAINST: float = 0.70
+    SIGNAL_T1_MAX_TREND_AGAINST: float = 0.90
+    # Slow volatility filter (1m sigma in percent). The existing
+    # BTC_VOL_* guard catches a 60s spike; this catches a high-vol regime.
+    SIGNAL_MAX_SIGMA_1M_PCT: float = 0.25
+
+    # CLOB microstructure. Missing book/flow data fails open.
+    SIGNAL_MICRO_GATE_ENABLED: bool = True
+    SIGNAL_MAX_SPREAD: float = 0.03          # (ask-bid)/mid
+    SIGNAL_MIN_BOOK_IMBALANCE: float = -0.60  # ask-heavy book blocks
+    SIGNAL_MAX_SELL_FLOW: float = 0.60        # |CVD|/volume against a BUY
+    SIGNAL_FLOW_WINDOW_S: float = 60.0
+
+    # 5m timeframe confirmation. The bot still trades only BTC 15m; the 5m
+    # market is a read-only signal. Missing 5m data fails open.
+    SIGNAL_5M_GATE_ENABLED: bool = True
+    SIGNAL_5M_MIN_CONFIRM: float = -0.50
+    SIGNAL_5M_WINDOW_S: float = 300.0
+
+    # Macro derivatives (Binance USDT-M funding/OI + Deribit DVOL).
+    SIGNAL_MACRO_GATE_ENABLED: bool = True
+    SIGNAL_MAX_FUNDING_RATE: float = 0.001   # |8h funding| > 0.1%
+    SIGNAL_MAX_OI_CHANGE_PCT: float = 3.0    # 5m OI change
+    SIGNAL_MAX_DVOL: float = 75.0
+    SIGNAL_MAX_DVOL_CHANGE_PCT: float = 20.0
+    SIGNAL_MACRO_POLL_S: float = 60.0
+
+    # Event calendar (manual JSON; see data/event_calendar.json).
+    SIGNAL_EVENT_GATE_ENABLED: bool = True
+    SIGNAL_EVENT_CALENDAR_PATH: str = ""
+    SIGNAL_EVENT_PRE_BUFFER_S: float = 300.0
+    SIGNAL_EVENT_POST_BUFFER_S: float = 300.0
+
+    # Optional edge/regime-based position scaling. Off by default: the
+    # operator's ladder stays 2/4/8/16 USD unless explicitly enabled.
+    SIGNAL_SIZE_SCALING_ENABLED: bool = False
+    SIGNAL_SIZE_MIN_MULT: float = 0.25
+    SIGNAL_SIZE_TARGET_EDGE: float = 0.10
+
+    # Regime recalculation interval (the ring scan is not free).
+    SIGNAL_REGIME_REFRESH_S: float = 5.0
+    SIGNAL_REGIME_LOOKBACK_S: float = 1200.0
+
     # ── Trading fees (official formula) ───────────────────────────────────
     # fee = C × feeRate × p × (1 - p)
     #   C = shares, p = fill price, taker-only; makers pay 0.

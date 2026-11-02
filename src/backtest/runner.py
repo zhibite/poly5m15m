@@ -40,6 +40,13 @@ VARIANTS: tuple[tuple[str, dict[str, Any]], ...] = (
     ("t4_2u", {"tier_notionals": (1.0, 2.0, 4.0, 2.0)}),
     ("stop_30", {"stop_loss_t4_drop_pct": 0.30}),
     ("z_1", {"t4_max_strike_z": 1.0}),
+    # A/B: the same replay with the external-signal gates disabled.
+    ("signals_off", {"signal_gates_enabled": False}),
+    ("signals_strict", {
+        "signal_min_edge": 0.05,
+        "signal_max_adverse_z": 1.5,
+        "signal_max_trend_against": 0.50,
+    }),
 )
 
 
@@ -80,6 +87,24 @@ def live_params() -> Params:
         t4_max_gap_below_trigger_pct=_f(s, "T4_MAX_GAP_BELOW_TRIGGER_PCT", 0.05),
         t4_drift_bypass_min_remaining_s=_f(
             s, "T4_DRIFT_BYPASS_MIN_REMAINING_S", 540.0
+        ),
+        signal_gates_enabled=bool(
+            getattr(s, "SIGNAL_GATES_ENABLED", True)
+        ),
+        signal_min_edge=_f(s, "SIGNAL_MIN_EDGE", 0.02),
+        signal_t1_min_edge=_f(s, "SIGNAL_T1_MIN_EDGE", -0.05),
+        signal_max_adverse_z=_f(s, "SIGNAL_MAX_ADVERSE_Z", 2.0),
+        signal_t1_max_adverse_z=_f(
+            s, "SIGNAL_T1_MAX_ADVERSE_Z", 2.5
+        ),
+        signal_max_trend_against=_f(
+            s, "SIGNAL_MAX_TREND_AGAINST", 0.70
+        ),
+        signal_t1_max_trend_against=_f(
+            s, "SIGNAL_T1_MAX_TREND_AGAINST", 0.90
+        ),
+        signal_max_sigma_1m_pct=_f(
+            s, "SIGNAL_MAX_SIGMA_1M_PCT", 0.25
         ),
         stop_loss_enabled=bool(getattr(s, "STOP_LOSS_ENABLED", True)),
         stop_loss_t4_drop_pct=_f(s, "STOP_LOSS_T4_DROP_PCT", 0.45),

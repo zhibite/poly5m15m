@@ -113,6 +113,19 @@
     </div>
   </div>
 
+  <!-- External signals / risk gates -->
+  <div class="section">
+    <h2>信号 / 风控闸门</h2>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>项目</th><th>数值</th><th>说明</th></tr></thead>
+        <tbody id="signal-tbody">
+          <tr><td colspan="3" class="no-data">等待首次决策...</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
   <!-- Position -->
   <div class="section">
     <h2>当前持仓</h2>
@@ -440,9 +453,43 @@ async function resumeTrading() {
   await controlCall('/api/control/resume', {});
 }
 
+function renderSignals(sig) {
+  const body = $('signal-tbody');
+  if (!sig || !sig.ts) {
+    body.innerHTML = '<tr><td colspan="3" class="no-data">等待首次决策...</td></tr>';
+    return;
+  }
+  const val = (v, d = 4) => (v === null || v === undefined || isNaN(v)) ? '--' : Number(v).toFixed(d);
+  const pct = (v, d = 2) => (v === null || v === undefined || isNaN(v)) ? '--' : (Number(v) * 100).toFixed(d) + '%';
+  const reasons = (sig.reasons && sig.reasons.length) ? sig.reasons.join(', ') : '无';
+  const tf = sig.tf5m || {};
+  const macro = sig.macro || {};
+  const ev = sig.event || {};
+  const rows = [
+    ['结论', sig.would_block ? '<span class="red">拦截</span>' : '<span class="green">放行</span>',
+      `模式=${sig.mode || '--'} · ${sig.kind || '--'} ${sig.side || ''} · 原因: ${reasons}`],
+    ['数字期权模型', `公允 ${val(sig.fair_held, 3)} / mid ${val(sig.token_mid, 3)}`,
+      `edge=${val(sig.edge, 4)} · adverse z=${val(sig.adverse_z, 2)} · σ=${val(sig.sigma_1m_pct, 3)}%/min`],
+    ['趋势/波动', `trend=${val(sig.trend_score, 3)} (against ${val(sig.trend_against, 2)})`,
+      `RSI=${val(sig.rsi, 1)} · ATR=${val(sig.atr_pct, 3)}% · bars=${sig.regime_bars || 0}`],
+    ['盘口', `spread=${val(sig.spread, 4)} · imbalance=${val(sig.book_imbalance, 2)}`,
+      `CVD 占比=${val(sig.cvd_ratio, 2)} · 60s 主动买卖流`],
+    ['5m 确认', tf.available ? `UP ${val(tf.up_mid, 3)} / DOWN ${val(tf.down_mid, 3)}` : '不可用',
+      tf.available ? `UP 60s ${pct(tf.up_change_60)} · DOWN 60s ${pct(tf.down_change_60)} · confirm=${val(tf.confirm, 2)}` : '数据缺失时失败开放'],
+    ['宏观', `funding=${val(macro.funding_rate, 5)} · OI ${val(macro.oi_change_pct, 2)}%`,
+      `DVOL=${val(macro.dvol, 1)} (${val(macro.dvol_change_pct, 1)}%) · 数据缺失时失败开放`],
+    ['事件', ev.event_blackout ? String(ev.event_name || '黑名单') : '无',
+      ev.event_end ? '结束 ' + new Date(ev.event_end * 1000).toLocaleString('zh-CN', { hour12: false }) : '未配置事件日历'],
+  ];
+  body.innerHTML = rows.map(([a, b, c]) =>
+    `<tr><td>${a}</td><td class="mono">${b}</td><td class="muted">${c}</td></tr>`
+  ).join('');
+}
+
 function renderStatus(s) {
   renderKillswitch(s.killswitch);
   renderTradingPause(s.trading_pause);
+  renderSignals(s.signals);
   renderMarketLink(s.slug);
 
   // window
