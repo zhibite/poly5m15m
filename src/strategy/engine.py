@@ -599,6 +599,30 @@ class StrategyEngine:
         """Latest signal snapshot for the dashboard / diagnostics."""
         return dict(getattr(self, "_last_signal_snapshot", {}) or {})
 
+    def _monitor_signal(self) -> None:
+        """Keep the dashboard signal panel fresh while entries are paused.
+
+        Without this the signal snapshot is only computed when a tier
+        reaches its price trigger, so a paused/observing operator would
+        see an empty panel. This is a read-only monitor: no action is
+        emitted.
+        """
+        if getattr(self, "_signals", None) is None or self._round is None:
+            return
+        up_tok = getattr(self._round, "up_token", None)
+        down_tok = getattr(self._round, "down_token", None)
+        if not up_tok or not down_tok:
+            return
+        up = self._pc.get_midpoint(up_tok)
+        down = self._pc.get_midpoint(down_tok)
+        if up <= 0 and down <= 0:
+            return
+        if up > 0 and (down <= 0 or up <= down):
+            side, token, mid = "UP", up_tok, up
+        else:
+            side, token, mid = "DOWN", down_tok, down
+        self._signal_decision("T1", side, token, mid)
+
     def _log_entries_paused(self) -> None:
         """One breadcrumb per round when new entries are paused."""
         rnd = getattr(self, "_round", None)
@@ -1304,6 +1328,7 @@ class StrategyEngine:
             # operator paused. TP/stop-loss SELLs are left untouched.
             if self._trading_paused():
                 await self._cancel_placed_buys("trading_paused")
+                self._monitor_signal()
 
             new_state = "PASS" if gate_state.within_limit else "FAIL"
             if self._round.gate_last_state != new_state:
