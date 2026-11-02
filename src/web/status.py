@@ -187,6 +187,13 @@ def build_status(state: Any) -> dict[str, Any]:
             orders = []
 
     ks = getattr(state, "killswitch", None)
+    pause = getattr(state, "trading_pause", None)
+    pause_snap = (
+        pause.snapshot()
+        if pause is not None and hasattr(pause, "snapshot")
+        else {"paused": True, "since": None, "reason": "not initialised"}
+    )
+    config_pause = bool(getattr(s, "PAUSE_NEW_ENTRIES", False))
     now_ts = int(time.time())
     return {
         "server_time": now_ts,
@@ -195,6 +202,11 @@ def build_status(state: Any) -> dict[str, Any]:
             "active": bool(getattr(ks, "active", False)),
             "since": getattr(ks, "since", 0.0) or None,
             "reason": getattr(ks, "reason", "") or None,
+        },
+        "trading_pause": {
+            **pause_snap,
+            "config_pause": config_pause,
+            "effective_paused": bool(pause_snap.get("paused") or config_pause),
         },
         "round_start_ts": getattr(rs, "round_start_ts", None),
         "slug": getattr(rs, "slug", None) or getattr(mkt, "slug", None),

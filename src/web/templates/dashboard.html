@@ -36,6 +36,20 @@
   </div>
   <div id="control-banner"></div>
 
+  <!-- Live-trading start latch: every process starts paused -->
+  <div class="control-bar" id="pause-bar">
+    <div class="control-status">
+      <span class="control-dot paused" id="pause-dot"></span>
+      <span class="control-label" id="pause-label">实盘交易已暂停</span>
+      <span class="control-meta" id="pause-meta"></span>
+    </div>
+    <div class="control-actions">
+      <button class="btn btn-primary" id="resume-trading-btn" onclick="resumeTrading()">恢复实盘交易</button>
+      <button class="btn btn-ghost" id="pause-trading-btn" hidden onclick="pauseTrading()">暂停新开仓</button>
+    </div>
+  </div>
+  <div id="pause-banner"></div>
+
   <!-- Summary -->
   <div class="stats-row">
     <div class="stat-card">
@@ -229,9 +243,47 @@ function updateControlAvailability() {
   const ready = !!(AUTH && AUTH.credentials_configured);
   $('stop-btn').disabled = !ready;
   $('start-btn').disabled = !ready;
+  $('resume-trading-btn').disabled = !ready;
+  $('pause-trading-btn').disabled = !ready;
   if (!ready) {
     $('control-meta').textContent = '未设置 WEB_PASSWORD，控制功能不可用';
+    $('pause-meta').textContent = '未设置 WEB_PASSWORD，控制功能不可用';
   }
+}
+
+function renderTradingPause(p) {
+  // Missing payload defaults to paused: the safe state for live money.
+  const paused = !p || !!(p.effective_paused || p.paused);
+  const dot = $('pause-dot');
+  const label = $('pause-label');
+  const meta = $('pause-meta');
+  const bar = $('pause-bar');
+
+  $('resume-trading-btn').hidden = !paused;
+  $('pause-trading-btn').hidden = paused;
+
+  if (paused) {
+    dot.className = 'control-dot paused';
+    label.textContent = '实盘交易已暂停';
+    const since = p && p.since
+      ? new Date(p.since * 1000).toLocaleString('zh-CN', { hour12: false })
+      : '--';
+    const cfg = p && p.config_pause ? ' · PAUSE_NEW_ENTRIES=true' : '';
+    meta.textContent = `新开仓/补仓已暂停${since !== '--' ? ' · 自 ' + since : ''}${cfg}`;
+    bar.classList.add('paused');
+    $('pause-banner').innerHTML =
+      '<div class="alert warn"><b>实盘交易已暂停。</b>不会新开仓/补仓；' +
+      '已有持仓的止盈和止损仍会执行。点「恢复实盘交易」后才会真实下单。</div>';
+  } else {
+    dot.className = 'control-dot running';
+    label.textContent = '实盘交易已启用';
+    meta.textContent = '新开仓已允许，注意会产生真实订单';
+    bar.classList.remove('paused');
+    $('pause-banner').innerHTML =
+      '<div class="alert info"><b>实盘交易已启用。</b>新开仓/补仓会发送真实 CLOB 订单；' +
+      '重启或重新部署后会再次自动暂停。</div>';
+  }
+  updateControlAvailability();
 }
 
 function renderKillswitch(ks) {
@@ -323,6 +375,10 @@ async function controlCall(path, body) {
     await refreshStatus();
     if (path.endsWith('/stop')) {
       showToast('已紧急停止，撤销挂单 ' + (data.cancelled_orders || 0) + ' 笔。');
+    } else if (path.endsWith('/pause')) {
+      showToast('已暂停新开仓；已有持仓的止盈/止损仍生效。');
+    } else if (path.endsWith('/resume')) {
+      showToast('已恢复实盘交易；重启或重新部署后会再次自动暂停。');
     } else {
       showToast('已恢复运行。');
     }
@@ -356,8 +412,37 @@ async function startStrategy() {
   await controlCall('/api/control/start', {});
 }
 
+async function pauseTrading() {
+  const ok = await confirmDialog({
+    title: '暂停实盘交易？',
+    okText: '暂停新开仓',
+    danger: true,
+    lines: [
+      '不会新开仓/补仓；已有持仓的止盈和止损仍会执行。',
+      '下一步可在本页点「恢复实盘交易」重新开启。',
+    ],
+  });
+  if (!ok) return;
+  await controlCall('/api/control/pause', { reason: 'dashboard' });
+}
+
+async function resumeTrading() {
+  const ok = await confirmDialog({
+    title: '恢复实盘交易？',
+    okText: '恢复实盘交易',
+    danger: true,
+    lines: [
+      '恢复后新开仓/补仓会发送真实 CLOB 订单。',
+      '此操作只对当前进程生效；重启或重新部署后会再次自动暂停。',
+    ],
+  });
+  if (!ok) return;
+  await controlCall('/api/control/resume', {});
+}
+
 function renderStatus(s) {
   renderKillswitch(s.killswitch);
+  renderTradingPause(s.trading_pause);
   renderMarketLink(s.slug);
 
   // window

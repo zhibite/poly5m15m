@@ -116,6 +116,8 @@ class StrategyEngine:
         price_cache: PriceCache,
         handler: ActionHandler,
         killswitch: object | None = None,
+        *,
+        trading_pause: object | None = None,
     ) -> None:
         self._bc = binance_cache
         self._pc = price_cache
@@ -123,6 +125,9 @@ class StrategyEngine:
         # Shared emergency-stop flag. When engaged `_evaluate` returns
         # immediately, so no T1 / averaging / TP action is emitted.
         self._kill = killswitch
+        # Live-trading start latch (2026-11-02). Every process starts
+        # paused; only an explicit dashboard "恢复实盘交易" releases it.
+        self._pause = trading_pause
         self._round: RoundState | None = None
         self._gate: GateKeeper | None = None
         self._s = _s()
@@ -502,17 +507,38 @@ class StrategyEngine:
         floor_price = strategy_price * (1.0 - gap)
         return mid >= floor_price, floor_price
 
+    def _trading_paused(self) -> bool:
+        """True when new entries/averaging must not be placed.
+
+        Two independent brakes are honoured:
+          * the in-memory live-trading start latch (default ON for every
+            process; released only from the dashboard), and
+          * the legacy PAUSE_NEW_ENTRIES config/env flag.
+        Take-profit and stop-loss are deliberately NOT affected.
+        """
+        pause = getattr(self, "_pause", None)
+        if pause is not None and getattr(pause, "paused", False):
+            return True
+        return self._cfg_bool("PAUSE_NEW_ENTRIES", False)
+
     def _log_entries_paused(self) -> None:
-        """One breadcrumb per round when PAUSE_NEW_ENTRIES is on."""
+        """One breadcrumb per round when new entries are paused."""
         rnd = getattr(self, "_round", None)
         rt = getattr(rnd, "round_start_ts", None)
         if getattr(self, "_pause_logged_round", None) == rt:
             return
         self._pause_logged_round = rt
+        pause = getattr(self, "_pause", None)
+        source = (
+            "live_trading_pause"
+            if pause is not None and getattr(pause, "paused", False)
+            else "PAUSE_NEW_ENTRIES"
+        )
         log.info(
             "engine.entries_paused",
             round_start_ts=rt,
-            note="PAUSE_NEW_ENTRIES=true; TP and stop-loss stay active",
+            source=source,
+            note="new entries/averaging blocked; TP and stop-loss stay active",
         )
 
     async def _cancel_placed_buys(self, reason: str) -> None:
@@ -1195,6 +1221,12 @@ class StrategyEngine:
 
             gate_state = self._gate.state(bc_now)
 
+            # A paused process must not leave pre-armed BUY GTDs on the
+            # book: they could fill and open a live position after the
+            # operator paused. TP/stop-loss SELLs are left untouched.
+            if self._trading_paused():
+                await self._cancel_placed_buys("trading_paused")
+
             new_state = "PASS" if gate_state.within_limit else "FAIL"
             if self._round.gate_last_state != new_state:
                 self._round.gate_last_state = new_state
@@ -1449,7 +1481,7 @@ class StrategyEngine:
 
         # Operator pause (e.g. while the backtest collects data): block new
         # entries and averaging, but leave TP / stop-loss untouched.
-        if self._cfg_bool("PAUSE_NEW_ENTRIES", False):
+        if self._trading_paused():
             self._log_entries_paused()
             return
 
@@ -1661,7 +1693,7 @@ class StrategyEngine:
             return
 
         # Same operator pause as _check_t1_entry: no new averaging tiers.
-        if self._cfg_bool("PAUSE_NEW_ENTRIES", False):
+        if self._trading_paused():
             self._log_entries_paused()
             return
 

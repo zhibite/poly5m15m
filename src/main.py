@@ -62,6 +62,7 @@ from src.strategy.engine import (
 )
 from src.strategy.killswitch import KillSwitch
 from src.strategy.loop import DecisionLoop
+from src.strategy.trading_pause import TradingPause
 
 log = get_logger(__name__)
 
@@ -226,6 +227,9 @@ class AppState:
         # Emergency stop. Loaded from disk so a restart/redeploy does not
         # silently resume trading after the operator pressed stop.
         self.killswitch = KillSwitch.load()
+        # Live-trading start latch (2026-11-02): every process starts
+        # paused. Only the dashboard can release it, for this process only.
+        self.trading_pause = TradingPause.load()
         self.binance_cache = BinanceCache()
         self.price_cache = PriceCache()
         self.ring = RingBuffer(retention_s=binance().BUFFER_RETENTION_S)
@@ -2570,8 +2574,15 @@ async def _status_loop() -> None:
 
         ks = getattr(s, "killswitch", None)
         stop_str = " [STOPPED]" if (ks is not None and ks.active) else ""
+        # Surface the new-entry pause latch (default ON at every start).
+        paused = bool(
+            s.engine is not None
+            and hasattr(s.engine, "_trading_paused")
+            and s.engine._trading_paused()
+        )
+        pause_str = " [PAUSED]" if (paused and not stop_str) else ""
         log.info(
-            f"STATUS{stop_str}  binance={bc:,.1f}  {gate_str}"
+            f"STATUS{stop_str}{pause_str}  binance={bc:,.1f}  {gate_str}"
             f"  {window_str}  "
             f"UP={up_last:.4f}  DOWN={down_last:.4f}{pos_str}"
         )
@@ -2718,6 +2729,13 @@ async def main() -> None:
         s.price_cache,
         router,
         killswitch=s.killswitch,
+        trading_pause=s.trading_pause,
+    )
+    log.warning(
+        "live_trading.starts_paused",
+        note="every process starts paused; click 恢复实盘交易 on the "
+             "dashboard before any new live entry is allowed. TP and "
+             "stop-loss remain active.",
     )
 
     # ── Decision loop — drives StrategyEngine._evaluate() on a fixed tick ──

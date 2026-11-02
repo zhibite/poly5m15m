@@ -34,6 +34,9 @@ Routes:
            GET  /api/control         emergency-stop state (login only)
            POST /api/control/stop    engage stop + cancel open orders (login only)
            POST /api/control/start   release stop (login only)
+           POST /api/control/pause   pause new live entries (login only)
+           POST /api/control/resume  allow new live entries for this process
+                                     (login only; not persisted)
 """
 from __future__ import annotations
 
@@ -465,15 +468,34 @@ class ControlPayload(BaseModel):
     reason: str = "dashboard"
 
 
+def _pause_payload(state: Any) -> dict[str, Any]:
+    from src.config import strategy as _strategy
+
+    pause = getattr(state, "trading_pause", None)
+    snap = (
+        pause.snapshot()
+        if pause is not None and hasattr(pause, "snapshot")
+        else {"paused": True, "since": None, "reason": "not initialised"}
+    )
+    config_pause = bool(getattr(_strategy(), "PAUSE_NEW_ENTRIES", False))
+    return {
+        **snap,
+        "config_pause": config_pause,
+        "effective_paused": bool(snap.get("paused") or config_pause),
+    }
+
+
 @app.get("/api/control")
 async def api_control(
     _: str = Depends(_require_login),
 ) -> dict[str, Any]:
-    ks = getattr(_state(), "killswitch", None)
+    state = _state()
+    ks = getattr(state, "killswitch", None)
     return {
         "killswitch": ks.snapshot() if ks is not None else {
             "active": False, "since": None, "reason": None,
-        }
+        },
+        "trading_pause": _pause_payload(state),
     }
 
 
@@ -511,3 +533,52 @@ async def api_control_start(
         raise HTTPException(status_code=503, detail=str(exc)) from None
     log.warning("web.control.start", actor=actor, **result)
     return {"ok": True, **result}
+
+
+@app.post("/api/control/pause")
+async def api_control_pause(
+    request: Request,
+    payload: ControlPayload | None = None,
+    _: str = Depends(_require_login),
+) -> dict[str, Any]:
+    """Pause new live entries/averaging (TP and stop-loss stay active)."""
+    state = _state()
+    pause = getattr(state, "trading_pause", None)
+    if pause is None:
+        raise HTTPException(status_code=503, detail="trading pause not initialised")
+    actor = auth.current_user(request) or "unknown"
+    reason = ((payload.reason if payload else "") or "dashboard")[:120]
+    pause.engage(reason=f"{reason} ({actor})")
+    log.warning("web.control.pause", actor=actor, reason=reason)
+    return {"ok": True, "trading_pause": _pause_payload(state)}
+
+
+@app.post("/api/control/resume")
+async def api_control_resume(
+    request: Request,
+    _: str = Depends(_require_login),
+) -> dict[str, Any]:
+    """Explicitly allow new live entries for THIS process.
+
+    Also clears the legacy PAUSE_NEW_ENTRIES config flag in memory, so an
+    operator's explicit resume is not silently overridden by .env. The
+    start latch itself is never persisted: the next process starts
+    paused again.
+    """
+    from src.config import strategy as _strategy
+
+    state = _state()
+    pause = getattr(state, "trading_pause", None)
+    if pause is None:
+        raise HTTPException(status_code=503, detail="trading pause not initialised")
+    actor = auth.current_user(request) or "unknown"
+    pause.release(reason=f"dashboard ({actor})")
+    cfg = _strategy()
+    cfg.PAUSE_NEW_ENTRIES = False
+    log.warning(
+        "web.control.resume",
+        actor=actor,
+        note="live entries enabled for this process only; a restart or "
+             "redeploy pauses again",
+    )
+    return {"ok": True, "trading_pause": _pause_payload(state)}
