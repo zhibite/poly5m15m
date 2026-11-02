@@ -236,8 +236,6 @@ class AppState:
         self.event_calendar = None
         self.macro_signals: MacroSignals | None = None
         self.signal_5m: Signal5mFeed | None = None
-        self.signal_5m_ws: MarketWS | None = None
-        self.signal_5m_cache: PriceCache | None = None
         self.signals: SignalEngine | None = None
         self.binance_cache = BinanceCache()
         self.price_cache = PriceCache()
@@ -2834,19 +2832,12 @@ async def main() -> None:
         on_connect=None,
         on_disconnect=None,
     )
-    # Read-only BTC 5m feed used only by the 15m signal gates. It gets its
-    # own WS + cache so its token subscriptions can be pruned without
-    # touching the trading channel's active 15m tokens.
-    s.signal_5m_cache = PriceCache()
-    s.signal_5m_ws = MarketWS(
-        cache=s.signal_5m_cache,
-        on_connect=None,
-        on_disconnect=None,
-    )
+    # Read-only BTC 5m feed used only by the 15m signal gates. It samples
+    # REST midpoints (every ~2s) and does not need a second market WS.
     s.signal_5m = Signal5mFeed(
         pm=s.pm_client,
-        market_ws=s.signal_5m_ws,
-        price_cache=s.signal_5m_cache,
+        price_cache=s.price_cache,
+        market_ws=None,
         asset="BTC",
         window_sec=300,
         window_s=float(cfg_strategy.SIGNAL_5M_WINDOW_S or 300.0),
@@ -2885,8 +2876,6 @@ async def main() -> None:
     try:
         if s.macro_signals is not None:
             await s.macro_signals.start()
-        if s.signal_5m_ws is not None:
-            await s.signal_5m_ws.start()
         if s.signal_5m is not None:
             await s.signal_5m.start()
     except Exception as exc:  # noqa: BLE001
@@ -2998,8 +2987,6 @@ async def main() -> None:
         await s.decision_loop.stop()
     if s.signal_5m:
         await s.signal_5m.stop()
-    if s.signal_5m_ws:
-        await s.signal_5m_ws.stop()
     if s.macro_signals:
         await s.macro_signals.stop()
     if s.wm:

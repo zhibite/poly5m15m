@@ -1355,6 +1355,10 @@ class StrategyEngine:
             # ── Not yet entered → check T1 entry ────────────────────────────
             if pos.entry_token is None:
                 await self._check_t1_entry(bc_now, snap)
+                # Keep the dashboard signal panel live while flat (no
+                # action is emitted; this is read-only monitoring).
+                if pos.entry_token is None:
+                    self._monitor_signal()
 
             # ── In position → check averaging-down and take-profit ───────────
             if pos.entry_token is not None:

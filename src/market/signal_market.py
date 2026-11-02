@@ -28,8 +28,8 @@ class Signal5mFeed:
         self,
         *,
         pm: PolymarketClient,
-        market_ws: MarketWS,
         price_cache: PriceCache,
+        market_ws: MarketWS | None = None,
         asset: str = "BTC",
         window_sec: int = 300,
         window_s: float = 300.0,
@@ -111,21 +111,28 @@ class Signal5mFeed:
         down = str(tokens[1].get("token_id") or "")
         if not up or not down:
             return
+        changed = (
+            round_ts != self._round_ts
+            or up != self._up_token
+            or down != self._down_token
+        )
         if round_ts != self._round_ts:
+            # Drop the previous 5m tokens from the shared price cache so it
+            # does not accumulate one pair per 5-minute window forever.
+            for old in (self._up_token, self._down_token):
+                if old:
+                    self._pc.clear_token(old)
             self._round_ts = round_ts
             self._samples.clear()
         self._up_token = up
         self._down_token = down
-        try:
-            self._market_ws.set_active_tokens({up, down})
-        except Exception as exc:  # noqa: BLE001
-            log.debug("signal_5m.subscribe_failed", error=str(exc))
-        log.info(
-            "signal_5m.market",
-            round_start_ts=round_ts,
-            up_token=up[:16],
-            down_token=down[:16],
-        )
+        if changed:
+            log.info(
+                "signal_5m.market",
+                round_start_ts=round_ts,
+                up_token=up[:16],
+                down_token=down[:16],
+            )
 
     async def _sample(self, now: float) -> None:
         if not self._up_token or not self._down_token:
