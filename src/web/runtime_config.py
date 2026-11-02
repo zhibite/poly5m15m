@@ -216,6 +216,8 @@ PARAMS: tuple[Param, ...] = (
           0.0, 1.0, 0.05,
           help="60 秒主动卖流占比超过该值则不补仓"),
     Param("SIGNAL_5M_GATE_ENABLED", "启用 5m 周期确认", "信号", "bool"),
+    Param("SIGNAL_5M_T1_ENABLED", "T1 也使用 5m 确认", "信号", "bool",
+          help="默认关闭：T1 不受 5m 周期确认约束；T2–T4 补仓仍按 5m 门执行"),
     Param("SIGNAL_5M_MIN_CONFIRM", "5m 最小确认分", "信号", "float",
           -1.0, 1.0, 0.05,
           help="-1..1；低于该值视为 5m 周期与持仓相反"),

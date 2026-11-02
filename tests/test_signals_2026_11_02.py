@@ -170,6 +170,45 @@ def test_5m_macro_and_event_vetoes(monkeypatch) -> None:
     assert decision.allowed is False
 
 
+def test_5m_gate_can_be_disabled_for_t1_only(monkeypatch) -> None:
+    class _Bearish5m:
+        def snapshot(self, side):  # noqa: ARG002
+            return {"available": True, "confirm": -0.90}
+
+    engine = SignalEngine(
+        ring=RingBuffer(retention_s=1200),
+        price_cache=PriceCache(),
+        tf5m=_Bearish5m(),
+    )
+    _flat_regime(engine)
+    cfg = _strategy()
+    monkeypatch.setattr(cfg, "SIGNAL_GATES_LOG_ONLY", False)
+    monkeypatch.setattr(cfg, "SIGNAL_5M_GATE_ENABLED", True)
+    monkeypatch.setattr(cfg, "SIGNAL_5M_T1_ENABLED", False)
+
+    t1 = engine.evaluate(
+        kind="T1", side="UP", token="UP", mid=0.35,
+        spot=100.0, strike=100.0, remaining_s=600.0, sigma_1m=0.001,
+    )
+    assert "5m_against" not in t1.reasons
+    assert t1.allowed is True
+
+    t2 = engine.evaluate(
+        kind="T2", side="UP", token="UP", mid=0.35,
+        spot=100.0, strike=100.0, remaining_s=600.0, sigma_1m=0.001,
+    )
+    assert "5m_against" in t2.reasons
+    assert t2.allowed is False
+
+    monkeypatch.setattr(cfg, "SIGNAL_5M_T1_ENABLED", True)
+    t1_on = engine.evaluate(
+        kind="T1", side="UP", token="UP", mid=0.35,
+        spot=100.0, strike=100.0, remaining_s=600.0, sigma_1m=0.001,
+    )
+    assert "5m_against" in t1_on.reasons
+    assert t1_on.allowed is False
+
+
 def test_event_calendar_loads_and_matches(tmp_path) -> None:
     path = tmp_path / "events.json"
     now = time.time()

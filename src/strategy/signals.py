@@ -335,7 +335,9 @@ class SignalEngine:
             if cvd_ratio is not None and cvd_ratio < -max_sell:
                 reasons.append("sell_flow")
 
-        if self._cfg_bool("SIGNAL_5M_GATE_ENABLED", True):
+        if self._cfg_bool("SIGNAL_5M_GATE_ENABLED", True) and (
+            not is_t1 or self._cfg_bool("SIGNAL_5M_T1_ENABLED", False)
+        ):
             confirm = tf.get("confirm")
             min_confirm = self._cfg_float("SIGNAL_5M_MIN_CONFIRM", -0.50)
             if (

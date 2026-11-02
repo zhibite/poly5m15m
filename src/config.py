@@ -226,6 +226,11 @@ class StrategySettings(BaseSettings):
     # 5m timeframe confirmation. The bot still trades only BTC 15m; the 5m
     # market is a read-only signal. Missing 5m data fails open.
     SIGNAL_5M_GATE_ENABLED: bool = True
+    # T1 also applies the 5m veto. Off by operator decision (2026-11-02):
+    # the 300 s T1 entry window is aligned with the 5m market window, so by
+    # the time the 15m side is cheap enough to enter, the 5m confirm is
+    # usually saturated near -1. T2-T4 keep the 5m confirmation.
+    SIGNAL_5M_T1_ENABLED: bool = False
     SIGNAL_5M_MIN_CONFIRM: float = -0.50
     SIGNAL_5M_WINDOW_S: float = 300.0
 
