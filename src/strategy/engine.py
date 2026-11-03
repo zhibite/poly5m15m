@@ -1801,7 +1801,11 @@ class StrategyEngine:
                 mid=mid_price,
                 trigger_line=trigger_line,
                 strategy_price=strategy_price,
-                drift=self._gate.state(bc_now).drift,
+                drift=(
+                    self._gate.state(bc_now).drift
+                    if self._gate is not None and bc_now > 0
+                    else None
+                ),
             )
 
             # H-1 v2 fix: claim the entry slot BEFORE awaiting the handler.
