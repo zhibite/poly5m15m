@@ -24,8 +24,10 @@ Strategy modelled (current production defaults):
 
 The model is deliberately mid-based: there is no order-book depth in the
 history, so maker fills are assumed to happen whenever the price touches
-the limit.  Taker exits are assumed at the observed mid (paper broker),
-not at the live FAK limit minus slippage.
+the limit.  BUY/SELL limit prices are floored to the exchange tick
+(0.01) like the live CLOB client; T1's entry cap and every tier order
+are sized from the accepted limit.  Taker exits are assumed at the
+observed mid (paper broker), not at the live FAK limit minus slippage.
 """
 from __future__ import annotations
 
@@ -53,6 +55,7 @@ ASSETS = ("BTC", "ETH", "BNB", "XRP", "SOL", "DOGE", "HYPE")
 @dataclass(frozen=True)
 class Params:
     entry_price_cap: float = 0.40
+    tick_size: float = 0.01
     price_pre_margin: float = 0.10
 
     t1_notional: float = 2.0
@@ -108,6 +111,14 @@ def taker_fee(shares: float, price: float, rate: float) -> float:
         return 0.0
     p = min(max(float(price), 0.0), 1.0)
     return max(0.0, shares) * rate * p * (1.0 - p)
+
+
+def _floor_tick(price: float, tick: float) -> float:
+    """Floor a price to the exchange tick (BUY and SELL both floor)."""
+    if tick <= 0:
+        return float(price)
+    steps = math.floor((float(price) + 1e-12) / tick)
+    return round(max(tick, steps * tick), 10)
 
 
 # ---------------------------------------------------------------------------
@@ -213,20 +224,24 @@ def replay(
     side = ""
     t1_price = 0.0
 
+    # T1 is posted at ENTRY_PRICE_CAP; the CLOB floors the price to the
+    # tick and sizes the order from that accepted limit.
+    t1_order_price = _floor_tick(p.entry_price_cap, p.tick_size)
+
     # ── T1: first side at/below the price cap in the entry window ──────
     for i, (t, up, down) in enumerate(points):
         if t - ws > p.t1_entry_window_s:
             break
-        if up <= p.entry_price_cap:
+        if up <= t1_order_price:
             entry_idx, side, t1_price = i, "UP", up
             break
-        if down <= p.entry_price_cap:
+        if down <= t1_order_price:
             entry_idx, side, t1_price = i, "DOWN", down
             break
     if entry_idx is None:
         return result
 
-    t1_shares = p.t1_notional / p.entry_price_cap
+    t1_shares = p.t1_notional / t1_order_price
     if t1_shares < p.min_shares - 1e-9:
         return result
 
@@ -337,45 +352,52 @@ def replay(
             drop = p.drop(next_tier)
             if drop is None:
                 break
-            trigger = t1_price * (1.0 - drop)
-            fire = trigger * (1.0 + p.price_pre_margin)
-            if trigger <= 0 or price > fire:
+            trigger_raw = t1_price * (1.0 - drop)
+            # The CLOB floors the posted BUY price to the tick; the engine's
+            # fire line still uses the unrounded strategy price.
+            order_price = _floor_tick(trigger_raw, p.tick_size)
+            fire = trigger_raw * (1.0 + p.price_pre_margin)
+            if order_price <= 0 or price > fire:
                 break
-            if price <= trigger:
-                # Marketable at arm time: size on the trigger (the GTD
+            if price <= order_price:
+                # Marketable at arm time: size on the order price (the GTD
                 # limit), fill at the observed mid (price improvement).
-                buy_more(next_tier, trigger, price, "TAKER")
+                buy_more(next_tier, order_price, price, "TAKER")
             else:
                 resting = {
                     "tier": next_tier,
-                    "trigger": trigger,
+                    "trigger": order_price,
                     "armed_at": t,
                 }
                 break
 
         # 3) Take-profit GTD/order.
-        target = tp_target()
-        fire = target * (1.0 - p.price_pre_margin)
+        target_raw = tp_target()
+        # The CLOB floors the SELL limit to the tick (fill priority).
+        target = _floor_tick(target_raw, p.tick_size)
+        fire = target_raw * (1.0 - p.price_pre_margin)
         cancel = fire * (1.0 - p.cancel_hysteresis_pct)
         if tp_armed and price < cancel:
             tp_armed = False
         if qty > 1e-12:
-            if not tp_armed:
+            if qty < p.min_shares:
+                # A compact residual cannot use a GTD; the engine exits with
+                # a FAK taker as soon as mid reaches the pre-arm line.
+                if price >= fire:
+                    sell(qty, price, "TAKER")
+                    result.exit = "TP"
+                    break
+            elif not tp_armed:
                 if price >= fire:
                     tp_armed = True
                     if price >= target:
-                        if qty < p.min_shares:
-                            sell(qty, price, "TAKER")
-                        else:
-                            sell(qty, target, "TAKER")
+                        # Marketable at post time: taker at the limit.
+                        sell(qty, target, "TAKER")
                         result.exit = "TP"
                         break
             else:
                 if price >= target:
-                    if qty < p.min_shares:
-                        sell(qty, price, "TAKER")
-                    else:
-                        sell(qty, target, "MAKER")
+                    sell(qty, target, "MAKER")
                     result.exit = "TP"
                     break
 
@@ -731,6 +753,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     ap.add_argument("--progress", type=int, default=0, help="progress every N rounds")
     ap.add_argument("--entry-price-cap", type=float, default=Params.entry_price_cap)
+    ap.add_argument("--tick-size", type=float, default=Params.tick_size)
     ap.add_argument("--price-pre-margin", type=float, default=Params.price_pre_margin)
     ap.add_argument("--t1-notional", type=float, default=Params.t1_notional)
     ap.add_argument("--t2-notional", type=float, default=Params.t2_notional)
@@ -760,6 +783,7 @@ def main(argv: list[str] | None = None) -> int:
     params = dataclasses.replace(
         Params(),
         entry_price_cap=args.entry_price_cap,
+        tick_size=args.tick_size,
         price_pre_margin=args.price_pre_margin,
         t1_notional=args.t1_notional,
         t2_notional=args.t2_notional,
