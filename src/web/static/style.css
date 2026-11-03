@@ -275,3 +275,10 @@ dialog.modal[open] { animation: modal-in .18s ease-out; }
   padding: 0;
 }
 .asset-link:hover { text-decoration: underline; }
+
+.overview-meta {
+  font-size: 12px;
+  color: #6b7280;
+  margin: -4px 0 12px;
+  line-height: 1.6;
+}

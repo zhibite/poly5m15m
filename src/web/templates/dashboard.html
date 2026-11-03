@@ -63,53 +63,15 @@
   <!-- Asset tabs + cross-asset overview -->
   <div class="section">
     <h2>币种概览 <span class="pill" id="asset-count">0</span></h2>
+    <div class="overview-meta" id="overview-meta">--</div>
     <div class="asset-tabs" id="asset-tabs"></div>
     <div class="table-wrap">
       <table>
         <thead>
-          <tr><th>币种</th><th>方向</th><th>数量</th><th>均价</th><th>中价</th><th>浮动盈亏</th><th>止盈目标</th><th>分层</th><th>挂单</th><th>状态</th></tr>
+          <tr><th>币种</th><th>UP / DOWN</th><th>方向</th><th>数量</th><th>均价</th><th>中价</th><th>浮动盈亏</th><th>止盈目标</th><th>分层</th><th>挂单</th><th>状态</th></tr>
         </thead>
-        <tbody id="overview-tbody"><tr><td colspan="10" class="no-data">等待行情...</td></tr></tbody>
+        <tbody id="overview-tbody"><tr><td colspan="11" class="no-data">等待行情...</td></tr></tbody>
       </table>
-    </div>
-  </div>
-
-  <!-- Selected asset price card -->
-  <div class="price-card">
-    <div class="price-head">
-      <a class="price-title disabled" id="market-link" target="_blank"
-         rel="noopener noreferrer" title="市场加载中"><span id="market-title">BTC / USDT · 1h Up/Down</span><span class="ext">↗</span></a>
-      <div>
-        <span class="badge pending" id="phase-badge">--</span>
-        <span class="badge pending" id="market-badge">--</span>
-      </div>
-    </div>
-    <div class="price-bar-wrap">
-      <div class="price-bar-label">
-        <span>UP <b id="up-price">--</b></span>
-        <span>DOWN <b id="down-price">--</b></span>
-      </div>
-      <div class="price-bar">
-        <div class="bar-up" id="bar-up" style="width:50%"></div>
-        <div class="bar-down" id="bar-down" style="width:50%"></div>
-      </div>
-    </div>
-    <div class="tokens">
-      <div class="token-item up">
-        <div class="token-label">UP 概率</div>
-        <div class="token-price green" id="up-pct">--</div>
-      </div>
-      <div class="token-item down">
-        <div class="token-label">DOWN 概率</div>
-        <div class="token-price red" id="down-pct">--</div>
-      </div>
-    </div>
-    <div class="gate-row">
-      <span>币种 <b id="detail-asset">--</b></span>
-      <span>轮次 <b id="round-ts">--</b></span>
-      <span>模式 <b id="trading-mode">--</b></span>
-      <span>市场 <b id="market-state">--</b></span>
-      <span>跳过原因 <b id="skip-reason">无</b></span>
     </div>
   </div>
 
@@ -215,20 +177,6 @@ const dur = (s) => {
 function setLive(ok) {
   $('live-dot').className = 'live-dot' + (ok ? '' : ' offline');
   $('live-label').textContent = ok ? '在线' : '离线';
-}
-
-// 卡片标题指向当前轮次对应的 Polymarket 实时市场页。
-function renderMarketLink(slug) {
-  const el = $('market-link');
-  if (slug) {
-    el.href = 'https://polymarket.com/event/' + encodeURIComponent(slug);
-    el.classList.remove('disabled');
-    el.title = '在 Polymarket 查看实时市场';
-  } else {
-    el.removeAttribute('href');
-    el.classList.add('disabled');
-    el.title = '市场加载中';
-  }
 }
 
 async function getJSON(path) {
@@ -394,11 +342,19 @@ function selectAsset(asset) {
 function renderOverview(assets) {
   const body = $('overview-tbody');
   if (!assets.length) {
-    body.innerHTML = '<tr><td colspan="10" class="no-data">等待行情...</td></tr>';
+    body.innerHTML = '<tr><td colspan="11" class="no-data">等待行情...</td></tr>';
     return;
   }
   body.innerHTML = assets.map((a) => {
     const p = a.position || {};
+    const prices = a.prices || {};
+    const upMid = Number(prices.up_mid || 0);
+    const downMid = Number(prices.down_mid || 0);
+    const priceCell = (upMid > 0 || downMid > 0)
+      ? `<span class="mono green">${fmt(upMid, 4)}</span>` +
+        `<span class="muted"> / </span>` +
+        `<span class="mono red">${fmt(downMid, 4)}</span>`
+      : '--';
     const qty = Number(p.qty || 0);
     const tiers = (p.tiers || []).map((t) =>
       `T${t.tier}${t.status === 'filled' ? '✓' : t.status === 'watching' ? '⏳' : t.status === 'placed' ? '◐' : '○'}`
@@ -415,6 +371,7 @@ function renderOverview(assets) {
     const pnlCls = cls(p.upnl_usd || 0);
     return `<tr>
       <td><button class="asset-link" onclick="selectAsset('${a.asset}')">${a.asset}</button></td>
+      <td>${priceCell}</td>
       <td>${side}</td>
       <td class="mono">${qty > 0 ? fmt(qty, 2) : '--'}</td>
       <td class="mono">${qty > 0 ? fmt(p.avg_cost, 4) : '--'}</td>
@@ -444,9 +401,6 @@ function renderStatus(s) {
 
   const a = assets.find((x) => x.asset === SELECTED) || assets[0];
   SELECTED = a.asset;
-  renderMarketLink(a.slug);
-  $('market-title').textContent = `${a.asset} / USDT · 1h Up/Down`;
-  $('detail-asset').textContent = a.asset;
   $('position-asset').textContent = a.asset;
   $('tiers-asset').textContent = a.asset;
   $('orders-asset').textContent = a.asset;
@@ -457,33 +411,19 @@ function renderStatus(s) {
   const phaseMap = { IN_T1: 'T1 可入场', PAST_T1: '已过 T1', END: '即将结算' };
   $('window-phase').textContent = (phaseMap[w.phase] || '--') + ' · ' +
     Math.round((w.period_s || 0) / 60) + ' 分钟窗口';
-  $('phase-badge').textContent = phaseMap[w.phase] || '--';
-  $('phase-badge').className = 'badge ' + ((w.phase || '').toLowerCase());
 
-  // market / mode / round / skip
-  $('market-badge').textContent = a.market_ok ? '市场就绪' : '无市场';
-  $('market-badge').className = 'badge ' + (a.market_ok ? 'in_t1' : 'pending');
-  $('market-state').textContent = a.market_ok ? '就绪' : '缺失';
-  $('market-state').className = a.market_ok ? 'green' : 'orange';
-  $('round-ts').textContent = a.round_start_ts ? utc(a.round_start_ts) : '--';
+  // Round / mode / market / skip for the selected asset. The price card was
+  // removed; these details now live in one compact line above the overview.
   const tm = a.trading_mode || s.trading_mode || {};
   const modeTxt = tm.effective === 'paper' ? '纸盘' : (tm.effective === 'live' ? '实盘' : '--');
-  $('trading-mode').textContent = modeTxt + (tm.locked ? '（本轮已锁定）' : '');
-  $('trading-mode').className = tm.effective === 'paper' ? 'green' : 'orange';
-  $('skip-reason').textContent = a.skip_reason || '无';
-  $('skip-reason').className = a.skip_reason ? 'orange' : 'muted';
-
-  // prices
-  const p = a.prices || {};
-  $('up-price').textContent = fmt(p.up_mid, 4);
-  $('down-price').textContent = fmt(p.down_mid, 4);
-  const upPct = (p.up_mid || 0) * 100, downPct = (p.down_mid || 0) * 100;
-  $('up-pct').textContent = fmt(upPct, 1) + '%';
-  $('down-pct').textContent = fmt(downPct, 1) + '%';
-  const total = (p.up_mid || 0) + (p.down_mid || 0);
-  const upShare = total > 0 ? (p.up_mid / total) * 100 : 50;
-  $('bar-up').style.width = upShare.toFixed(1) + '%';
-  $('bar-down').style.width = (100 - upShare).toFixed(1) + '%';
+  const meta = [
+    `轮次 ${a.round_start_ts ? utc(a.round_start_ts) : '--'} UTC`,
+    modeTxt + (tm.locked ? '（锁定）' : ''),
+    phaseMap[w.phase] || '--',
+    a.market_ok ? '市场就绪' : '无市场',
+  ];
+  if (a.skip_reason) meta.push(`跳过: ${a.skip_reason}`);
+  $('overview-meta').textContent = meta.join(' · ');
 
   // position
   const pos = a.position;
