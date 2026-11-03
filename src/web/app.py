@@ -283,17 +283,40 @@ async def api_status(_: None = Depends(_require_auth)) -> dict[str, Any]:
     return status_mod.build_status(_state())
 
 
+# The dashboard history pages are paginated, but the summary stats should
+# still cover every matching round. One query returns all rows and the page
+# is sliced from it, so the stats and the page are always consistent.
+_ALL_ROUNDS_LIMIT = 1_000_000
+
+
+def _rounds_page(conn: Any, limit: int, offset: int, mode: str | None,
+                 asset: str | None) -> tuple[list[dict], dict, int]:
+    all_rounds = status_mod.rounds_with_pnl(
+        conn, limit=_ALL_ROUNDS_LIMIT, mode=mode, asset=asset
+    )
+    total = len(all_rounds)
+    page = all_rounds[offset:offset + limit]
+    return page, status_mod.compute_stats(all_rounds), total
+
+
 @app.get("/api/rounds")
 async def api_rounds(
     limit: int = Query(50, ge=1, le=500),
+    offset: int = Query(0, ge=0),
     mode: str | None = Query(None),
     asset: str | None = Query(None),
     _: None = Depends(_require_auth),
 ) -> dict[str, Any]:
-    rounds = status_mod.rounds_with_pnl(
-        _conn(), limit, mode=mode, asset=asset
+    page, stats, total = _rounds_page(
+        _conn(), limit, offset, mode, asset
     )
-    return {"rounds": rounds, "stats": status_mod.compute_stats(rounds)}
+    return {
+        "rounds": page,
+        "stats": stats,
+        "total": total,
+        "limit": int(limit),
+        "offset": int(offset),
+    }
 
 
 @app.get("/api/fills")
@@ -318,20 +341,24 @@ async def api_fills(
 @app.get("/api/trades")
 async def api_trades(
     limit: int = Query(100, ge=1, le=500),
+    offset: int = Query(0, ge=0),
     mode: str | None = Query(None),
     asset: str | None = Query(None),
     _: None = Depends(_require_auth),
 ) -> dict[str, Any]:
     conn = _conn()
-    rounds = status_mod.rounds_with_pnl(
-        conn, limit, mode=mode, asset=asset
+    rounds, stats, rounds_total = _rounds_page(
+        conn, limit, offset, mode, asset
     )
     return {
         "rounds": rounds,
+        "rounds_total": rounds_total,
+        "rounds_limit": int(limit),
+        "rounds_offset": int(offset),
         "fills": status_mod.recent_fills(
             conn, limit * 2, mode=mode, asset=asset
         ),
-        "stats": status_mod.compute_stats(rounds),
+        "stats": stats,
         "quality": status_mod.execution_quality(conn),
         "assets": list(getattr(_state(), "assets", []) or []),
     }

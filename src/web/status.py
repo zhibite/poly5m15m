@@ -333,7 +333,7 @@ WHERE (EXISTS (SELECT 1 FROM orders o2
   AND (? IS NULL OR COALESCE(r.asset, 'BTC') = ?)
 GROUP BY r.round_start_ts, r.asset, r.mode
 ORDER BY r.round_start_ts DESC, r.asset ASC
-LIMIT ?
+LIMIT ? OFFSET ?
 """
 
 
@@ -448,6 +448,7 @@ def rounds_with_pnl(
     limit: int = 100,
     mode: str | None = None,
     asset: str | None = None,
+    offset: int = 0,
 ) -> list[dict[str, Any]]:
     """Rounds with realised PnL derived from fills.
 
@@ -468,7 +469,11 @@ def rounds_with_pnl(
     """
     wanted_asset = str(asset).upper() if asset else None
     rows = conn.execute(
-        _ROUNDS_SQL, (mode, mode, wanted_asset, wanted_asset, int(limit))
+        _ROUNDS_SQL,
+        (
+            mode, mode, wanted_asset, wanted_asset,
+            int(limit), max(0, int(offset)),
+        ),
     ).fetchall()
     wanted = {
         (int(row[0]), str(row[1] or "BTC").upper()) for row in rows

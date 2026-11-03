@@ -163,6 +163,11 @@
         <tbody id="fills-tbody"><tr><td colspan="8" class="no-data">暂无成交</td></tr></tbody>
       </table>
     </div>
+    <div class="pager" id="dash-fills-pager" hidden>
+      <button class="btn btn-ghost btn-sm" id="dash-fill-prev" type="button">上一页</button>
+      <span class="pager-info" id="dash-fill-page-info">--</span>
+      <button class="btn btn-ghost btn-sm" id="dash-fill-next" type="button">下一页</button>
+    </div>
   </div>
 </div>
 
@@ -531,13 +536,43 @@ function renderStatus(s) {
   }
 }
 
+const DASH_FILL_PAGE_SIZE = 15;
+let dashFillOffset = 0;
+let dashFillTotal = 0;
+
+function renderDashFillPager() {
+  const pages = Math.max(1, Math.ceil(dashFillTotal / DASH_FILL_PAGE_SIZE));
+  const page = Math.floor(dashFillOffset / DASH_FILL_PAGE_SIZE) + 1;
+  $('dash-fill-page-info').textContent =
+    `第 ${page} / ${pages} 页 · 共 ${dashFillTotal} 笔`;
+  $('dash-fill-prev').disabled = dashFillOffset <= 0;
+  $('dash-fill-next').disabled =
+    dashFillOffset + DASH_FILL_PAGE_SIZE >= dashFillTotal;
+  $('dash-fills-pager').hidden = dashFillTotal <= DASH_FILL_PAGE_SIZE;
+}
+
+async function refreshDashFills() {
+  const d = await getJSON(
+    `/api/fills?limit=${DASH_FILL_PAGE_SIZE}&offset=${dashFillOffset}`
+  );
+  dashFillTotal = Number(d.total || 0);
+  const pages = Math.max(1, Math.ceil(dashFillTotal / DASH_FILL_PAGE_SIZE));
+  const maxOffset = (pages - 1) * DASH_FILL_PAGE_SIZE;
+  if (dashFillOffset > maxOffset) {
+    dashFillOffset = maxOffset;
+    return refreshDashFills();
+  }
+  renderFills(d.fills || []);
+  renderDashFillPager();
+}
+
 function renderFills(fills) {
   const body = $('fills-tbody');
   if (!fills || !fills.length) {
     body.innerHTML = '<tr><td colspan="8" class="no-data">暂无成交</td></tr>';
     return;
   }
-  body.innerHTML = fills.slice(0, 15).map(f => `<tr>
+  body.innerHTML = fills.map(f => `<tr>
     <td class="mono">${f.ts_ms ? new Date(f.ts_ms).toISOString().slice(11, 19) : '--'}</td>
     <td><span class="pill watching">${f.asset || 'BTC'}</span></td>
     <td class="mono">${utc(f.round_start_ts)}${outcomePill(f.outcome)}</td>
@@ -577,11 +612,23 @@ async function refreshStatus() {
 
 async function refreshTrades() {
   try {
-    const d = await getJSON('/api/trades?limit=300');
+    // Stats cover all matching rounds; the fills table has its own pager.
+    const d = await getJSON('/api/trades?limit=1');
     renderStats(d.stats);
-    renderFills(d.fills);
+    await refreshDashFills();
   } catch (e) { /* status poll handles the indicator */ }
 }
+
+$('dash-fill-prev').addEventListener('click', () => {
+  if (dashFillOffset < DASH_FILL_PAGE_SIZE) return;
+  dashFillOffset -= DASH_FILL_PAGE_SIZE;
+  refreshDashFills().catch(() => setLive(false));
+});
+$('dash-fill-next').addEventListener('click', () => {
+  if (dashFillOffset + DASH_FILL_PAGE_SIZE >= dashFillTotal) return;
+  dashFillOffset += DASH_FILL_PAGE_SIZE;
+  refreshDashFills().catch(() => setLive(false));
+});
 
 $('clock').textContent = new Date().toISOString().slice(11, 19) + ' UTC';
 setInterval(() => { $('clock').textContent = new Date().toISOString().slice(11, 19) + ' UTC'; }, 1000);

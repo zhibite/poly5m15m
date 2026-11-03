@@ -96,6 +96,11 @@
         <tbody id="rounds-tbody"><tr><td colspan="13" class="no-data">加载中...</td></tr></tbody>
       </table>
     </div>
+    <div class="pager" id="rounds-pager" hidden>
+      <button class="btn btn-ghost btn-sm" id="rounds-prev" type="button">上一页</button>
+      <span class="pager-info" id="rounds-page-info">--</span>
+      <button class="btn btn-ghost btn-sm" id="rounds-next" type="button">下一页</button>
+    </div>
   </div>
 
   <div class="section">
@@ -141,8 +146,11 @@ const modeParam = () => (MODE ? '&mode=' + encodeURIComponent(MODE) : '') +
   (ASSET ? '&asset=' + encodeURIComponent(ASSET) : '');
 const assetPill = (a) => a ? `<span class="pill watching">${a}</span>` : '--';
 
-// 成交明细分页：每页 20 条，服务端按 (ts_ms, fill_id) 倒序切片。
+// 轮次记录 / 成交明细分页：每页 20 条，服务端按时间倒序切片。
+const ROUND_PAGE_SIZE = 20;
 const FILL_PAGE_SIZE = 20;
+let roundOffset = 0;
+let roundTotal = 0;
 let fillOffset = 0;
 let fillTotal = 0;
 
@@ -198,7 +206,7 @@ function renderQuality(q) {
 }
 
 function renderRounds(rounds) {
-  $('round-count').textContent = rounds.length;
+  $('round-count').textContent = roundTotal || rounds.length;
   const body = $('rounds-tbody');
   if (!rounds.length) {
     body.innerHTML = '<tr><td colspan="13" class="no-data">暂无记录（下单成交后会出现在这里）</td></tr>';
@@ -267,6 +275,35 @@ function renderFills(fills) {
   }).join('');
 }
 
+function renderRoundPager() {
+  const pages = Math.max(1, Math.ceil(roundTotal / ROUND_PAGE_SIZE));
+  const page = Math.floor(roundOffset / ROUND_PAGE_SIZE) + 1;
+  $('rounds-page-info').textContent =
+    `第 ${page} / ${pages} 页 · 共 ${roundTotal} 轮`;
+  $('rounds-prev').disabled = roundOffset <= 0;
+  $('rounds-next').disabled =
+    roundOffset + ROUND_PAGE_SIZE >= roundTotal;
+  $('rounds-pager').hidden = roundTotal <= ROUND_PAGE_SIZE;
+}
+
+async function refreshRounds() {
+  const d = await getJSON(
+    `/api/trades?limit=${ROUND_PAGE_SIZE}&offset=${roundOffset}${modeParam()}`
+  );
+  roundTotal = Number(d.rounds_total || 0);
+  const pages = Math.max(1, Math.ceil(roundTotal / ROUND_PAGE_SIZE));
+  const maxOffset = (pages - 1) * ROUND_PAGE_SIZE;
+  if (roundOffset > maxOffset) {
+    roundOffset = maxOffset;
+    return refreshRounds();
+  }
+  renderStats(d.stats);
+  renderQuality(d.quality);
+  renderAssetOptions(d.assets || []);
+  renderRounds(d.rounds || []);
+  renderRoundPager();
+}
+
 function renderFillPager() {
   const pages = Math.max(1, Math.ceil(fillTotal / FILL_PAGE_SIZE));
   const page = Math.floor(fillOffset / FILL_PAGE_SIZE) + 1;
@@ -307,18 +344,23 @@ function renderAssetOptions(assets) {
 
 async function refresh() {
   try {
-    const d = await getJSON(`/api/trades?limit=300${modeParam()}`);
-    renderStats(d.stats);
-    renderQuality(d.quality);
-    renderAssetOptions(d.assets || []);
-    renderRounds(d.rounds || []);
-    await refreshFills();
+    await Promise.all([refreshRounds(), refreshFills()]);
     setLive(true);
   } catch (e) {
     setLive(false);
   }
 }
 
+$('rounds-prev').addEventListener('click', () => {
+  if (roundOffset < ROUND_PAGE_SIZE) return;
+  roundOffset -= ROUND_PAGE_SIZE;
+  refreshRounds().catch(() => setLive(false));
+});
+$('rounds-next').addEventListener('click', () => {
+  if (roundOffset + ROUND_PAGE_SIZE >= roundTotal) return;
+  roundOffset += ROUND_PAGE_SIZE;
+  refreshRounds().catch(() => setLive(false));
+});
 $('fill-prev').addEventListener('click', () => {
   if (fillOffset < FILL_PAGE_SIZE) return;
   fillOffset -= FILL_PAGE_SIZE;
@@ -336,6 +378,7 @@ $('mode-filter').value = MODE;
 $('asset-filter').value = ASSET;
 $('mode-filter').addEventListener('change', () => {
   MODE = $('mode-filter').value;
+  roundOffset = 0;
   fillOffset = 0;
   const url = new URL(location.href);
   if (MODE) url.searchParams.set('mode', MODE);
@@ -345,6 +388,7 @@ $('mode-filter').addEventListener('change', () => {
 });
 $('asset-filter').addEventListener('change', () => {
   ASSET = $('asset-filter').value;
+  roundOffset = 0;
   fillOffset = 0;
   const url = new URL(location.href);
   if (ASSET) url.searchParams.set('asset', ASSET);
