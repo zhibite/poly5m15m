@@ -33,8 +33,10 @@ def _toml_section(key: str) -> dict:
 
 
 class GeneralConfig(BaseSettings):
-    ROUND_PERIOD_S: int = 900
-    WINDOW_PRE_OPEN_S: int = 300
+    # 1-hour Up/Down markets. All seven assets share the same hourly window
+    # boundary, so a single WindowManager drives every asset's round.
+    ROUND_PERIOD_S: int = 3600
+    WINDOW_PRE_OPEN_S: int = 600
 
     def __init__(self, **kwargs):
         super().__init__(**{**_toml_section("GENERAL"), **kwargs})
@@ -120,6 +122,15 @@ class StrategySettings(BaseSettings):
     POLYMARKET_HOST: str = "https://clob.polymarket.com"
     POLYGON_RPC_URL: str = "https://polygon-bor.publicnode.com"
 
+    # ── Market universe (2026-11-03) ─────────────────────────────────────
+    # One process trades every asset independently: each gets its own
+    # StrategyEngine / Position / 2-4-8-16 ladder, while the CLOB client,
+    # OrderManager, UserWS and dashboard are shared.
+    TRADE_ASSETS: str = "BTC,ETH,BNB,XRP,SOL,DOGE,HYPE"
+    # Gamma slug shape: {asset.lower()}-updown-{interval}-{unix_slot}.
+    MARKET_SLUG_INTERVAL: str = "1h"
+    MARKET_WINDOW_SEC: int = 3600
+
     # ── Trading mode (2026-11-02) ────────────────────────────────────────
     # True  = paper mode: local GTD fill simulation, no real CLOB orders.
     # False = live mode: real CLOB orders.
@@ -178,8 +189,8 @@ class StrategySettings(BaseSettings):
     STOP_LOSS_RETRY_S: float = 3.0
 
     # T1 entry time gate: T1 must enter within this many seconds of window open.
-    # Prevents chasing at the very end of the 15-min window.
-    T1_ENTRY_WINDOW_S: float = 300.0    # 5 minutes
+    # For the 1-hour series the operator chose a 10-minute entry window.
+    T1_ENTRY_WINDOW_S: float = 600.0    # 10 minutes
 
     # ── External signal gates (2026-11-02) ────────────────────────────────
     # The martingale used to average down on a fixed price drop alone. The
@@ -193,6 +204,10 @@ class StrategySettings(BaseSettings):
     # few days after deploying a new threshold). Set enabled=False to turn
     # the whole layer off. Missing data always fails OPEN: a signal outage
     # must never wedge the ladder.
+    # 2026-11-03 operator decision: the 1h multi-asset bot is a pure price
+    # martingale. `main` no longer instantiates SignalEngine, so these
+    # settings are inert in production; they remain for the research
+    # modules and their tests.
     SIGNAL_GATES_ENABLED: bool = True
     SIGNAL_GATES_LOG_ONLY: bool = False
 
@@ -222,13 +237,11 @@ class StrategySettings(BaseSettings):
     SIGNAL_MAX_SELL_FLOW: float = 0.60        # |CVD|/volume against a BUY
     SIGNAL_FLOW_WINDOW_S: float = 60.0
 
-    # 5m timeframe confirmation. The bot still trades only BTC 15m; the 5m
-    # market is a read-only signal. Missing 5m data fails open.
+    # 5m timeframe confirmation (legacy research layer; not wired in the
+    # 2026-11-03 1h multi-asset production bot). Missing 5m data fails open.
     SIGNAL_5M_GATE_ENABLED: bool = True
-    # T1 also applies the 5m veto. Off by operator decision (2026-11-02):
-    # the 300 s T1 entry window is aligned with the 5m market window, so by
-    # the time the 15m side is cheap enough to enter, the 5m confirm is
-    # usually saturated near -1. T2-T4 keep the 5m confirmation.
+    # T1 also applies the 5m veto. Off by operator decision (2026-11-02).
+    # T2-T4 keep the 5m confirmation when the signal layer is enabled.
     SIGNAL_5M_T1_ENABLED: bool = False
     SIGNAL_5M_MIN_CONFIRM: float = -0.50
     SIGNAL_5M_WINDOW_S: float = 300.0
@@ -270,7 +283,9 @@ class StrategySettings(BaseSettings):
     # Boot-time window-age guard: if the process starts more than
     # ENTRY_OPEN_OFFSET_GRACE_SEC into a window, skip that window entirely.
     SKIP_IF_LATE_WINDOW_AT_BOOT: bool = True
-    ENTRY_OPEN_OFFSET_GRACE_SEC: float = 180.0
+    # Aligned with T1_ENTRY_WINDOW_S: a restart inside the first 10 minutes
+    # of an hourly window may still trade; later than that, skip the hour.
+    ENTRY_OPEN_OFFSET_GRACE_SEC: float = 600.0
 
     # Skip a new window when BTC spot jumped more than this percent between
     # the previous window's recorded price and the new window's open.
@@ -296,7 +311,7 @@ class StrategySettings(BaseSettings):
     # seconds left, allow T4 at its normal 60%-drop trigger even if the BTC
     # drift gate fails — there is still time for the position to recover.
     # 0 disables (T4 always requires drift within limit).
-    T4_DRIFT_BYPASS_MIN_REMAINING_S: float = 540.0
+    T4_DRIFT_BYPASS_MIN_REMAINING_S: float = 0.0
 
     # ── T4 entry gates (operator decision 2026-10-31) ─────────────────────
     # T4 adds 16 of the 30 USD planned exposure at a price 60% below T1.
@@ -310,14 +325,12 @@ class StrategySettings(BaseSettings):
     # Skip T4 when fewer than this many seconds remain in the window:
     # the 300 s GTD and the recovery to TP cannot play out, and round-end
     # cancels the order anyway. 0 disables.
-    T4_MIN_REMAINING_S: float = 240.0
-    # Distance-to-strike gate. The 15-minute token is a probability that
-    # BTC closes on one side of the window-open price. z = adverse-side
-    # distance / (sigma_1m * sqrt(remaining_minutes)); "adverse" flips
-    # sign by position side. Add only while the adverse z is at most this.
-    # Higher = more permissive; 0 = only add when BTC is on the winning
-    # side of the strike. 0 does not disable (see the ENABLED flag).
-    T4_STRIKE_GATE_ENABLED: bool = True
+    # 2026-11-03: the pure martingale keeps only the 20/40/60% price
+    # triggers. The T4 time / strike-distance / gap gates are disabled.
+    T4_MIN_REMAINING_S: float = 0.0
+    # Distance-to-strike gate. Retained for the research/backtest modules;
+    # production wiring leaves it off.
+    T4_STRIKE_GATE_ENABLED: bool = False
     T4_MAX_STRIKE_Z: float = 2.0
     # Fallback 1-minute BTC sigma (percent) when the 60 s range sample is
     # too thin. The live estimate is range/2, so a fast spike (possible
@@ -327,7 +340,7 @@ class StrategySettings(BaseSettings):
     # fraction below the T4 trigger: wait for the price to come back into
     # the pre-arm zone instead of catching a falling knife.
     # 0 = arm at any mid at/below the fire line (old behaviour).
-    T4_MAX_GAP_BELOW_TRIGGER_PCT: float = 0.05
+    T4_MAX_GAP_BELOW_TRIGGER_PCT: float = 0.0
 
     # ── T4 decision journal (2026-10-31) ─────────────────────────────────
     # Append-only JSONL of T4 entry/exit events (decisions with z/time/
@@ -411,12 +424,12 @@ class StrategySettings(BaseSettings):
     TIER_WATCHER_POLL_S: float = 1.5
 
     # ── Web dashboard ─────────────────────────────────────────────────────
-    # FastAPI app served in-process on WEB_PORT (default 8010). Set
+    # FastAPI app served in-process on WEB_PORT (default 8025). Set
     # WEB_PASSWORD (secret — Coolify panel / process env) to require HTTP
     # Basic auth; leaving it empty exposes the dashboard publicly.
     WEB_ENABLED: bool = True
     WEB_HOST: str = "0.0.0.0"
-    WEB_PORT: int = 8010
+    WEB_PORT: int = 8025
     WEB_LOG_LEVEL: str = "warning"
     WEB_USERNAME: str = "admin"
     WEB_PASSWORD: str = ""
@@ -425,6 +438,16 @@ class StrategySettings(BaseSettings):
     WEB_SESSION_TTL_S: int = 7 * 24 * 3600
 
     # ── Derived helpers ───────────────────────────────────────────────────
+
+    @property
+    def trade_assets(self) -> list[str]:
+        """Normalised asset list (deduplicated, upper-case)."""
+        seen: list[str] = []
+        for raw in str(self.TRADE_ASSETS or "").split(","):
+            asset = raw.strip().upper()
+            if asset and asset not in seen:
+                seen.append(asset)
+        return seen
 
     @property
     def max_tier(self) -> int:

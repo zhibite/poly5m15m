@@ -682,7 +682,7 @@ async def _run_reconcile(eng: Any) -> list[ActionCancelTier]:
 
 
 @pytest.mark.asyncio
-async def test_t1_window_closed_cancels_the_gtd() -> None:
+async def test_t1_window_closed_cancels_the_gtd(monkeypatch) -> None:
     """An unfilled T1 GTD must be pulled once T1_ENTRY_WINDOW_S closes."""
     pos = _FakePos(
         tiers=_t1_gtd_tiers(),
@@ -691,6 +691,9 @@ async def test_t1_window_closed_cancels_the_gtd() -> None:
         tp_target=None,
     )
     eng = _make_engine(pos, mid=0.39)
+    # Pin the legacy 300 s window for this regression test; production now
+    # uses 600 s for the 1-hour markets.
+    monkeypatch.setattr(eng._s, "T1_ENTRY_WINDOW_S", 300.0)
     eng._round.round_start_ts = int(time.time()) - 310  # past the 300 s window
 
     emitted = await _run_reconcile(eng)

@@ -48,20 +48,25 @@ Polymarket CLOB 使用 pUSD（不是原生 USDC）作为抵押品：
 
 1. 将 USDC 充值到 Polymarket 获取 pUSD
 2. 或通过 Collateral Onramp 直接桥接
-3. 建议余额：至少 $50（覆盖最多 4 层马丁 $16 + 手续费缓冲）
+3. 建议余额：按每币 2+4+8+16 = 30 USD 计算；7 个币同时满仓需要约 $210 + 手续费缓冲。若资金不足，可先只配置部分 `TRADE_ASSETS`
 
 ---
 
 ## 三、配置参数
 
 ```bash
-# 马丁格尔仓位（美元名义）— 四层，总最大暴露 2+3+5+6 = 16 USD
-TIER1_NOTIONAL=2.0   # 首单
-TIER2_NOTIONAL=3.0   # 补仓1（下跌 20%）
-TIER3_NOTIONAL=5.0   # 补仓2（下跌 40%）
-TIER4_NOTIONAL=6.0   # 补仓3（下跌 60%）
+# 多币种 1 小时市场（单进程，每币独立阶梯）
+TRADE_ASSETS=BTC,ETH,BNB,XRP,SOL,DOGE,HYPE
+MARKET_SLUG_INTERVAL=1h
+MARKET_WINDOW_SEC=3600
 
-# 策略阈值
+# 马丁格尔仓位（美元名义）— 每币四层，总最大暴露 2+4+8+16 = 30 USD/币
+TIER1_NOTIONAL=2.0   # 首单
+TIER2_NOTIONAL=4.0   # 补仓1（下跌 20%）
+TIER3_NOTIONAL=8.0   # 补仓2（下跌 40%）
+TIER4_NOTIONAL=16.0  # 补仓3（下跌 60%）
+
+# 策略阈值（纯价格马丁，无信号判断）
 ENTRY_PRICE_CAP=0.40     # T1 入场价格上限
 TIER2_DROP_PCT=0.20      # T2 触发：T1 成交均价 × (1-20%)
 TIER3_DROP_PCT=0.40      # T3 触发：T1 成交均价 × (1-40%)
@@ -69,19 +74,16 @@ TIER4_DROP_PCT=0.60      # T4 触发：T1 成交均价 × (1-60%)
 TP_PROFIT_PCT=0.20       # 止盈目标：成本 + 20%
 TP_DECREMENT_PCT=0.03    # 每补一档 -3% (N=1→17%, N=2→14%, N=3→11%)
 TP_MIN_PCT=0.05          # 止盈下限 5%
-BASELINE_DRIFT_LIMIT=0.0015  # BTC 现货偏移上限 0.15%
 
-# T4 入场闸门（T4 是最大的一层，避免在趋势中越补越深）
-T4_MIN_REMAINING_S=240   # 剩余 <240s 不补 T4；0=关闭
-T4_STRIKE_GATE_ENABLED=true  # 只允许 BTC 仍接近开盘价时补 T4
-T4_MAX_STRIKE_Z=2.0      # 不利方向 z 分数上限；越小越保守
-T4_STRIKE_SIGMA_PCT_PER_MIN=0.05  # 60s 样本不足时的 1 分钟波动率下限
-T4_MAX_GAP_BELOW_TRIGGER_PCT=0.05  # mid 已跌破触发价 >5% 时不挂单；0=关闭
+# T4 额外闸门（2026-11-03 起关闭，保持纯马丁）
+T4_MIN_REMAINING_S=0
+T4_STRIKE_GATE_ENABLED=false
+T4_MAX_GAP_BELOW_TRIGGER_PCT=0
 
 # 订单参数
 GTD_LIFETIME_S=300       # GTD 有效期（CLOB 硬下限 180，客户端会钳制到 >=181）
 SELL_SLIPPAGE_PCT=0.02   # FAK 卖出滑点 2%
-T1_ENTRY_WINDOW_S=300    # T1 入场时间窗口（窗口开启后 5 分钟内）
+T1_ENTRY_WINDOW_S=600    # T1 入场时间窗口（窗口开启后 10 分钟内）
 STARTUP_RECONCILE_CANCEL_ALL=true  # 启动时取消账户全部挂单；共享钱包请设为 false
 ```
 
@@ -170,12 +172,12 @@ volumes:
 
 ### 4. 运行检查
 
-- 内置 Web 看板（FastAPI），监听容器端口 **8010**
+- 内置 Web 看板（FastAPI），监听容器端口 **8025**
 - 健康检查端点：`GET /api/health`（无需鉴权，可用于 Coolify HTTP 探针）
 - 看板页面：`/`（控制台）、`/trades`（交易记录）、`/config`（策略配置）
 - 启动命令：`python -m src.main`
 - 日志存活判断：`docker logs` 中每 5 秒输出一行 `STATUS ...`
-- 启动日志应出现 `web.started port=8010 auth=True/False`
+- 启动日志应出现 `web.started port=8025 auth=True/False`
 
 ### 5. Web 看板配置
 
@@ -183,7 +185,7 @@ volumes:
 |------|------|------|
 | `WEB_ENABLED` | `true` | 设为 `false` 关闭 HTTP 服务 |
 | `WEB_HOST` | `0.0.0.0` | 监听地址 |
-| `WEB_PORT` | `8010` | 监听端口（需与 Coolify 域名映射的端口一致） |
+| `WEB_PORT` | `8025` | 监听端口（需与 Coolify 域名映射的端口一致） |
 | `WEB_USERNAME` | `admin` | 登录用户名 |
 | `WEB_PASSWORD` | 空 | 登录密码；设置后看板所有页面/API 都需要登录 |
 | `WEB_SESSION_TTL_S` | `604800` | 登录会话有效期（秒），默认 7 天 |
@@ -201,11 +203,11 @@ volumes:
 `WEB_PASSWORD` 属于密钥，请放在 Coolify 面板的环境变量里，不要写进
 `.env.docker`。看板数据来源：
 
-- `/api/status`：进程内存中的实时状态（当前轮次、BTC 基准/漂移、持仓、分层、挂单）
+- `/api/status`：进程内存中的实时状态（7 个币各自的当前轮次、持仓、分层、挂单；`assets[]`）
 - `/api/trades`、`/api/rounds`、`/api/fills`：`/app/data/polymarket.db` 中的
   `rounds` / `orders` / `fills` 表（由 `OrderManager` 实时写入）
 
-Coolify 中将 `polygtd.bquant.com` 指向本服务的 **8010** 端口即可；
+Coolify 中将 `polygtd.bquant.com` 指向本服务的 **8025** 端口即可；
 若仍出现 502，请检查 `docker logs` 是否有 `web.started`。
 
 ### 6. 策略配置页
@@ -222,8 +224,8 @@ Coolify 中将 `polygtd.bquant.com` 指向本服务的 **8010** 端口即可；
 
 | 标记 | 生效时机 |
 |------|----------|
-| 立即生效 | 下一次决策 tick 读取（入场价、预挂幅度、漂移上限、T1 时间窗、止盈参数、GTD 有效期等） |
-| 下一轮生效 | 下个 15 分钟窗口开始时读取（分层金额、跨窗跳空阈值、晚启动宽限期） |
+| 立即生效 | 下一次决策 tick 读取（入场价、预挂幅度、T1 时间窗、止盈/止损参数、GTD 有效期等） |
+| 下一轮生效 | 下个 1 小时窗口开始时读取（分层金额、晚启动宽限期） |
 | 重启后生效 | 只在进程启动后的第一个窗口判定（晚启动跳过开关） |
 
 - 「恢复默认」删除覆盖文件，回到 `.env` / `.env.docker` / 代码默认值
@@ -382,10 +384,11 @@ fatal: could not read Username for 'https://github.com'
 - EOA 模式：检查钱包私钥正确
 - Safe 模式：确认多签已执行 pUSD 授权交易
 
-### 3. BTC 偏移超限导致 Gatekeeper 失效
+### 3. 某个币没有行情 / 不交易
 
-- 检查 `BASELINE_DRIFT_LIMIT` 设置（当前 0.15%）
-- 如果 BTC 波动剧烈，考虑放宽阈值
+- 1h 市场 slug 形如 `{asset}-updown-1h-{ts}`（如 `eth-updown-1h-...`）
+- 若 Gamma 尚未上架该窗口，WindowManager 会每 5 秒重试；日志见 `round.market_not_found`
+- 若某个币在 Polymarket 没有 1h Up/Down 市场，该币会一直显示“无市场”，不影响其他币
 
 ### 4. 重复下单同一层
 
@@ -418,7 +421,7 @@ curl -X GET "https://clob.polymarket.com/balance" \
   -H "Poly-Signature: $SIGNATURE"
 
 # 2. 检查 Polymarket 市场
-curl "https://gamma-api.polymarket.com/events?slug=btc-updown-15m-$(date +%s -d '15 min' | xargs -I{} echo {})"
+curl "https://gamma-api.polymarket.com/events?slug=btc-updown-1h-$(date -u +%s | awk '{print int($1/3600)*3600}')"
 
 # 3. 启动 bot 观察日志
 python -m src.main
@@ -433,7 +436,7 @@ python -m src.main
 - [ ] 环境变量已填入 API Key
 - [ ] `GAMMA_API`、`POLYMARKET_HOST`、`POLYGON_RPC_URL` 已配置
 - [ ] 马丁格尔参数已调优
-- [ ] 端口 8010 已暴露，`/api/health` 返回 200，看板 `/` 可访问
+- [ ] 端口 8025 已暴露，`/api/health` 返回 200，看板 `/` 可访问
 - [ ] 已设置 `WEB_PASSWORD`（公网域名必做）
 - [ ] 数据目录 `/app/data` 已持久化（数据库路径 `/app/data/polymarket.db`）
 - [ ] 日志正常输出（无 ERROR）

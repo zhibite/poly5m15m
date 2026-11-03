@@ -45,6 +45,7 @@ def _engine(*, btc_price: float = 100_000.0, baseline: float = 100_000.0):
         TP_DECREMENT_PCT=0.03,
         TP_MIN_PCT=0.05,
         T4_MIN_REMAINING_S=240.0,
+        T4_DRIFT_BYPASS_MIN_REMAINING_S=540.0,
         T4_STRIKE_GATE_ENABLED=True,
         T4_MAX_STRIKE_Z=2.0,
         T4_STRIKE_SIGMA_PCT_PER_MIN=0.05,

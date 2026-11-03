@@ -28,9 +28,9 @@ from src.config import strategy as _strategy
 # otherwise a fully-exited round keeps showing 未平仓 forever.
 _DUST_QTY = 1e-2
 
-# Window length assumed when attributing a settlement that carries no
-# `resolved_at` (legacy rows). The bot only trades the 15-minute BTC series.
-_ROUND_PERIOD_S = 900
+# Window length assumed when attributing a settlement to a UTC day.
+# The bot now trades the 1-hour series for every asset.
+_ROUND_PERIOD_S = 3600
 
 
 # ---------------------------------------------------------------------------
@@ -72,59 +72,37 @@ def _tier_payload(t: Any) -> dict[str, Any]:
 # Live status
 # ---------------------------------------------------------------------------
 
-def build_status(state: Any) -> dict[str, Any]:
-    """Snapshot of the running bot, safe to serialise to JSON."""
+def _asset_status(
+    state: Any,
+    asset: str,
+    *,
+    period_s: int,
+    remain_s: float,
+    elapsed_s: float,
+    phase: str,
+) -> dict[str, Any]:
+    """Per-asset live snapshot (position, tiers, orders, prices)."""
     s = _strategy()
-    wm = getattr(state, "wm", None)
-    ctx = wm.get("BTC") if wm else None
-    mkt = getattr(ctx, "market", None) if ctx else None
-    eng = getattr(state, "engine", None)
+    engines = getattr(state, "engines", None) or {}
+    eng = engines.get(asset) or getattr(state, "engine", None)
     rs = getattr(eng, "_round", None) if eng else None
-    pos = getattr(rs, "position", None) if rs else None
+    wm = getattr(state, "wm", None)
+    ctx = wm.get(asset) if wm else None
+    mkt = (getattr(state, "markets", None) or {}).get(asset) or (
+        getattr(ctx, "market", None) if ctx else None
+    )
     pc = state.price_cache
-    bc = float(getattr(state.binance_cache, "last_price", 0.0) or 0.0)
 
-    up_token = (mkt.up_token if mkt else "") or ""
-    down_token = (mkt.down_token if mkt else "") or ""
+    up_token = (getattr(mkt, "up_token", "") if mkt else "") or ""
+    down_token = (getattr(mkt, "down_token", "") if mkt else "") or ""
     up_mid = float(pc.get_midpoint(up_token)) if up_token else 0.0
     down_mid = float(pc.get_midpoint(down_token)) if down_token else 0.0
 
-    # ── Window / phase ──────────────────────────────────────────────────
-    period_s = int(wm.window_period_s()) if wm else int(s.T1_ENTRY_WINDOW_S)
-    try:
-        remain_s = max(0.0, min(float(period_s), float(wm.seconds_until_next())))
-    except Exception:
-        remain_s = 0.0
-    elapsed_s = max(0.0, period_s - remain_s)
-    if remain_s < 1.0:
-        phase = "END"
-    elif elapsed_s <= s.T1_ENTRY_WINDOW_S:
-        phase = "IN_T1"
-    else:
-        phase = "PAST_T1"
-
-    # ── Gate ────────────────────────────────────────────────────────────
-    gate: dict[str, Any] = {
-        "state": "pending",
-        "baseline": None,
-        "drift": None,
-        "limit": float(s.BASELINE_DRIFT_LIMIT),
-        "binance": bc,
-    }
-    if eng and getattr(eng, "_gate", None) and bc > 0:
-        gs = eng._gate.state(bc)
-        gate.update(
-            state="PASS" if gs.within_limit else "FAIL",
-            baseline=float(gs.binance_baseline),
-            drift=float(gs.drift),
-        )
-
-    # ── Position ────────────────────────────────────────────────────────
+    pos = getattr(rs, "position", None) if rs else None
     position = None
     if pos is not None:
         qty = float(pos.total_qty)
         if qty < _DUST_QTY:
-            # Rounding dust only — the engine treats this as flat too.
             qty = 0.0
         cost = float(pos.total_cost) if qty > 0 else 0.0
         avg = float(pos.avg_cost) if qty > 0 else 0.0
@@ -136,11 +114,6 @@ def build_status(state: Any) -> dict[str, Any]:
         upnl = (held_mid - avg) * qty if qty > 0 and held_mid > 0 else 0.0
         tiers = [_tier_payload(t) for t in getattr(pos, "tiers", [])]
         if qty <= 0:
-            # Flat position: never show leftover filled/placed tier rows.
-            # The engine clears them on its next tick, but the dashboard may
-            # poll inside that window — and this also covers legacy state
-            # (production 2026-10-31 09:02: T1 displayed filled 5/5 after a
-            # TP had closed the whole position).
             for payload in tiers:
                 payload.update(
                     status="idle",
@@ -165,12 +138,13 @@ def build_status(state: Any) -> dict[str, Any]:
             "tiers": tiers,
         }
 
-    # ── Open orders (live GTDs this round) ──────────────────────────────
     orders: list[dict[str, Any]] = []
     om = getattr(state, "order_manager", None)
     if om is not None and rs is not None:
         try:
-            for o in om.open_orders_for_round(rs.round_start_ts):
+            for o in om.open_orders_for_round(
+                rs.round_start_ts, asset=asset
+            ):
                 orders.append({
                     "client_order_id": o.client_order_id,
                     "server_order_id": o.server_order_id,
@@ -186,45 +160,37 @@ def build_status(state: Any) -> dict[str, Any]:
         except Exception:
             orders = []
 
-    signals: dict[str, Any] = {}
-    if eng is not None and hasattr(eng, "signal_snapshot"):
-        try:
-            signals = eng.signal_snapshot()
-        except Exception:  # noqa: BLE001
-            signals = {}
-
-    ks = getattr(state, "killswitch", None)
-    configured_mode = "paper" if bool(getattr(s, "PAPER_TRADING", True)) else "live"
+    configured_mode = (
+        "paper" if bool(getattr(s, "PAPER_TRADING", True)) else "live"
+    )
     round_mode = str(getattr(rs, "mode", "") or "") if rs else ""
-    now_ts = int(time.time())
     return {
-        "server_time": now_ts,
-        "asset": "BTC",
+        "asset": asset,
+        "round_start_ts": getattr(rs, "round_start_ts", None),
+        "slug": getattr(rs, "slug", None) or getattr(mkt, "slug", None),
+        "condition_id": getattr(mkt, "condition_id", None),
+        "skip_reason": getattr(rs, "skip_reason", None),
+        "market_ok": mkt is not None,
         "trading_mode": {
             "configured": configured_mode,
             "round": round_mode or None,
             "effective": round_mode or configured_mode,
             "locked": bool(round_mode),
         },
-        "killswitch": {
-            "active": bool(getattr(ks, "active", False)),
-            "since": getattr(ks, "since", 0.0) or None,
-            "reason": getattr(ks, "reason", "") or None,
-        },
-        "signals": signals,
-        "round_start_ts": getattr(rs, "round_start_ts", None),
-        "slug": getattr(rs, "slug", None) or getattr(mkt, "slug", None),
-        "condition_id": getattr(mkt, "condition_id", None),
-        "skip_reason": getattr(rs, "skip_reason", None),
         "window": {
             "period_s": period_s,
             "remain_s": remain_s,
             "elapsed_s": elapsed_s,
             "phase": phase,
-            "start": _iso(getattr(mkt, "window_start", None) and mkt.window_start.timestamp()),
-            "end": _iso(getattr(mkt, "window_end", None) and mkt.window_end.timestamp()),
+            "start": _iso(
+                getattr(mkt, "window_start", None)
+                and mkt.window_start.timestamp()
+            ),
+            "end": _iso(
+                getattr(mkt, "window_end", None)
+                and mkt.window_end.timestamp()
+            ),
         },
-        "gate": gate,
         "prices": {
             "up_token": up_token,
             "down_token": down_token,
@@ -236,9 +202,96 @@ def build_status(state: Any) -> dict[str, Any]:
         "orders": orders,
         "config": {
             "t1_entry_window_s": float(s.T1_ENTRY_WINDOW_S),
-            "drift_limit": float(s.BASELINE_DRIFT_LIMIT),
+            "tier_notionals": list(cfg_tier_notionals()),
+            "tier_drop_pcts": [
+                None,
+                float(s.TIER2_DROP_PCT),
+                float(s.TIER3_DROP_PCT),
+                float(s.TIER4_DROP_PCT),
+            ],
         },
     }
+
+
+def cfg_tier_notionals() -> tuple[float, float, float, float]:
+    s = _strategy()
+    return (
+        float(s.TIER1_NOTIONAL),
+        float(s.TIER2_NOTIONAL),
+        float(s.TIER3_NOTIONAL),
+        float(s.TIER4_NOTIONAL),
+    )
+
+
+def build_status(state: Any) -> dict[str, Any]:
+    """Snapshot of every asset, plus primary-asset aliases for old clients."""
+    s = _strategy()
+    wm = getattr(state, "wm", None)
+    period_s = int(wm.window_period_s()) if wm else int(
+        getattr(s, "MARKET_WINDOW_SEC", 3600) or 3600
+    )
+    try:
+        remain_s = max(
+            0.0, min(float(period_s), float(wm.seconds_until_next()))
+        )
+    except Exception:
+        remain_s = 0.0
+    elapsed_s = max(0.0, period_s - remain_s)
+    if remain_s < 1.0:
+        phase = "END"
+    elif elapsed_s <= s.T1_ENTRY_WINDOW_S:
+        phase = "IN_T1"
+    else:
+        phase = "PAST_T1"
+
+    assets = list(getattr(state, "assets", []) or ["BTC"])
+    statuses = [
+        _asset_status(
+            state,
+            asset,
+            period_s=period_s,
+            remain_s=remain_s,
+            elapsed_s=elapsed_s,
+            phase=phase,
+        )
+        for asset in assets
+    ]
+    primary = statuses[0] if statuses else {}
+    ks = getattr(state, "killswitch", None)
+
+    out: dict[str, Any] = dict(primary)
+    out.update({
+        "server_time": int(time.time()),
+        "primary": primary.get("asset", "BTC"),
+        "assets": statuses,
+        "killswitch": {
+            "active": bool(getattr(ks, "active", False)),
+            "since": getattr(ks, "since", 0.0) or None,
+            "reason": getattr(ks, "reason", "") or None,
+        },
+        "window": primary.get("window", {
+            "period_s": period_s,
+            "remain_s": remain_s,
+            "elapsed_s": elapsed_s,
+            "phase": phase,
+        }),
+        "trading_mode": primary.get("trading_mode", {
+            "configured": "paper" if bool(getattr(s, "PAPER_TRADING", True)) else "live",
+            "round": None,
+            "effective": "paper" if bool(getattr(s, "PAPER_TRADING", True)) else "live",
+            "locked": False,
+        }),
+    })
+    # Compatibility field for older dashboard clients: the pure-martingale
+    # deployment has no BTC drift gate.
+    out.setdefault("gate", {
+        "state": "pending",
+        "baseline": None,
+        "drift": None,
+        "limit": float(getattr(s, "BASELINE_DRIFT_LIMIT", 0.0)),
+        "binance": 0.0,
+    })
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -247,6 +300,7 @@ def build_status(state: Any) -> dict[str, Any]:
 
 _ROUNDS_SQL = """
 SELECT r.round_start_ts,
+       COALESCE(r.asset, 'BTC') AS asset,
        COALESCE(r.mode, 'live') AS mode,
        r.slug,
        r.started_at,
@@ -260,17 +314,25 @@ SELECT r.round_start_ts,
        COALESCE(SUM(CASE WHEN f.side = 'SELL' THEN f.price * f.size END), 0.0) AS sell_proceeds,
        COUNT(f.fill_id) AS fill_count,
        (SELECT COUNT(*) FROM orders o
-         WHERE o.round_start_ts = r.round_start_ts) AS order_count,
+         WHERE o.round_start_ts = r.round_start_ts
+           AND COALESCE(o.asset, 'BTC') = COALESCE(r.asset, 'BTC')) AS order_count,
        (SELECT COUNT(*) FROM orders o3
          WHERE o3.round_start_ts = r.round_start_ts
+           AND COALESCE(o3.asset, 'BTC') = COALESCE(r.asset, 'BTC')
            AND o3.status = 'cancelled') AS cancel_count
 FROM rounds r
 LEFT JOIN fills f ON f.round_start_ts = r.round_start_ts
-WHERE (EXISTS (SELECT 1 FROM orders o2 WHERE o2.round_start_ts = r.round_start_ts)
-    OR EXISTS (SELECT 1 FROM fills  f2 WHERE f2.round_start_ts = r.round_start_ts))
+                 AND COALESCE(f.asset, 'BTC') = COALESCE(r.asset, 'BTC')
+WHERE (EXISTS (SELECT 1 FROM orders o2
+                WHERE o2.round_start_ts = r.round_start_ts
+                  AND COALESCE(o2.asset, 'BTC') = COALESCE(r.asset, 'BTC'))
+    OR EXISTS (SELECT 1 FROM fills f2
+                WHERE f2.round_start_ts = r.round_start_ts
+                  AND COALESCE(f2.asset, 'BTC') = COALESCE(r.asset, 'BTC')))
   AND (? IS NULL OR COALESCE(r.mode, 'live') = ?)
-GROUP BY r.round_start_ts, r.mode
-ORDER BY r.round_start_ts DESC
+  AND (? IS NULL OR COALESCE(r.asset, 'BTC') = ?)
+GROUP BY r.round_start_ts, r.asset, r.mode
+ORDER BY r.round_start_ts DESC, r.asset ASC
 LIMIT ?
 """
 
@@ -319,12 +381,15 @@ def _round_realized_pnl(
     )
     # round -> token_id -> [qty, cost basis]
     state: dict[int, dict[str, list[float]]] = {}
-    for round_ts, token_id, side, price, size, ts_ms, fee in conn.execute(
-        "SELECT round_start_ts, token_id, side, price, size, ts_ms, "
-        "COALESCE(fee, 0) FROM fills "
+    for (
+        round_ts, asset, token_id, side, price, size, ts_ms, fee
+    ) in conn.execute(
+        "SELECT round_start_ts, COALESCE(asset, 'BTC'), token_id, side, "
+        "price, size, ts_ms, COALESCE(fee, 0) FROM fills "
         "ORDER BY round_start_ts ASC, ts_ms ASC, fill_id ASC"
     ):
-        if round_ts not in wanted:
+        key = (int(round_ts), str(asset or "BTC").upper())
+        if key not in wanted:
             continue
         try:
             px = float(price or 0.0)
@@ -335,13 +400,13 @@ def _round_realized_pnl(
         if px <= 0 or sz <= 0:
             continue
         tok = str(token_id or "")
-        positions = state.setdefault(round_ts, {})
+        positions = state.setdefault(key, {})
         st = positions.setdefault(tok, [0.0, 0.0])
-        fees_total[round_ts] = fees_total.get(round_ts, 0.0) + fee_f
+        fees_total[key] = fees_total.get(key, 0.0) + fee_f
         if str(side or "").upper() == "BUY":
             st[0] += sz
             st[1] += px * sz + fee_f
-            buy_fees[round_ts] = buy_fees.get(round_ts, 0.0) + fee_f
+            buy_fees[key] = buy_fees.get(key, 0.0) + fee_f
             continue
         # SELL: realise only against shares actually held. Older rows can
         # carry a blank token_id on either side; fall back to the sole
@@ -358,15 +423,15 @@ def _round_realized_pnl(
         fee_sold = fee_f * (sold / sz)
         proceeds = px * sold - fee_sold
         pnl = proceeds - avg * sold
-        realized[round_ts] = realized.get(round_ts, 0.0) + pnl
-        cost_sold[round_ts] = cost_sold.get(round_ts, 0.0) + avg * sold
+        realized[key] = realized.get(key, 0.0) + pnl
+        cost_sold[key] = cost_sold.get(key, 0.0) + avg * sold
         try:
             ts_ms_i = int(ts_ms or 0)
         except (TypeError, ValueError):
             ts_ms_i = 0
         if ts_ms_i >= today_start_ms:
-            pnl_today[round_ts] = pnl_today.get(round_ts, 0.0) + pnl
-            sells_today[round_ts] = sells_today.get(round_ts, 0) + 1
+            pnl_today[key] = pnl_today.get(key, 0.0) + pnl
+            sells_today[key] = sells_today.get(key, 0) + 1
         st[0] -= sold
         st[1] -= avg * sold
         if st[0] <= 1e-9:
@@ -379,7 +444,10 @@ def _round_realized_pnl(
 
 
 def rounds_with_pnl(
-    conn: Any, limit: int = 100, mode: str | None = None
+    conn: Any,
+    limit: int = 100,
+    mode: str | None = None,
+    asset: str | None = None,
 ) -> list[dict[str, Any]]:
     """Rounds with realised PnL derived from fills.
 
@@ -398,10 +466,13 @@ def rounds_with_pnl(
     nothing was ever bought (e.g. every BUY rejected for insufficient
     balance) lingered in the history as phantom open positions.
     """
+    wanted_asset = str(asset).upper() if asset else None
     rows = conn.execute(
-        _ROUNDS_SQL, (mode, mode, int(limit))
+        _ROUNDS_SQL, (mode, mode, wanted_asset, wanted_asset, int(limit))
     ).fetchall()
-    wanted = {int(row[0]) for row in rows}
+    wanted = {
+        (int(row[0]), str(row[1] or "BTC").upper()) for row in rows
+    }
     if wanted:
         (realized, cost_sold, open_positions, pnl_today, sells_today,
          fees_total, buy_fees) = _round_realized_pnl(conn, wanted)
@@ -415,9 +486,10 @@ def rounds_with_pnl(
     )
     out: list[dict[str, Any]] = []
     for row in rows:
-        (round_ts, row_mode, slug, started_at, finished_at, resolved,
-         up_won, resolved_at, up_token, down_token, buy_cost,
+        (round_ts, row_asset, row_mode, slug, started_at, finished_at,
+         resolved, up_won, resolved_at, up_token, down_token, buy_cost,
          sell_proceeds, fill_count, order_count, cancel_count) = row
+        key = (int(round_ts), str(row_asset or "BTC").upper())
         resolved = bool(resolved)
         up_won_b = None if up_won is None else bool(up_won)
         buy_cost = float(buy_cost or 0.0)
@@ -428,7 +500,7 @@ def rounds_with_pnl(
         # Remaining inventory, per token. Ignore CLOB size-rounding dust
         # (see `_DUST_QTY`): a round whose residual cannot even be sold is
         # flat.
-        positions = open_positions.get(round_ts, {})
+        positions = open_positions.get(key, {})
         qty_open = sum(
             float(q) for q, _cost in positions.values() if q >= _DUST_QTY
         )
@@ -471,13 +543,13 @@ def rounds_with_pnl(
 
         pnl = None
         if has_sells or settle_pnl is not None:
-            pnl = float(realized.get(round_ts, 0.0)) + (settle_pnl or 0.0)
-        cost_sold_round = float(cost_sold.get(round_ts, 0.0))
+            pnl = float(realized.get(key, 0.0)) + (settle_pnl or 0.0)
+        cost_sold_round = float(cost_sold.get(key, 0.0))
         # A settled round's return is measured against everything it
         # invested (notional + buy-side taker fees); a still-open round
         # keeps the realised-on-sold-shares denominator.
         pnl_denom = (
-            buy_cost + float(buy_fees.get(round_ts, 0.0))
+            buy_cost + float(buy_fees.get(key, 0.0))
             if settle_pnl is not None
             else cost_sold_round
         )
@@ -493,6 +565,7 @@ def rounds_with_pnl(
 
         out.append({
             "round_start_ts": round_ts,
+            "asset": key[1],
             "mode": str(row_mode or "live"),
             "slug": slug,
             "started_at": started_at,
@@ -506,7 +579,7 @@ def rounds_with_pnl(
             "order_count": int(order_count or 0),
             "cancel_count": int(cancel_count or 0),
             # Taker fees recorded on this round's fills (USDC).
-            "fee_total": float(fees_total.get(round_ts, 0.0)),
+            "fee_total": float(fees_total.get(key, 0.0)),
             "status": round_status,
             "closed": round_status == "closed",
             "pnl_usd": pnl,
@@ -523,9 +596,9 @@ def rounds_with_pnl(
             # dashboard reflects a TP immediately, not at the round's end.
             # Settlement PnL is included when the market resolved today.
             "pnl_today_usd": (
-                float(pnl_today.get(round_ts, 0.0)) if has_sells else 0.0
+                float(pnl_today.get(key, 0.0)) if has_sells else 0.0
             ) + (float(settle_pnl) if settled_today else 0.0),
-            "sells_today": int(sells_today.get(round_ts, 0)),
+            "sells_today": int(sells_today.get(key, 0)),
             "settled_today": settled_today,
             "open_qty": 0.0 if settle_pnl is not None else qty_open,
         })
@@ -571,6 +644,7 @@ def compute_stats(rounds: list[dict[str, Any]]) -> dict[str, Any]:
 _FILLS_SQL = """
 SELECT f.fill_id,
        f.round_start_ts,
+       COALESCE(f.asset, 'BTC') AS asset,
        COALESCE(f.mode, 'live') AS mode,
        f.side,
        f.price,
@@ -589,7 +663,9 @@ SELECT f.fill_id,
 FROM fills f
 LEFT JOIN orders o ON o.client_order_id = f.order_id
 LEFT JOIN rounds r ON r.round_start_ts = f.round_start_ts
+                  AND COALESCE(r.asset, 'BTC') = COALESCE(f.asset, 'BTC')
 WHERE (? IS NULL OR COALESCE(f.mode, 'live') = ?)
+  AND (? IS NULL OR COALESCE(f.asset, 'BTC') = ?)
 ORDER BY f.ts_ms DESC, f.fill_id DESC
 LIMIT ? OFFSET ?
 """
@@ -612,18 +688,26 @@ def _improvement_bps(side: str, price: float, limit_price: float) -> float | Non
     return None
 
 
-def count_fills(conn: Any, mode: str | None = None) -> int:
+def count_fills(
+    conn: Any, mode: str | None = None, asset: str | None = None
+) -> int:
     """Total number of fill rows (pagination denominator)."""
+    wanted_asset = str(asset).upper() if asset else None
     row = conn.execute(
         "SELECT COUNT(*) FROM fills "
-        "WHERE (? IS NULL OR COALESCE(mode, 'live') = ?)",
-        (mode, mode),
+        "WHERE (? IS NULL OR COALESCE(mode, 'live') = ?) "
+        "AND (? IS NULL OR COALESCE(asset, 'BTC') = ?)",
+        (mode, mode, wanted_asset, wanted_asset),
     ).fetchone()
     return int(row[0] or 0) if row else 0
 
 
 def recent_fills(
-    conn: Any, limit: int = 200, offset: int = 0, mode: str | None = None
+    conn: Any,
+    limit: int = 200,
+    offset: int = 0,
+    mode: str | None = None,
+    asset: str | None = None,
 ) -> list[dict[str, Any]]:
     """Fill rows, newest first.
 
@@ -631,11 +715,14 @@ def recent_fills(
     ordered by (ts_ms, fill_id) so consecutive pages neither overlap nor
     skip a row when several fills share a millisecond.
     """
+    wanted_asset = str(asset).upper() if asset else None
     rows = conn.execute(
-        _FILLS_SQL, (mode, mode, int(limit), max(0, int(offset)))
+        _FILLS_SQL,
+        (mode, mode, wanted_asset, wanted_asset, int(limit),
+         max(0, int(offset))),
     ).fetchall()
     out = []
-    for (fill_id, round_ts, row_mode, side, price, size, ts_ms,
+    for (fill_id, round_ts, row_asset, row_mode, side, price, size, ts_ms,
          tier_name, slug, limit_price, trader_side, fee, outcome) in rows:
         price = float(price or 0.0)
         size = float(size or 0.0)
@@ -645,6 +732,7 @@ def recent_fills(
         out.append({
             "fill_id": fill_id,
             "round_start_ts": round_ts,
+            "asset": str(row_asset or "BTC").upper(),
             "mode": str(row_mode or "live"),
             "side": side,
             # UP/DOWN token the fill touched; '' for legacy rows whose
@@ -753,22 +841,27 @@ def execution_quality(conn: Any, limit: int = 500) -> dict[str, Any]:
     }
 
 
-def fills_for_round(conn: Any, round_start_ts: int) -> list[dict[str, Any]]:
+def fills_for_round(
+    conn: Any, round_start_ts: int, asset: str | None = None
+) -> list[dict[str, Any]]:
+    wanted_asset = str(asset).upper() if asset else None
     rows = conn.execute(
         """
-        SELECT f.fill_id, f.side, f.price, f.size, f.ts_ms,
-               COALESCE(o.tier_name, '') AS tier_name
+        SELECT f.fill_id, COALESCE(f.asset, 'BTC'), f.side, f.price,
+               f.size, f.ts_ms, COALESCE(o.tier_name, '') AS tier_name
         FROM fills f
         LEFT JOIN orders o ON o.client_order_id = f.order_id
         WHERE f.round_start_ts = ?
+          AND (? IS NULL OR COALESCE(f.asset, 'BTC') = ?)
         ORDER BY f.ts_ms ASC
         """,
-        (int(round_start_ts),),
+        (int(round_start_ts), wanted_asset, wanted_asset),
     ).fetchall()
     return [
         {
-            "fill_id": r[0], "side": r[1], "price": float(r[2] or 0.0),
-            "size": float(r[3] or 0.0), "ts_ms": r[4], "tier": r[5],
+            "fill_id": r[0], "asset": r[1], "side": r[2],
+            "price": float(r[3] or 0.0), "size": float(r[4] or 0.0),
+            "ts_ms": r[5], "tier": r[6],
         }
         for r in rows
     ]

@@ -523,7 +523,9 @@ class WindowManager:
                             prev_close=prev_close,
                             new_open=mkt.btc_spot_at_window_open,
                         )
-                else:
+                elif self._binance_spot is not None:
+                    # Only warn when a spot feed is configured; the 1h
+                    # multi-asset pure-martingale deployment has none.
                     reasons = []
                     if prev_close is None or prev_close <= 0:
                         reasons.append("prev_close unavailable")

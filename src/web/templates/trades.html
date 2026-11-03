@@ -30,6 +30,9 @@
         <option value="live">实盘</option>
         <option value="paper">纸盘</option>
       </select>
+      <select id="asset-filter" class="market-select">
+        <option value="">全部币种</option>
+      </select>
       <span class="control-meta" id="mode-meta"></span>
     </div>
   </div>
@@ -86,11 +89,11 @@
       <table>
         <thead>
           <tr>
-            <th>模式</th><th>开始 (UTC)</th><th>轮次</th><th>买入成本</th><th>卖出收入</th>
+            <th>模式</th><th>币种</th><th>开始 (UTC)</th><th>轮次</th><th>买入成本</th><th>卖出收入</th>
             <th>到期结算</th><th>手续费</th><th>盈亏</th><th>盈亏 %</th><th>成交笔数</th><th>撤单</th><th>状态</th>
           </tr>
         </thead>
-        <tbody id="rounds-tbody"><tr><td colspan="12" class="no-data">加载中...</td></tr></tbody>
+        <tbody id="rounds-tbody"><tr><td colspan="13" class="no-data">加载中...</td></tr></tbody>
       </table>
     </div>
   </div>
@@ -100,9 +103,9 @@
     <div class="table-wrap">
       <table>
         <thead>
-          <tr><th>模式</th><th>时间 (UTC)</th><th>轮次</th><th>层</th><th>方向</th><th>价格</th><th>挂价</th><th>价差</th><th>数量</th><th>金额</th><th>手续费</th><th>方式</th></tr>
+          <tr><th>模式</th><th>币种</th><th>时间 (UTC)</th><th>轮次</th><th>层</th><th>方向</th><th>价格</th><th>挂价</th><th>价差</th><th>数量</th><th>金额</th><th>手续费</th><th>方式</th></tr>
         </thead>
-        <tbody id="fills-tbody"><tr><td colspan="12" class="no-data">加载中...</td></tr></tbody>
+        <tbody id="fills-tbody"><tr><td colspan="13" class="no-data">加载中...</td></tr></tbody>
       </table>
     </div>
     <div class="pager" id="fills-pager" hidden>
@@ -133,7 +136,10 @@ const modePill = (m) => (String(m || '').toLowerCase() === 'paper'
   : '<span class="pill buy">实盘</span>');
 
 let MODE = new URLSearchParams(location.search).get('mode') || '';
-const modeParam = () => MODE ? '&mode=' + encodeURIComponent(MODE) : '';
+let ASSET = new URLSearchParams(location.search).get('asset') || '';
+const modeParam = () => (MODE ? '&mode=' + encodeURIComponent(MODE) : '') +
+  (ASSET ? '&asset=' + encodeURIComponent(ASSET) : '');
+const assetPill = (a) => a ? `<span class="pill watching">${a}</span>` : '--';
 
 // 成交明细分页：每页 20 条，服务端按 (ts_ms, fill_id) 倒序切片。
 const FILL_PAGE_SIZE = 20;
@@ -195,7 +201,7 @@ function renderRounds(rounds) {
   $('round-count').textContent = rounds.length;
   const body = $('rounds-tbody');
   if (!rounds.length) {
-    body.innerHTML = '<tr><td colspan="12" class="no-data">暂无记录（下单成交后会出现在这里）</td></tr>';
+    body.innerHTML = '<tr><td colspan="13" class="no-data">暂无记录（下单成交后会出现在这里）</td></tr>';
     return;
   }
   body.innerHTML = rounds.map(r => {
@@ -213,6 +219,7 @@ function renderRounds(rounds) {
       : '<span class="muted">--</span>';
     return `<tr>
       <td>${modePill(r.mode)}</td>
+      <td>${assetPill(r.asset)}</td>
       <td class="mono">${iso(r.started_at) === '--' ? utc(r.round_start_ts) : iso(r.started_at)}</td>
       <td class="mono muted">${r.slug || r.round_start_ts}</td>
       <td class="mono">$${fmt(r.buy_cost, 2)}</td>
@@ -231,7 +238,7 @@ function renderRounds(rounds) {
 function renderFills(fills) {
   const body = $('fills-tbody');
   if (!fills.length) {
-    body.innerHTML = '<tr><td colspan="12" class="no-data">暂无成交</td></tr>';
+    body.innerHTML = '<tr><td colspan="13" class="no-data">暂无成交</td></tr>';
     return;
   }
   body.innerHTML = fills.map(f => {
@@ -244,6 +251,7 @@ function renderFills(fills) {
     const roleCls = role === 'MAKER' ? 'watching' : role === 'TAKER' ? 'placed' : 'idle';
     return `<tr>
       <td>${modePill(f.mode)}</td>
+      <td>${assetPill(f.asset)}</td>
       <td class="mono">${f.ts_ms ? new Date(f.ts_ms).toISOString().replace('T', ' ').slice(0, 19) : '--'}</td>
       <td class="mono">${utc(f.round_start_ts)}${outcomePill(f.outcome)}</td>
       <td>${f.tier || '--'}</td>
@@ -286,11 +294,23 @@ async function refreshFills() {
   renderFillPager();
 }
 
+function renderAssetOptions(assets) {
+  const sel = $('asset-filter');
+  const opts = '<option value="">全部币种</option>' + (assets || []).map(
+    (a) => `<option value="${a}">${a}</option>`
+  ).join('');
+  if (sel.innerHTML !== opts) {
+    sel.innerHTML = opts;
+    sel.value = ASSET;
+  }
+}
+
 async function refresh() {
   try {
     const d = await getJSON(`/api/trades?limit=300${modeParam()}`);
     renderStats(d.stats);
     renderQuality(d.quality);
+    renderAssetOptions(d.assets || []);
     renderRounds(d.rounds || []);
     await refreshFills();
     setLive(true);
@@ -313,12 +333,22 @@ $('fill-next').addEventListener('click', () => {
 $('clock').textContent = new Date().toISOString().slice(11, 19) + ' UTC';
 setInterval(() => { $('clock').textContent = new Date().toISOString().slice(11, 19) + ' UTC'; }, 1000);
 $('mode-filter').value = MODE;
+$('asset-filter').value = ASSET;
 $('mode-filter').addEventListener('change', () => {
   MODE = $('mode-filter').value;
   fillOffset = 0;
   const url = new URL(location.href);
   if (MODE) url.searchParams.set('mode', MODE);
   else url.searchParams.delete('mode');
+  history.replaceState(null, '', url);
+  refresh();
+});
+$('asset-filter').addEventListener('change', () => {
+  ASSET = $('asset-filter').value;
+  fillOffset = 0;
+  const url = new URL(location.href);
+  if (ASSET) url.searchParams.set('asset', ASSET);
+  else url.searchParams.delete('asset');
   history.replaceState(null, '', url);
   refresh();
 });

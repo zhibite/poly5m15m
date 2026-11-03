@@ -30,13 +30,20 @@ log = get_logger(__name__)
 class ModeRouter:
     """Action handler that fans out to the live or paper executor."""
 
-    def __init__(self, state: Any, live: Any, paper: Any) -> None:
+    def __init__(
+        self, state: Any, live: Any, paper: Any, asset: str = "BTC"
+    ) -> None:
         self._state = state
         self._live = live
         self._paper = paper
+        self.asset = str(asset or "BTC").upper()
         # The live ActionRouter sets state.router to itself in __init__;
         # the killswitch / round cleanup must see this wrapper instead.
-        state.router = self
+        # In the multi-asset bot main installs a RouterGroup after all
+        # per-asset wrappers exist; don't overwrite it.
+        existing = getattr(state, "router", None)
+        if existing is None or not isinstance(existing, RouterGroup):
+            state.router = self
         self.engine = None
 
     @staticmethod
@@ -108,3 +115,36 @@ class ModeRouter:
     @property
     def paper(self) -> Any:
         return self._paper
+
+
+class RouterGroup:
+    """Aggregate facade over every asset's ModeRouter.
+
+    The killswitch and round-rollover paths only need
+    `stop_all_watchers()`, so this tiny wrapper keeps those call sites
+    unchanged while seven independent routers exist.
+    """
+
+    def __init__(self, routers: dict[str, ModeRouter]) -> None:
+        self._routers = routers
+
+    async def stop_all_watchers(self) -> None:
+        for router in list(self._routers.values()):
+            try:
+                await router.stop_all_watchers()
+            except Exception as exc:  # noqa: BLE001
+                log.warning(
+                    "router.group_stop_watchers_failed",
+                    asset=getattr(router, "asset", "?"),
+                    error=str(exc),
+                )
+
+    def watcher_for_server_order(self, server_order_id: str):
+        for router in self._routers.values():
+            live = getattr(router, "live", None)
+            if live is None:
+                continue
+            watcher = live.watcher_for_server_order(server_order_id)
+            if watcher is not None:
+                return watcher
+        return None

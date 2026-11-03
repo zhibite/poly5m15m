@@ -4,7 +4,7 @@
 # Or install the package:
 #   pip install -e .
 
-# Web dashboard (FastAPI app served on WEB_PORT, default 8010)
+# Web dashboard (FastAPI app served on WEB_PORT, default 8025)
 fastapi>=0.111
 uvicorn[standard]>=0.30
 

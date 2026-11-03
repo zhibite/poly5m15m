@@ -697,6 +697,7 @@ class PaperBroker:
         try:
             self._db.upsert_round(
                 round_start_ts=meta["round_start_ts"],
+                asset=self.asset,
                 slug=meta.get("slug"),
                 condition_id=meta.get("condition_id"),
                 up_token=meta.get("up_token"),
@@ -727,6 +728,7 @@ class PaperBroker:
                 expires_at=int(order.expires_at),
                 placed_at=int(order.placed_at),
                 mode="paper",
+                asset=self.asset,
             )
         except Exception as exc:  # noqa: BLE001
             log.warning(
@@ -769,6 +771,7 @@ class PaperBroker:
                 trader_side=role,
                 fee=fee,
                 mode="paper",
+                asset=self.asset,
             )
             self._db.update_order_status(
                 order.order_id, "filled", order.size_matched

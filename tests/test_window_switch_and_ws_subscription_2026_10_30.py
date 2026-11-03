@@ -255,9 +255,10 @@ def _make_engine_and_market():
         condition_id="0xdeadbeef",
         token_up_id="UPTOKEN",
         token_down_id="DOWNTOKEN",
-        window_start=datetime.now(timezone.utc) - timedelta(seconds=400),
-        window_end=datetime.now(timezone.utc) + timedelta(seconds=500),
-        round_start_ts=int(time.time()) - 400,
+        # 1-hour markets use a 600 s T1 entry window.
+        window_start=datetime.now(timezone.utc) - timedelta(seconds=700),
+        window_end=datetime.now(timezone.utc) + timedelta(seconds=200),
+        round_start_ts=int(time.time()) - 700,
     )
     eng._round = RoundState(round_start_ts=mkt.round_start_ts, market=mkt)
     eng._gate = GateKeeper(100.0)

@@ -60,6 +60,7 @@ async def wallet_snapshot(state: Any, force: bool = False) -> dict[str, Any]:
         "allowance_usd": None,
         "position_token": None,
         "position_shares": None,
+        "positions": {},
         "error": None,
         "updated_at": int(now),
     }
@@ -77,16 +78,29 @@ async def wallet_snapshot(state: Any, force: bool = False) -> dict[str, Any]:
             data["balance_usd"] = collateral.get("balance")
             data["allowance_usd"] = collateral.get("allowance")
 
-        # Shares held for the current round (if any). Uses the position's
-        # entry token, so it is empty outside an open position.
-        engine = getattr(state, "engine", None)
-        round_state = getattr(engine, "_round", None) if engine else None
-        position = getattr(round_state, "position", None) if round_state else None
-        token = getattr(position, "entry_token", None) if position else None
-        if token:
-            data["position_token"] = token
+        # Shares held for each asset's current round (if any).
+        engines = getattr(state, "engines", {}) or {}
+        primary = getattr(state, "engine", None)
+        if primary is not None and not engines:
+            engines = {"BTC": primary}
+        for asset, engine in engines.items():
+            round_state = getattr(engine, "_round", None) if engine else None
+            position = (
+                getattr(round_state, "position", None)
+                if round_state else None
+            )
+            token = (
+                getattr(position, "entry_token", None) if position else None
+            )
+            if not token:
+                continue
             shares = await clob.get_token_balance(token)
-            if shares is not None:
+            data["positions"][asset] = {
+                "token": token,
+                "shares": shares,
+            }
+            if asset == "BTC" or data["position_token"] is None:
+                data["position_token"] = token
                 data["position_shares"] = shares
     except Exception as exc:  # noqa: BLE001
         data["error"] = f"余额查询异常: {exc}"

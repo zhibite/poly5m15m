@@ -26,7 +26,7 @@ RUN mkdir -p /app/data && chown -R appuser:appuser /app
 
 USER appuser
 
-EXPOSE 8010
+EXPOSE 8025
 
 ENV PYTHONUNBUFFERED=1
 ENV PYTHONDONTWRITEBYTECODE=1

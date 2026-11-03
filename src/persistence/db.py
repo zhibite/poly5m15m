@@ -30,9 +30,10 @@ _DB_PATH = Path(os.getenv("POLYMARKET_DB_PATH") or (_DATA_DIR / "polymarket.db")
 # Schema
 # ---------------------------------------------------------------------------
 
-SCHEMA = """
+ROUNDS_TABLE_SQL = """
 CREATE TABLE IF NOT EXISTS rounds (
-  round_start_ts  INTEGER PRIMARY KEY,
+  round_start_ts  INTEGER NOT NULL,
+  asset           TEXT NOT NULL DEFAULT 'BTC',
   mode            TEXT DEFAULT 'live',
   slug            TEXT,
   condition_id    TEXT,
@@ -45,13 +46,17 @@ CREATE TABLE IF NOT EXISTS rounds (
   finished_at     TEXT,
   resolved        INTEGER DEFAULT 0,
   up_won          INTEGER,
-  resolved_at     TEXT
+  resolved_at     TEXT,
+  PRIMARY KEY (round_start_ts, asset)
 );
+"""
 
+SCHEMA = ROUNDS_TABLE_SQL + """
 CREATE TABLE IF NOT EXISTS orders (
   client_order_id TEXT PRIMARY KEY,
   server_order_id TEXT,
   round_start_ts  INTEGER,
+  asset           TEXT NOT NULL DEFAULT 'BTC',
   mode            TEXT DEFAULT 'live',
   side            TEXT,
   token_id        TEXT,
@@ -69,6 +74,7 @@ CREATE TABLE IF NOT EXISTS fills (
   fill_id        TEXT PRIMARY KEY,
   order_id       TEXT,
   round_start_ts INTEGER,
+  asset          TEXT NOT NULL DEFAULT 'BTC',
   mode           TEXT DEFAULT 'live',
   token_id       TEXT,
   side           TEXT,
@@ -80,11 +86,6 @@ CREATE TABLE IF NOT EXISTS fills (
   trader_side    TEXT,
   fee            REAL DEFAULT 0
 );
-
--- The dashboard filters rounds by activity. These keep that lookup cheap
--- as fills accumulate (rounds are keyed by round_start_ts already).
-CREATE INDEX IF NOT EXISTS idx_orders_round ON orders(round_start_ts);
-CREATE INDEX IF NOT EXISTS idx_fills_round  ON fills(round_start_ts);
 """
 
 
@@ -113,7 +114,56 @@ def init_db(db_path: Path = _DB_PATH) -> sqlite3.Connection:
         if "fee" not in fill_cols:
             conn.execute("ALTER TABLE fills ADD COLUMN fee REAL DEFAULT 0")
             log.info("db.migrate.fills_fee")
+        if "asset" not in fill_cols:
+            conn.execute(
+                "ALTER TABLE fills ADD COLUMN asset TEXT NOT NULL DEFAULT 'BTC'"
+            )
+            log.info("db.migrate.fills_asset")
+
         round_cols = {row[1] for row in conn.execute("PRAGMA table_info(rounds)")}
+        if "asset" not in round_cols:
+            # The old rounds table was keyed by round_start_ts alone. The
+            # multi-asset bot needs (round_start_ts, asset), which SQLite can
+            # only express by rebuilding the table.
+            conn.execute("ALTER TABLE rounds RENAME TO rounds_legacy")
+            conn.execute(ROUNDS_TABLE_SQL)
+            legacy_cols = {
+                row[1]
+                for row in conn.execute("PRAGMA table_info(rounds_legacy)")
+            }
+
+            def _legacy(name: str, default: str) -> str:
+                return name if name in legacy_cols else default
+
+            conn.execute(
+                f"""
+                INSERT INTO rounds (
+                  round_start_ts, asset, mode, slug, condition_id, up_token,
+                  down_token, tick_size, binance_baseline, finished,
+                  started_at, finished_at, resolved, up_won, resolved_at
+                )
+                SELECT round_start_ts, 'BTC',
+                       {_legacy("mode", "'live'")},
+                       {_legacy("slug", "NULL")},
+                       {_legacy("condition_id", "NULL")},
+                       {_legacy("up_token", "NULL")},
+                       {_legacy("down_token", "NULL")},
+                       {_legacy("tick_size", "0.01")},
+                       {_legacy("binance_baseline", "NULL")},
+                       {_legacy("finished", "0")},
+                       {_legacy("started_at", "NULL")},
+                       {_legacy("finished_at", "NULL")},
+                       {_legacy("resolved", "0")},
+                       {_legacy("up_won", "NULL")},
+                       {_legacy("resolved_at", "NULL")}
+                FROM rounds_legacy
+                """
+            )
+            conn.execute("DROP TABLE rounds_legacy")
+            round_cols = {
+                row[1] for row in conn.execute("PRAGMA table_info(rounds)")
+            }
+            log.info("db.migrate.rounds_asset")
         if "resolved" not in round_cols:
             conn.execute(
                 "ALTER TABLE rounds ADD COLUMN resolved INTEGER DEFAULT 0"
@@ -125,7 +175,13 @@ def init_db(db_path: Path = _DB_PATH) -> sqlite3.Connection:
         if "resolved_at" not in round_cols:
             conn.execute("ALTER TABLE rounds ADD COLUMN resolved_at TEXT")
             log.info("db.migrate.rounds_resolved_at")
+
         order_cols = {row[1] for row in conn.execute("PRAGMA table_info(orders)")}
+        if "asset" not in order_cols:
+            conn.execute(
+                "ALTER TABLE orders ADD COLUMN asset TEXT NOT NULL DEFAULT 'BTC'"
+            )
+            log.info("db.migrate.orders_asset")
         for table, cols in (
             ("rounds", round_cols),
             ("orders", order_cols),
@@ -136,6 +192,22 @@ def init_db(db_path: Path = _DB_PATH) -> sqlite3.Connection:
                     f"ALTER TABLE {table} ADD COLUMN mode TEXT DEFAULT 'live'"
                 )
                 log.info("db.migrate.%s_mode", table)
+
+        # Activity lookups are per round AND per asset now.
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_orders_asset_round "
+            "ON orders(asset, round_start_ts)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_fills_asset_round "
+            "ON fills(asset, round_start_ts)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_orders_round ON orders(round_start_ts)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_fills_round ON fills(round_start_ts)"
+        )
     except Exception as exc:  # noqa: BLE001
         log.warning("db.migrate.failed", error=str(exc))
     conn.commit()
@@ -161,6 +233,7 @@ class DB:
         tick_size: float = 0.01,
         binance_baseline: float | None = None,
         mode: str = "live",
+        asset: str = "BTC",
     ) -> None:
         # `started_at` is the WINDOW start, derived from the round key, not
         # the moment this row happened to be written. Rounds are inserted
@@ -171,10 +244,11 @@ class DB:
             int(round_start_ts), tz=timezone.utc
         ).isoformat()
         self._c.execute("""
-            INSERT INTO rounds (round_start_ts, mode, slug, condition_id, up_token, down_token,
-                                tick_size, binance_baseline, started_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(round_start_ts) DO UPDATE SET
+            INSERT INTO rounds (round_start_ts, asset, mode, slug, condition_id,
+                                up_token, down_token, tick_size,
+                                binance_baseline, started_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(round_start_ts, asset) DO UPDATE SET
               mode=excluded.mode,
               slug=COALESCE(excluded.slug, slug),
               condition_id=COALESCE(excluded.condition_id, condition_id),
@@ -182,14 +256,19 @@ class DB:
               down_token=COALESCE(excluded.down_token, down_token),
               tick_size=excluded.tick_size,
               binance_baseline=COALESCE(excluded.binance_baseline, binance_baseline)
-        """, (round_start_ts, mode, slug, condition_id, up_token, down_token,
-              tick_size, binance_baseline, started_at))
+        """, (int(round_start_ts), str(asset).upper(), mode, slug, condition_id,
+              up_token, down_token, tick_size, binance_baseline, started_at))
         self._c.commit()
 
-    def finish_round(self, round_start_ts: int) -> None:
+    def finish_round(self, round_start_ts: int, asset: str = "BTC") -> None:
         self._c.execute(
-            "UPDATE rounds SET finished=1, finished_at=? WHERE round_start_ts=?",
-            (datetime.now(timezone.utc).isoformat(), round_start_ts)
+            "UPDATE rounds SET finished=1, finished_at=? "
+            "WHERE round_start_ts=? AND asset=?",
+            (
+                datetime.now(timezone.utc).isoformat(),
+                int(round_start_ts),
+                str(asset).upper(),
+            )
         )
         self._c.commit()
 
@@ -198,6 +277,7 @@ class DB:
         round_start_ts: int,
         up_won: bool,
         resolved_at: str | None = None,
+        asset: str = "BTC",
     ) -> None:
         """Record the market's final outcome for a round.
 
@@ -207,11 +287,12 @@ class DB:
         """
         self._c.execute(
             "UPDATE rounds SET resolved=1, up_won=?, resolved_at=? "
-            "WHERE round_start_ts=?",
+            "WHERE round_start_ts=? AND asset=?",
             (
                 1 if up_won else 0,
                 resolved_at or datetime.now(timezone.utc).isoformat(),
                 int(round_start_ts),
+                str(asset).upper(),
             ),
         )
         self._c.commit()
@@ -224,21 +305,23 @@ class DB:
     ) -> list[tuple]:
         """Rounds whose window has ended but whose outcome is unknown.
 
-        Returns `(round_start_ts, condition_id, slug, up_token, down_token)`
-        newest-first, so the round that just ended is settled before the
-        backlog of older rows. Rows without a condition_id cannot be looked
-        up and are skipped; the caller also needs both token ids to
-        attribute the held side.
+        Returns `(round_start_ts, condition_id, slug, up_token, down_token,
+        asset)` newest-first, so the round that just ended is settled before
+        the backlog of older rows. The asset is appended at the END to keep
+        the historical 5-field prefix stable for older callers. Rows
+        without a condition_id cannot be looked up and are skipped; the
+        caller also needs both token ids to attribute the held side.
         """
         cutoff = int(before_ts) - int(lookback_s)
         rows = self._c.execute(
             """
-            SELECT round_start_ts, condition_id, slug, up_token, down_token
+            SELECT round_start_ts, condition_id, slug,
+                   up_token, down_token, asset
             FROM rounds
             WHERE COALESCE(resolved, 0) = 0
               AND condition_id IS NOT NULL AND condition_id <> ''
               AND round_start_ts >= ? AND round_start_ts <= ?
-            ORDER BY round_start_ts DESC
+            ORDER BY round_start_ts DESC, asset ASC
             LIMIT ?
             """,
             (cutoff, int(before_ts), int(limit)),
@@ -259,14 +342,17 @@ class DB:
         expires_at: int,
         placed_at: int,
         mode: str = "live",
+        asset: str = "BTC",
     ) -> None:
         self._c.execute("""
             INSERT OR REPLACE INTO orders
-              (client_order_id, server_order_id, round_start_ts, mode, side, token_id,
-               tier_name, price, size, lifetime_s, expires_at, placed_at, status)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'placed')
-        """, (client_order_id, server_order_id, round_start_ts, mode, side, token_id,
-              tier_name, price, size, lifetime_s, expires_at, placed_at))
+              (client_order_id, server_order_id, round_start_ts, asset, mode,
+               side, token_id, tier_name, price, size, lifetime_s, expires_at,
+               placed_at, status)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'placed')
+        """, (client_order_id, server_order_id, int(round_start_ts),
+              str(asset).upper(), mode, side, token_id, tier_name, price, size,
+              lifetime_s, expires_at, placed_at))
         self._c.commit()
 
     def update_order_status(
@@ -299,14 +385,16 @@ class DB:
         trader_side: str | None = None,
         fee: float = 0.0,
         mode: str = "live",
+        asset: str = "BTC",
     ) -> None:
         self._c.execute("""
             INSERT OR IGNORE INTO fills
-              (fill_id, order_id, round_start_ts, mode, token_id, side,
-               price, size, ts_ms, confirmed, recorded_at, trader_side, fee)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (fill_id, order_id, round_start_ts, mode, token_id, side,
-              price, size, ts_ms, confirmed,
+              (fill_id, order_id, round_start_ts, asset, mode, token_id,
+               side, price, size, ts_ms, confirmed, recorded_at,
+               trader_side, fee)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (fill_id, order_id, int(round_start_ts), str(asset).upper(),
+              mode, token_id, side, price, size, ts_ms, confirmed,
               datetime.now(timezone.utc).isoformat(), trader_side,
               float(fee or 0.0)))
         self._c.commit()
@@ -366,15 +454,23 @@ class DB:
 
     def rounds_in_progress(self) -> list[tuple]:
         cur = self._c.execute(
-            "SELECT round_start_ts, slug, condition_id, up_token, down_token, tick_size "
-            "FROM rounds WHERE finished=0 ORDER BY round_start_ts DESC LIMIT 1"
+            "SELECT round_start_ts, asset, slug, condition_id, up_token, "
+            "down_token, tick_size "
+            "FROM rounds WHERE finished=0 "
+            "ORDER BY round_start_ts DESC, asset ASC LIMIT 1"
         )
         return cur.fetchall()
 
-    def orders_for_round(self, round_start_ts: int) -> list[tuple]:
+    def orders_for_round(
+        self, round_start_ts: int, asset: str | None = None
+    ) -> list[tuple]:
+        wanted = str(asset).upper() if asset else None
         cur = self._c.execute(
-            "SELECT client_order_id, server_order_id, round_start_ts, side, token_id, "
-            "tier_name, price, size, lifetime_s, expires_at, placed_at, size_matched, status "
-            "FROM orders WHERE round_start_ts=?", (round_start_ts,)
+            "SELECT client_order_id, server_order_id, round_start_ts, asset, "
+            "side, token_id, tier_name, price, size, lifetime_s, expires_at, "
+            "placed_at, size_matched, status "
+            "FROM orders WHERE round_start_ts=? "
+            "AND (? IS NULL OR asset=?)",
+            (int(round_start_ts), wanted, wanted),
         )
         return cur.fetchall()

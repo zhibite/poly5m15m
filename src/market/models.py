@@ -55,7 +55,7 @@ class MarketInfo:
 
     @staticmethod
     def slug_for_round(round_start_ts: int) -> str:
-        return f"btc-updown-15m-{round_start_ts}"
+        return f"btc-updown-1h-{round_start_ts}"
 
     # ── Dynamic real-time prices (injected by strategy main loop) ──────
     _up_mid: float = 0.0

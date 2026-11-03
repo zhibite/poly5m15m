@@ -110,6 +110,10 @@ class ActionHandler(Protocol):
 class StrategyEngine:
     """Reactive strategy that monitors prices and emits action callbacks."""
 
+    # Class-level default so tests that construct the engine via __new__
+    # (bypassing __init__) still have the asset label available to logs.
+    asset: str = "BTC"
+
     def __init__(
         self,
         binance_cache: BinanceCache,
@@ -118,7 +122,9 @@ class StrategyEngine:
         killswitch: object | None = None,
         *,
         signals: object | None = None,
+        asset: str = "BTC",
     ) -> None:
+        self.asset = str(asset or "BTC").upper()
         self._bc = binance_cache
         self._pc = price_cache
         self._handler = handler
@@ -837,7 +843,11 @@ class StrategyEngine:
         `on_round_end`, leaving the gate at None for the full 15-min window
         (STATUS logged `baseline=pending`, no drift gating ran).
         """
-        log.info("engine.new_round", round_start_ts=round_start_ts)
+        log.info(
+            "engine.new_round",
+            asset=self.asset,
+            round_start_ts=round_start_ts,
+        )
         # H-V6-15: clear stale price-cap tracking from the previous round
         # (if on_round_end ran) so the new round starts with a clean slate.
         # summary() will be re-armed when t1_skip_log observes the first
@@ -862,7 +872,9 @@ class StrategyEngine:
         if market is not None and getattr(market, "btc_spot_at_window_open", 0.0) > 0:
             baseline = float(market.btc_spot_at_window_open)
             baseline_src = "market.btc_spot_at_window_open"
-        elif self._bc.last_price > 0:
+        elif self.asset == "BTC" and self._bc.last_price > 0:
+            # Legacy BTC-only fallback. The multi-asset engines never see a
+            # Binance spot feed, so their `_gate` stays None (pure ladder).
             baseline = self._bc.last_price
             baseline_src = "binance_cache.last_price"
 
@@ -975,6 +987,7 @@ class StrategyEngine:
             self._round.finished = True
             log.info(
                 "engine.round_ended",
+                asset=self.asset,
                 round_start_ts=self._round.round_start_ts,
                 position=self._round.position,
             )
@@ -1262,7 +1275,7 @@ class StrategyEngine:
         each emit ActionOpenT1 / ActionOpenTN and the router would queue
         two placements.
         """
-        if not self._round or not self._gate:
+        if not self._round:
             return
         if getattr(self._round, "skip_reason", None):
             # Window pre-check (late boot / cross-window BTC gap) — do not
@@ -1296,17 +1309,33 @@ class StrategyEngine:
             return
         self._eval_inflight = True
         try:
-            bc_now = self._bc.last_price
-            if bc_now <= 0:
-                return
+            # The multi-asset production engine is a pure price martingale:
+            # no Binance spot feed and no GateKeeper are wired, so `bc_now`
+            # legitimately stays 0. The BTC drift / volatility guards below
+            # remain available for the legacy single-asset tests and for any
+            # future deployment that supplies a spot feed.
+            try:
+                bc_now = float(self._bc.last_price)
+            except (TypeError, ValueError):
+                bc_now = 0.0
 
             # Feed health + short-term volatility state. A stale feed is not
             # sampled (the price is old); the guards in the check_* helpers
             # decide whether to pause new actions.
-            if not self._btc_feed_stale():
+            if bc_now > 0 and not self._btc_feed_stale():
                 self._update_btc_volatility(bc_now)
 
-            gate_state = self._gate.state(bc_now)
+            if self._gate is not None and bc_now > 0:
+                gate_state = self._gate.state(bc_now)
+                new_state = "PASS" if gate_state.within_limit else "FAIL"
+                if self._round.gate_last_state != new_state:
+                    self._round.gate_last_state = new_state
+                    log.info(
+                        "engine.gate",
+                        asset=self.asset,
+                        drift=gate_state.drift,
+                        state=new_state,
+                    )
 
             # A paused process must not leave pre-armed BUY GTDs on the
             # book: they could fill and open a live position after the
@@ -1315,13 +1344,8 @@ class StrategyEngine:
                 await self._cancel_placed_buys("trading_paused")
                 self._monitor_signal()
 
-            new_state = "PASS" if gate_state.within_limit else "FAIL"
-            if self._round.gate_last_state != new_state:
-                self._round.gate_last_state = new_state
-                log.info("engine.gate", drift=gate_state.drift, state=new_state)
-
             # NOTE: do NOT early-return on drift here. Each decision path
-            # enforces the gate itself:
+            # enforces the gate itself (when a gate is present):
             #   * T1 entry   -> GateKeeper.can_enter() (drift + price cap)
             #   * averaging  -> can_double_down() (documented drift bypass
             #                   once the next-tier trigger is reached)
@@ -1399,7 +1423,7 @@ class StrategyEngine:
         Tier.is_complete tiers are skipped (no GTD to cancel). Already-
         cancelled tiers (placed=False) are skipped.
         """
-        if not self._round or not self._gate:
+        if not self._round:
             return
         pos = self._round.position
         if snap is None:
@@ -1606,7 +1630,7 @@ class StrategyEngine:
         None and we build one locally. This keeps the snapshot as the
         canonical source while not breaking existing call sites.
         """
-        if not self._round or not self._gate or not self._round.up_token:
+        if not self._round or not self._round.up_token:
             return
 
         # Operator pause (e.g. while the backtest collects data): block new
@@ -1726,8 +1750,13 @@ class StrategyEngine:
                 )
                 continue
 
-            # BTC drift gate
-            if not self._gate.can_enter(bc_now, mid_price):
+            # BTC drift gate (legacy; disabled in the pure-martingale
+            # multi-asset deployment because no gate/spot feed is wired).
+            if (
+                self._gate is not None
+                and bc_now > 0
+                and not self._gate.can_enter(bc_now, mid_price)
+            ):
                 gs = self._gate.state(bc_now)
                 self._t1_skip_log(
                     "engine.t1_skip_drift",
@@ -1766,6 +1795,7 @@ class StrategyEngine:
 
             log.info(
                 "engine.trigger_t1",
+                asset=self.asset,
                 side=side,
                 token=token[:16],
                 mid=mid_price,
@@ -1851,7 +1881,7 @@ class StrategyEngine:
         snapshot for `baseline_realized_price` / `baseline_target_price`
         instead of reading `pos` repeatedly.
         """
-        if not self._round or not self._gate:
+        if not self._round:
             return
 
         # Same operator pause as _check_t1_entry: no new averaging tiers.
@@ -2091,9 +2121,15 @@ class StrategyEngine:
                     )
                     continue
 
-            # BTC drift gate for averaging.
+            # BTC drift gate for averaging (legacy; disabled in production).
             next_drop = TierSnapshot._next_tier_drop(tier.tier)
-            if not self._gate.can_double_down(bc_now, mid_price, tier.tier, next_drop, t1_entry):
+            if (
+                self._gate is not None
+                and bc_now > 0
+                and not self._gate.can_double_down(
+                    bc_now, mid_price, tier.tier, next_drop, t1_entry
+                )
+            ):
                 # T4-only time-based bypass (operator decision 2026-10-31):
                 # T4 has no momentum bypass, so a trending window blocks the
                 # last/largest tier exactly when the token crashes into its
@@ -2192,6 +2228,7 @@ class StrategyEngine:
 
             log.info(
                 "engine.trigger_tN",
+                asset=self.asset,
                 round_start_ts=self._current_round_ts(),
                 tier=tier.tier,
                 mid=mid_price,
@@ -2232,7 +2269,7 @@ class StrategyEngine:
         H-NEW-2026-07-15: takes a `PositionSnapshot`. Behaviour is unchanged;
         we just read state from the snapshot instead of `pos.*`.
         """
-        if not self._round or not self._gate:
+        if not self._round:
             return
         # A stop-loss taker exit is in flight — do not race it with a TP.
         if getattr(self, "_stop_loss_inflight", False):
@@ -2480,7 +2517,12 @@ class StrategyEngine:
         # 2026-10-30: mid crossed the TP fire line while drift was FAIL, the
         # SELL was never posted, and the token then collapsed ~60%. Default
         # off; `TP_REQUIRE_DRIFT_GATE=true` restores the old behaviour.
-        if self._get_tp_require_drift_gate() and not self._gate.can_act(bc_now):
+        if (
+            self._get_tp_require_drift_gate()
+            and self._gate is not None
+            and bc_now > 0
+            and not self._gate.can_act(bc_now)
+        ):
             round_ts = getattr(self._round, "round_start_ts", 0)
             if getattr(self, "_tp_drift_skip_round_ts", None) != round_ts:
                 self._tp_drift_skip_round_ts = round_ts
@@ -2528,6 +2570,7 @@ class StrategyEngine:
 
         log.info(
             "engine.trigger_tp",
+            asset=self.asset,
             round_start_ts=self._current_round_ts(),
             mid=mid_price,
             fire_line=fire_line,

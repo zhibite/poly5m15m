@@ -60,14 +60,28 @@
     </div>
   </div>
 
-  <!-- BTC price card -->
+  <!-- Asset tabs + cross-asset overview -->
+  <div class="section">
+    <h2>币种概览 <span class="pill" id="asset-count">0</span></h2>
+    <div class="asset-tabs" id="asset-tabs"></div>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>币种</th><th>方向</th><th>数量</th><th>均价</th><th>中价</th><th>浮动盈亏</th><th>止盈目标</th><th>分层</th><th>挂单</th><th>状态</th></tr>
+        </thead>
+        <tbody id="overview-tbody"><tr><td colspan="10" class="no-data">等待行情...</td></tr></tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- Selected asset price card -->
   <div class="price-card">
     <div class="price-head">
       <a class="price-title disabled" id="market-link" target="_blank"
-         rel="noopener noreferrer" title="市场加载中">BTC / USDT · 15m Up/Down<span class="ext">↗</span></a>
+         rel="noopener noreferrer" title="市场加载中"><span id="market-title">BTC / USDT · 1h Up/Down</span><span class="ext">↗</span></a>
       <div>
         <span class="badge pending" id="phase-badge">--</span>
-        <span class="badge pending" id="gate-badge">--</span>
+        <span class="badge pending" id="market-badge">--</span>
       </div>
     </div>
     <div class="price-bar-wrap">
@@ -91,31 +105,17 @@
       </div>
     </div>
     <div class="gate-row">
-      <span>Binance <b id="binance">--</b></span>
-      <span>基线 <b id="baseline">--</b></span>
-      <span>漂移 <b id="drift">--</b></span>
+      <span>币种 <b id="detail-asset">--</b></span>
       <span>轮次 <b id="round-ts">--</b></span>
       <span>模式 <b id="trading-mode">--</b></span>
+      <span>市场 <b id="market-state">--</b></span>
       <span>跳过原因 <b id="skip-reason">无</b></span>
-    </div>
-  </div>
-
-  <!-- External signals / risk gates -->
-  <div class="section">
-    <h2>信号 / 风控闸门</h2>
-    <div class="table-wrap">
-      <table>
-        <thead><tr><th>项目</th><th>数值</th><th>说明</th></tr></thead>
-        <tbody id="signal-tbody">
-          <tr><td colspan="3" class="no-data">等待首次决策...</td></tr>
-        </tbody>
-      </table>
     </div>
   </div>
 
   <!-- Position -->
   <div class="section">
-    <h2>当前持仓</h2>
+    <h2>当前持仓 · <span id="position-asset">BTC</span></h2>
     <div class="table-wrap">
       <table>
         <thead>
@@ -128,7 +128,7 @@
 
   <!-- Tiers -->
   <div class="section">
-    <h2>分层状态</h2>
+    <h2>分层状态 · <span id="tiers-asset">BTC</span></h2>
     <div class="table-wrap">
       <table>
         <thead>
@@ -141,7 +141,7 @@
 
   <!-- Open orders -->
   <div class="section">
-    <h2>当前挂单</h2>
+    <h2>当前挂单 · <span id="orders-asset">BTC</span></h2>
     <div class="table-wrap">
       <table>
         <thead>
@@ -158,9 +158,9 @@
     <div class="table-wrap">
       <table>
         <thead>
-          <tr><th>时间 (UTC)</th><th>轮次</th><th>层</th><th>方向</th><th>价格</th><th>数量</th><th>金额</th></tr>
+          <tr><th>时间 (UTC)</th><th>币种</th><th>轮次</th><th>层</th><th>方向</th><th>价格</th><th>数量</th><th>金额</th></tr>
         </thead>
-        <tbody id="fills-tbody"><tr><td colspan="7" class="no-data">暂无成交</td></tr></tbody>
+        <tbody id="fills-tbody"><tr><td colspan="8" class="no-data">暂无成交</td></tr></tbody>
       </table>
     </div>
   </div>
@@ -370,70 +370,106 @@ async function startStrategy() {
   await controlCall('/api/control/start', {});
 }
 
-function renderSignals(sig) {
-  const body = $('signal-tbody');
-  if (!sig || !sig.ts) {
-    body.innerHTML = '<tr><td colspan="3" class="no-data">等待首次决策...</td></tr>';
+let SELECTED = 'BTC';
+let LAST_STATUS = null;
+
+function renderAssetTabs(assets) {
+  $('asset-tabs').innerHTML = assets.map((a) => {
+    const active = a.asset === SELECTED ? ' active' : '';
+    return `<button class="asset-tab${active}" data-asset="${a.asset}"
+      onclick="selectAsset('${a.asset}')">${a.asset}</button>`;
+  }).join('');
+}
+
+function selectAsset(asset) {
+  SELECTED = asset;
+  if (LAST_STATUS) renderStatus(LAST_STATUS);
+}
+
+function renderOverview(assets) {
+  const body = $('overview-tbody');
+  if (!assets.length) {
+    body.innerHTML = '<tr><td colspan="10" class="no-data">等待行情...</td></tr>';
     return;
   }
-  const val = (v, d = 4) => (v === null || v === undefined || isNaN(v)) ? '--' : Number(v).toFixed(d);
-  const pct = (v, d = 2) => (v === null || v === undefined || isNaN(v)) ? '--' : (Number(v) * 100).toFixed(d) + '%';
-  const reasons = (sig.reasons && sig.reasons.length) ? sig.reasons.join(', ') : '无';
-  const tf = sig.tf5m || {};
-  const macro = sig.macro || {};
-  const ev = sig.event || {};
-  const rows = [
-    ['结论', sig.would_block ? '<span class="red">拦截</span>' : '<span class="green">放行</span>',
-      `模式=${sig.mode || '--'} · ${sig.kind || '--'} ${sig.side || ''} · 原因: ${reasons}`],
-    ['数字期权模型', `公允 ${val(sig.fair_held, 3)} / mid ${val(sig.token_mid, 3)}`,
-      `edge=${val(sig.edge, 4)} · adverse z=${val(sig.adverse_z, 2)} · σ=${val(sig.sigma_1m_pct, 3)}%/min`],
-    ['趋势/波动', `trend=${val(sig.trend_score, 3)} (against ${val(sig.trend_against, 2)})`,
-      `RSI=${val(sig.rsi, 1)} · ATR=${val(sig.atr_pct, 3)}% · bars=${sig.regime_bars || 0}`],
-    ['盘口', `spread=${val(sig.spread, 4)} · imbalance=${val(sig.book_imbalance, 2)}`,
-      `CVD 占比=${val(sig.cvd_ratio, 2)} · 60s 主动买卖流`],
-    ['5m 确认', tf.available ? `UP ${val(tf.up_mid, 3)} / DOWN ${val(tf.down_mid, 3)}` : '不可用',
-      tf.available ? `UP 60s ${pct(tf.up_change_60)} · DOWN 60s ${pct(tf.down_change_60)} · confirm=${val(tf.confirm, 2)}` : '数据缺失时失败开放'],
-    ['宏观', `funding=${val(macro.funding_rate, 5)} · OI ${val(macro.oi_change_pct, 2)}%`,
-      `DVOL=${val(macro.dvol, 1)} (${val(macro.dvol_change_pct, 1)}%) · 数据缺失时失败开放`],
-    ['事件', ev.event_blackout ? String(ev.event_name || '黑名单') : '无',
-      ev.event_end ? '结束 ' + new Date(ev.event_end * 1000).toLocaleString('zh-CN', { hour12: false }) : '未配置事件日历'],
-  ];
-  body.innerHTML = rows.map(([a, b, c]) =>
-    `<tr><td>${a}</td><td class="mono">${b}</td><td class="muted">${c}</td></tr>`
-  ).join('');
+  body.innerHTML = assets.map((a) => {
+    const p = a.position || {};
+    const qty = Number(p.qty || 0);
+    const tiers = (p.tiers || []).map((t) =>
+      `T${t.tier}${t.status === 'filled' ? '✓' : t.status === 'watching' ? '⏳' : t.status === 'placed' ? '◐' : '○'}`
+    ).join(' ');
+    const orderCount = (a.orders || []).length;
+    let state;
+    if (!a.market_ok) state = '<span class="pill idle">无市场</span>';
+    else if (a.skip_reason) state = '<span class="pill idle">跳过</span>';
+    else if (qty > 0) state = '<span class="pill watching">持仓</span>';
+    else state = '<span class="pill placed">等待</span>';
+    const side = qty > 0
+      ? `<span class="pill ${p.side === 'UP' ? 'buy' : 'sell'}">${p.side || '--'}</span>`
+      : '--';
+    const pnlCls = cls(p.upnl_usd || 0);
+    return `<tr>
+      <td><button class="asset-link" onclick="selectAsset('${a.asset}')">${a.asset}</button></td>
+      <td>${side}</td>
+      <td class="mono">${qty > 0 ? fmt(qty, 2) : '--'}</td>
+      <td class="mono">${qty > 0 ? fmt(p.avg_cost, 4) : '--'}</td>
+      <td class="mono">${qty > 0 ? fmt(p.mid, 4) : '--'}</td>
+      <td class="mono ${pnlCls}">${qty > 0 ? money(p.upnl_usd) : '--'}</td>
+      <td class="mono">${p.tp_target === null || p.tp_target === undefined ? '--' : fmt(p.tp_target, 4)}</td>
+      <td class="mono muted">${tiers || '--'}</td>
+      <td class="mono">${orderCount}</td>
+      <td>${state}</td>
+    </tr>`;
+  }).join('');
 }
 
 function renderStatus(s) {
+  if (!s) return;
+  LAST_STATUS = s;
   renderKillswitch(s.killswitch);
-  renderSignals(s.signals);
-  renderMarketLink(s.slug);
+
+  const assets = s.assets || [];
+  if (!assets.length) return;
+  if (!assets.some((a) => a.asset === SELECTED)) {
+    SELECTED = s.primary || assets[0].asset;
+  }
+  $('asset-count').textContent = assets.length;
+  renderAssetTabs(assets);
+  renderOverview(assets);
+
+  const a = assets.find((x) => x.asset === SELECTED) || assets[0];
+  SELECTED = a.asset;
+  renderMarketLink(a.slug);
+  $('market-title').textContent = `${a.asset} / USDT · 1h Up/Down`;
+  $('detail-asset').textContent = a.asset;
+  $('position-asset').textContent = a.asset;
+  $('tiers-asset').textContent = a.asset;
+  $('orders-asset').textContent = a.asset;
 
   // window
-  const w = s.window || {};
+  const w = a.window || s.window || {};
   $('window-remain').textContent = dur(w.remain_s);
   const phaseMap = { IN_T1: 'T1 可入场', PAST_T1: '已过 T1', END: '即将结算' };
-  $('window-phase').textContent = (phaseMap[w.phase] || '--') + ' · ' + Math.round((w.period_s || 0) / 60) + ' 分钟窗口';
+  $('window-phase').textContent = (phaseMap[w.phase] || '--') + ' · ' +
+    Math.round((w.period_s || 0) / 60) + ' 分钟窗口';
   $('phase-badge').textContent = phaseMap[w.phase] || '--';
   $('phase-badge').className = 'badge ' + ((w.phase || '').toLowerCase());
 
-  // gate
-  const g = s.gate || {};
-  $('gate-badge').textContent = g.state || '--';
-  $('gate-badge').className = 'badge ' + ((g.state || 'pending').toLowerCase());
-  $('binance').textContent = fmt(g.binance, 1);
-  $('baseline').textContent = fmt(g.baseline, 1);
-  $('drift').textContent = g.drift === null || g.drift === undefined ? '--' : (g.drift * 100).toFixed(3) + '%';
-  $('drift').className = g.state === 'FAIL' ? 'red' : (g.state === 'PASS' ? 'green' : '');
-  $('round-ts').textContent = s.round_start_ts ? utc(s.round_start_ts) : '--';
-  const tm = s.trading_mode || {};
+  // market / mode / round / skip
+  $('market-badge').textContent = a.market_ok ? '市场就绪' : '无市场';
+  $('market-badge').className = 'badge ' + (a.market_ok ? 'in_t1' : 'pending');
+  $('market-state').textContent = a.market_ok ? '就绪' : '缺失';
+  $('market-state').className = a.market_ok ? 'green' : 'orange';
+  $('round-ts').textContent = a.round_start_ts ? utc(a.round_start_ts) : '--';
+  const tm = a.trading_mode || s.trading_mode || {};
   const modeTxt = tm.effective === 'paper' ? '纸盘' : (tm.effective === 'live' ? '实盘' : '--');
   $('trading-mode').textContent = modeTxt + (tm.locked ? '（本轮已锁定）' : '');
   $('trading-mode').className = tm.effective === 'paper' ? 'green' : 'orange';
-  $('skip-reason').textContent = s.skip_reason || '无';
-  $('skip-reason').className = s.skip_reason ? 'orange' : 'muted';
+  $('skip-reason').textContent = a.skip_reason || '无';
+  $('skip-reason').className = a.skip_reason ? 'orange' : 'muted';
 
   // prices
-  const p = s.prices || {};
+  const p = a.prices || {};
   $('up-price').textContent = fmt(p.up_mid, 4);
   $('down-price').textContent = fmt(p.down_mid, 4);
   const upPct = (p.up_mid || 0) * 100, downPct = (p.down_mid || 0) * 100;
@@ -445,7 +481,7 @@ function renderStatus(s) {
   $('bar-down').style.width = (100 - upShare).toFixed(1) + '%';
 
   // position
-  const pos = s.position;
+  const pos = a.position;
   const pBody = $('position-tbody');
   if (!pos || !(pos.qty > 0)) {
     pBody.innerHTML = '<tr><td colspan="7" class="no-data">无持仓</td></tr>';
@@ -480,8 +516,8 @@ function renderStatus(s) {
 
   // open orders
   const oBody = $('orders-tbody');
-  if (s.orders && s.orders.length) {
-    oBody.innerHTML = s.orders.map(o => `<tr>
+  if (a.orders && a.orders.length) {
+    oBody.innerHTML = a.orders.map(o => `<tr>
       <td>${o.tier}</td>
       <td><span class="pill ${o.side === 'BUY' ? 'buy' : 'sell'}">${o.side}</span></td>
       <td class="mono">${fmt(o.price, 4)}</td>
@@ -498,11 +534,12 @@ function renderStatus(s) {
 function renderFills(fills) {
   const body = $('fills-tbody');
   if (!fills || !fills.length) {
-    body.innerHTML = '<tr><td colspan="7" class="no-data">暂无成交</td></tr>';
+    body.innerHTML = '<tr><td colspan="8" class="no-data">暂无成交</td></tr>';
     return;
   }
   body.innerHTML = fills.slice(0, 15).map(f => `<tr>
     <td class="mono">${f.ts_ms ? new Date(f.ts_ms).toISOString().slice(11, 19) : '--'}</td>
+    <td><span class="pill watching">${f.asset || 'BTC'}</span></td>
     <td class="mono">${utc(f.round_start_ts)}${outcomePill(f.outcome)}</td>
     <td>${f.tier || '--'}</td>
     <td><span class="pill ${f.side === 'BUY' ? 'buy' : 'sell'}">${f.side}</span></td>
@@ -540,7 +577,7 @@ async function refreshStatus() {
 
 async function refreshTrades() {
   try {
-    const d = await getJSON('/api/trades?limit=100');
+    const d = await getJSON('/api/trades?limit=300');
     renderStats(d.stats);
     renderFills(d.fills);
   } catch (e) { /* status poll handles the indicator */ }

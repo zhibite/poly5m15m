@@ -287,9 +287,12 @@ async def api_status(_: None = Depends(_require_auth)) -> dict[str, Any]:
 async def api_rounds(
     limit: int = Query(50, ge=1, le=500),
     mode: str | None = Query(None),
+    asset: str | None = Query(None),
     _: None = Depends(_require_auth),
 ) -> dict[str, Any]:
-    rounds = status_mod.rounds_with_pnl(_conn(), limit, mode=mode)
+    rounds = status_mod.rounds_with_pnl(
+        _conn(), limit, mode=mode, asset=asset
+    )
     return {"rounds": rounds, "stats": status_mod.compute_stats(rounds)}
 
 
@@ -298,12 +301,15 @@ async def api_fills(
     limit: int = Query(200, ge=1, le=2000),
     offset: int = Query(0, ge=0),
     mode: str | None = Query(None),
+    asset: str | None = Query(None),
     _: None = Depends(_require_auth),
 ) -> dict[str, Any]:
     conn = _conn()
     return {
-        "fills": status_mod.recent_fills(conn, limit, offset, mode=mode),
-        "total": status_mod.count_fills(conn, mode=mode),
+        "fills": status_mod.recent_fills(
+            conn, limit, offset, mode=mode, asset=asset
+        ),
+        "total": status_mod.count_fills(conn, mode=mode, asset=asset),
         "limit": int(limit),
         "offset": int(offset),
     }
@@ -313,26 +319,36 @@ async def api_fills(
 async def api_trades(
     limit: int = Query(100, ge=1, le=500),
     mode: str | None = Query(None),
+    asset: str | None = Query(None),
     _: None = Depends(_require_auth),
 ) -> dict[str, Any]:
     conn = _conn()
-    rounds = status_mod.rounds_with_pnl(conn, limit, mode=mode)
+    rounds = status_mod.rounds_with_pnl(
+        conn, limit, mode=mode, asset=asset
+    )
     return {
         "rounds": rounds,
-        "fills": status_mod.recent_fills(conn, limit * 2, mode=mode),
+        "fills": status_mod.recent_fills(
+            conn, limit * 2, mode=mode, asset=asset
+        ),
         "stats": status_mod.compute_stats(rounds),
         "quality": status_mod.execution_quality(conn),
+        "assets": list(getattr(_state(), "assets", []) or []),
     }
 
 
 @app.get("/api/rounds/{round_start_ts}/fills")
 async def api_round_fills(
     round_start_ts: int,
+    asset: str | None = Query(None),
     _: None = Depends(_require_auth),
 ) -> dict[str, Any]:
     return {
         "round_start_ts": round_start_ts,
-        "fills": status_mod.fills_for_round(_conn(), round_start_ts),
+        "asset": asset,
+        "fills": status_mod.fills_for_round(
+            _conn(), round_start_ts, asset=asset
+        ),
     }
 
 

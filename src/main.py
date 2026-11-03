@@ -1,21 +1,25 @@
-"""Polymarket BTC 15m Up/Down — GTD Martingale Bot.
+"""Polymarket multi-asset 1h Up/Down — pure GTD Martingale Bot.
+
+One process trades BTC, ETH, BNB, XRP, SOL, DOGE and HYPE independently.
+Each asset gets its own StrategyEngine / Position / 2-4-8-16 ladder; the
+CLOB client, OrderManager, UserWS, market WS and dashboard are shared.
 
 Entry point. Coordinates:
-  1. WindowManager — tracks 15-min window boundaries
-  2. BinanceFeed   — BTC spot WS + ring buffer
-  3. MarketWS      — CLOB market data WS (last_trade_price)
-  4. MarketDiscovery — Gamma REST to find market metadata
-  5. StrategyEngine — decision loop (emits typed Actions)
-  6. OrderManager   — serialised order executor
-  7. TierWatcher    — one per in-flight GTD, polls balance + cancels
-  8. HeartbeatLoop  — independent keepalive
+  1. WindowManager — one hourly boundary for all seven markets
+  2. MarketWS      — shared CLOB market data WS (mid/last trade)
+  3. MarketService — Gamma REST market discovery
+  4. StrategyEngine (×7) — pure price martingale, no signal gates
+  5. OrderManager  — serialised order executor shared by every asset
+  6. TierWatcher   — one per in-flight GTD, passive lifecycle observer
+  7. HeartbeatLoop — independent keepalive
 
 Usage:
   pip install -e .              # install dependencies
   cp .env.example .env          # fill in credentials
   python -m src.main            # start bot
 
-All trading is live. DRY_RUN has been removed.
+PAPER_TRADING selects local simulation vs live CLOB orders; the mode is
+locked per round at T1 and can be changed from the dashboard.
 
 H-NEW-2026-07-11 refactor:
   - BUY/TP GTDs post at the **strategy price exactly** (no orderbook snap).
@@ -41,7 +45,7 @@ from src.clob_l1_auth import create_or_derive_clob_api_creds, ClobL1Error
 from src.execution.clob_client import CLOBClient
 from src.execution.gtd_expiry_watcher import GtdExpiryWatcher
 from src.execution.heartbeat import HeartbeatLoop
-from src.execution.mode_router import ModeRouter
+from src.execution.mode_router import ModeRouter, RouterGroup
 from src.execution.order_manager import OrderManager
 from src.execution.paper_broker import PaperBroker
 from src.execution.tier_watcher import TierWatcher, WatcherResult
@@ -232,7 +236,22 @@ class AppState:
         # Emergency stop. Loaded from disk so a restart/redeploy does not
         # silently resume trading after the operator pressed stop.
         self.killswitch = KillSwitch.load()
-        # External-signal layer (2026-11-02).
+        # ── Multi-asset universe (2026-11-03) ─────────────────────────────
+        # Every asset gets its own StrategyEngine / Position / router /
+        # paper broker; the CLOB client, OrderManager, UserWS, market WS,
+        # price cache and dashboard are shared.
+        self.assets: list[str] = []
+        self.engines: dict[str, "StrategyEngine"] = {}
+        self.markets: dict[str, object | None] = {}
+        self.market_tokens: dict[str, set[str]] = {}
+        self.condition_ids: set[str] = set()
+        self.live_routers: dict[str, "ActionRouter"] = {}
+        self.mode_routers: dict[str, object] = {}
+        self.paper_brokers: dict[str, PaperBroker] = {}
+        self.decision_loops: dict[str, DecisionLoop] = {}
+        self.gtd_expiries: dict[str, GtdExpiryWatcher] = {}
+        # External-signal layer is no longer wired (pure martingale); these
+        # attributes remain for older tests/dashboard code paths.
         self.event_calendar = None
         self.macro_signals: MacroSignals | None = None
         self.signal_5m: Signal5mFeed | None = None
@@ -271,6 +290,31 @@ class AppState:
         # aborting the TP sell path even though the GTD BUY is live on the
         # CLOB. Mirrors the same pattern used in `GtdExpiryWatcher._bg_tasks`.
         self._bg_tasks: set[asyncio.Task[None]] = set()
+
+    # ── Multi-asset routing helpers ──────────────────────────────────────
+
+    def engine_for_order(self, server_order_id: str):
+        """Resolve the engine that owns a server order id."""
+        om = getattr(self, "order_manager", None)
+        tracked = om.by_server_id(server_order_id) if om else None
+        if tracked is None:
+            return None
+        return self.engines.get(str(tracked.asset).upper())
+
+    def engine_for_token(self, token_id: str):
+        """Resolve the engine that owns an outcome token id."""
+        for asset, tokens in self.market_tokens.items():
+            if token_id in tokens:
+                return self.engines.get(asset)
+        return None
+
+    def watcher_for_order(self, server_order_id: str):
+        """Find the per-asset TierWatcher tracking a server order id."""
+        for router in self.live_routers.values():
+            watcher = router.watcher_for_server_order(server_order_id)
+            if watcher is not None:
+                return watcher
+        return None
 
 
 STATE = AppState()
@@ -422,8 +466,18 @@ class ActionRouter:
         expired, or crossed-into-next-tier).
     """
 
-    def __init__(self, state: AppState) -> None:
+    def __init__(
+        self,
+        state: AppState,
+        asset: str = "BTC",
+        engine: "StrategyEngine | None" = None,
+    ) -> None:
         self._state = state
+        self.asset = str(asset or "BTC").upper()
+        # Per-asset router: this engine is the only one whose position state
+        # these callbacks may touch. The shared AppState.engines map is used
+        # only for cross-asset fill attribution.
+        self._engine = engine
         # Strong refs to the spawned TierWatchers per (round, tier). Lets us
         # cancel them on round-end without losing the references.
         self._watchers: dict[tuple[int, int], TierWatcher] = {}
@@ -434,9 +488,15 @@ class ActionRouter:
         # know the (round, tier) tuple. Built on every spawn, dropped on
         # every terminal fire.
         self._watcher_by_server_id: dict[str, TierWatcher] = {}
-        # Convenience handle so other modules (e.g. _on_new_round cleanup)
-        # can call stop_all_watchers() without going through the engine.
-        state.router = self
+        # Bare-construction compatibility for tests: only claim the single
+        # state.router slot when no RouterGroup has been installed yet.
+        if getattr(state, "router", None) is None:
+            state.router = self
+
+    def _eng(self):
+        """The engine this router serves (falls back to state.engine for
+        legacy single-asset tests that construct the router first)."""
+        return self._engine or getattr(self._state, "engine", None)
 
     # ------------------------------------------------------------------
     # TierWatcher lifecycle helpers
@@ -518,10 +578,10 @@ class ActionRouter:
             stop_task.add_done_callback(self._state._bg_tasks.discard)
 
         cfg = strategy()
-        eng = self._state.engine
+        eng = self._eng()
 
         async def on_done(result: WatcherResult) -> None:
-            eng = self._state.engine
+            eng = self._eng()
             if not eng or not eng._round:
                 return
             tier_snap = eng._round.position.tiers[tier - 1]
@@ -746,7 +806,7 @@ class ActionRouter:
             )
 
         def is_active() -> bool:
-            eng = self._state.engine
+            eng = self._eng()
             return bool(eng and eng._round and eng._round.round_start_ts == round_start_ts)
 
         # H-NEW-2026-07-12: continuous ground-truth reconciliation.
@@ -781,7 +841,7 @@ class ActionRouter:
             fill_price: float,
             hint_result: "WatcherResult | None",
         ) -> None:
-            eng = self._state.engine
+            eng = self._eng()
             om = self._state.order_manager
             if not eng or not om or cumulative_size_matched <= 0:
                 return
@@ -920,7 +980,7 @@ class ActionRouter:
         cfg = strategy()
 
         async def on_done(result: WatcherResult) -> None:
-            eng = self._state.engine
+            eng = self._eng()
             if not eng or not eng._round:
                 return
             pos = eng._round.position
@@ -996,7 +1056,7 @@ class ActionRouter:
             derive the increment from OrderManager's monotonic
             `size_matched`, then let the engine book it.
             """
-            eng = self._state.engine
+            eng = self._eng()
             om = self._state.order_manager
             if not eng or not om or cumulative_size_matched <= 0:
                 return
@@ -1047,7 +1107,7 @@ class ActionRouter:
             )
 
         def is_active() -> bool:
-            eng = self._state.engine
+            eng = self._eng()
             return bool(eng and eng._round and eng._round.round_start_ts == round_start_ts)
 
         watcher = TierWatcher(
@@ -1081,7 +1141,7 @@ class ActionRouter:
         order is allowed for the same tier.
         """
         om = self._state.order_manager
-        eng = self._state.engine
+        eng = self._eng()
         clob = self._state.clob
         if not om or not eng or not eng._round or not clob or not server_order_id:
             return
@@ -1186,7 +1246,7 @@ class ActionRouter:
     # ------------------------------------------------------------------
 
     async def __call__(self, action: Action) -> None:
-        eng = self._state.engine
+        eng = self._eng()
         om = self._state.order_manager
         if not eng or not om:
             return
@@ -1225,6 +1285,7 @@ class ActionRouter:
                 round_start_ts=round_ts,
                 tier_name="T1",
                 tick_size=tick_size,
+                asset=self.asset,
             )
             if order:
                 expires = order.expires_at
@@ -1291,6 +1352,7 @@ class ActionRouter:
                 round_start_ts=round_ts,
                 tier_name=f"T{action.tier}",
                 tick_size=tick_size,
+                asset=self.asset,
             )
             if order:
                 expires = order.expires_at
@@ -1384,6 +1446,7 @@ class ActionRouter:
                             round_start_ts=round_ts,
                             tier_name="TP",
                             tick_size=tick_size,
+                            asset=self.asset,
                         )
                         if not order:
                             pos._tp_inflight = False
@@ -1444,6 +1507,7 @@ class ActionRouter:
                         round_start_ts=round_ts,
                         tier_name="TP",
                         tick_size=tick_size,
+                        asset=self.asset,
                     )
                     if order and not pos._tp_inflight:
                         # The engine abandoned the TP while the POST was in
@@ -1589,9 +1653,15 @@ class ActionRouter:
                         return
                     pos = eng._round.position
                     try:
-                        cancelled = await om.cancel_market(
-                            action.round_start_ts
-                        )
+                        try:
+                            cancelled = await om.cancel_market(
+                                action.round_start_ts, asset=self.asset
+                            )
+                        except TypeError:
+                            # Legacy test double / older manager.
+                            cancelled = await om.cancel_market(
+                                action.round_start_ts
+                            )
                         if cancelled:
                             log.warning(
                                 "router.stop_loss.cancelled_orders",
@@ -1613,6 +1683,7 @@ class ActionRouter:
                         round_start_ts=action.round_start_ts,
                         tier_name=f"SL{action.stage}",
                         tick_size=tick_size,
+                        asset=self.asset,
                     )
                     if not order:
                         log.error(
@@ -1864,7 +1935,6 @@ class ActionRouter:
         `size_filled += size`, which under delta semantics gives an exact sum,
         regardless of how many times WS / polling / FAK re-observe the order.
         """
-        eng = self._state.engine
         om = self._state.order_manager
 
         def on_fill(
@@ -1875,6 +1945,11 @@ class ActionRouter:
             fill_total_size: float,
             trader_side: str | None = None,
         ):
+            # All per-asset routers install the same dispatcher: resolve the
+            # engine from the order's asset so the fill always lands on the
+            # market that owns it.
+            resolver = getattr(self._state, "engine_for_order", None)
+            eng = resolver(order_id) if callable(resolver) else self._eng()
             if not eng or not om:
                 return
             if fill_total_size <= 0:
@@ -1976,93 +2051,112 @@ async def _on_binance_connect() -> None:
 
 
 def _on_market_discovered(asset: str, mkt) -> None:
-    """Called by WindowManager as soon as market info (token IDs) is resolved."""
+    """Called by WindowManager as soon as market info (token IDs) is resolved.
+
+    Runs once per asset discovery (boundary, retry and late-binding). The
+    per-asset token sets are merged into the shared MarketWS / UserWS
+    subscriptions so all seven hourly markets are streamed concurrently.
+    """
     state = STATE
+    asset = str(asset or "BTC").upper()
 
-    # Detect if this is a window transition (condition_id changed)
-    prev_up = getattr(state.current_market, "token_up_id", None) if state.current_market else None
-    prev_cid = getattr(state.current_market, "condition_id", "") if state.current_market else ""
-    is_transition = prev_cid and prev_cid != mkt.condition_id
+    prev_mkt = state.markets.get(asset)
+    prev_cid = getattr(prev_mkt, "condition_id", "") if prev_mkt else ""
+    prev_up = getattr(prev_mkt, "token_up_id", "") if prev_mkt else ""
+    is_transition = bool(prev_cid and prev_cid != mkt.condition_id)
 
-    # Clear old token prices from cache to avoid stale data
-    if state.current_market and state.price_cache:
-        old_up = getattr(state.current_market, "token_up_id", None)
-        old_down = getattr(state.current_market, "token_down_id", None)
-        for old_t in [old_up, old_down]:
-            if old_t and old_t != mkt.token_up_id and old_t != mkt.token_down_id:
-                state.price_cache.clear_token(old_t)
+    # Clear the previous window's tokens for THIS asset only.
+    old_tokens = set(state.market_tokens.get(asset, set()))
+    new_tokens = {
+        t for t in (mkt.token_up_id, mkt.token_down_id) if t
+    }
+    for old_token in old_tokens - new_tokens:
+        state.price_cache.clear_token(old_token)
+    state.market_tokens[asset] = new_tokens
+    state.markets[asset] = mkt
 
-    # Publish the market FIRST. A failure in the WS subscription must not
-    # leave `current_market` pointing at the previous (expired) window.
-    state.current_market = mkt
+    primary = state.assets[0] if state.assets else "BTC"
+    if asset == primary:
+        state.current_market = mkt
 
     # Late discovery: `_on_new_round` may have run before this market was
-    # listed (Gamma lag at the boundary), leaving the round metadata empty.
-    # The history row is written lazily on the first fill, so refresh the
-    # registered metadata now that the tokens are known.
+    # listed (Gamma lag at the boundary). Refresh the round metadata now
+    # that the tokens are known; the history row itself is written lazily
+    # on the first fill.
     om = getattr(state, "order_manager", None)
     register_round_meta = getattr(om, "set_round_meta", None)
     round_ts = mkt.round_start_ts or state.round_start_ts
     if callable(register_round_meta) and round_ts:
         register_round_meta(
             round_start_ts=round_ts,
+            asset=asset,
             slug=mkt.slug or None,
             condition_id=mkt.condition_id or None,
             up_token=mkt.token_up_id or None,
             down_token=mkt.token_down_id or None,
             tick_size=mkt.tick_size,
         )
-    if getattr(state, 'paper_broker', None) is not None and round_ts:
+    paper_brokers = getattr(state, "paper_brokers", None) or {}
+    broker = paper_brokers.get(asset) or getattr(state, "paper_broker", None)
+    if broker is not None and round_ts:
         try:
-            state.paper_broker.set_round_meta(round_ts, mkt)
+            broker.set_round_meta(round_ts, mkt)
         except Exception as exc:  # noqa: BLE001
-            log.warning("paper.round_meta_failed", error=str(exc))
+            log.warning(
+                "paper.round_meta_failed", asset=asset, error=str(exc)
+            )
 
+    # Market WS: union of every asset's current tokens. set_active_tokens
+    # replaces the subscription set, so send the full union each time.
     if state.market_ws:
         try:
-            # set_active_tokens replaces the subscription set (the 15m bot
-            # only ever trades this one market) and subscribes the new ids.
-            state.market_ws.set_active_tokens(
-                {mkt.token_up_id, mkt.token_down_id}
-            )
+            all_tokens: set[str] = set()
+            for tokens in state.market_tokens.values():
+                all_tokens.update(tokens)
+            if all_tokens:
+                state.market_ws.set_active_tokens(all_tokens)
         except Exception as exc:  # noqa: BLE001
             log.warning(
                 "market.subscribe_failed",
+                asset=asset,
                 cid=mkt.condition_id[:16],
                 error=str(exc),
                 note="engine still receives the market; MarketWS will "
                      "re-subscribe on its next reconnect",
             )
 
-    # User channel: Polymarket only pushes order/trade events for markets in
-    # the subscribe frame, so every window must be registered here. Without
-    # this the socket authenticated but never delivered a single fill event.
-    if state.user_ws and mkt.condition_id:
+    # User WS: Polymarket only pushes order/trade events for markets named
+    # in the subscribe frame. Send every current asset's condition id.
+    if state.user_ws:
+        current_cids = {
+            m.condition_id
+            for m in state.markets.values()
+            if m is not None and getattr(m, "condition_id", "")
+        }
+        state.condition_ids = set(current_cids)
         try:
-            state.user_ws.subscribe_markets([mkt.condition_id])
+            state.user_ws.subscribe_markets(sorted(current_cids))
         except Exception as exc:  # noqa: BLE001
             log.warning(
                 "user_ws.subscribe_markets_failed",
+                asset=asset,
                 cid=mkt.condition_id[:16],
                 error=str(exc),
             )
 
-    # Late discovery: the round may have started before this market was
-    # available (Gamma lag at the boundary). Bind the tokens to the
-    # already-created RoundState so the engine can trade this window.
-    eng = state.engine
+    # Late discovery: bind the tokens to the already-created RoundState.
+    engines = getattr(state, "engines", None) or {}
+    eng = engines.get(asset) or getattr(state, "engine", None)
     if eng is not None and eng._round is not None:
         try:
             eng.attach_market(mkt)
         except Exception:
             log.exception(
                 "market.attach_market_failed",
+                asset=asset,
                 cid=mkt.condition_id[:16],
             )
-        # A late (retry) discovery can run AFTER _on_new_round has already
-        # created the RoundState. If WindowManager's pre-check flagged this
-        # window as unsafe, apply the skip flag now.
-        ctx = state.wm.get("BTC") if state.wm else None
+        ctx = state.wm.get(asset) if state.wm else None
         if (
             ctx is not None
             and ctx.skip_until_next_window
@@ -2072,6 +2166,7 @@ def _on_market_discovered(asset: str, mkt) -> None:
             eng._round.skip_reason = "window_precheck"
             log.warning(
                 "round.skip.late_market",
+                asset=asset,
                 round_start_ts=eng._round.round_start_ts,
                 reason="window_precheck",
             )
@@ -2102,129 +2197,163 @@ def _on_market_discovered(asset: str, mkt) -> None:
 
 
 async def _on_new_round(round_start_ts: int) -> None:
-    """
-    Called by WindowManager on every 15-min boundary.
+    """Called by WindowManager on every hourly boundary.
 
-    Handles end-of-round cleanup. WindowManager's tick() also calls
-    fetch_at_window_open() which triggers `_on_window_baseline` to seed
-    the GateKeeper — so we no longer wait for a baseline here. Returning
-    promptly is important: this callback is awaited from WM's boundary
-    poller, and the previous 5-min `compute_baseline` wait loop blocked
-    the event loop for up to 5 minutes on every round transition.
+    Every asset shares the same boundary, so this is a two-phase sweep:
+    close the previous round for all seven engines, then seed the new
+    round for each asset from its own WindowContext market.
     """
     state = STATE
 
-    # End previous round
+    # ── End the previous round (all assets) ─────────────────────────────
     if state.round_start_ts > 0:
         prev = state.round_start_ts
-        # H-NEW-2026-07-11: stop any active TierWatchers so they don't
-        # fire after the round has rolled over. Watchers that already
-        # finished are no-ops.
         router = getattr(state, "router", None)
         if router is not None:
             try:
                 await router.stop_all_watchers()
             except Exception as exc:
                 log.warning("router.stop_all_watchers.error", error=str(exc))
-        if state.engine:
-            await state.engine.on_round_end()
+        for asset, eng in list(state.engines.items()):
+            try:
+                await eng.on_round_end()
+            except Exception as exc:  # noqa: BLE001
+                log.warning(
+                    "round.end_engine_failed", asset=asset, error=str(exc)
+                )
+        for asset, broker in list(state.paper_brokers.items()):
+            try:
+                await broker.cancel_round(prev)
+            except Exception as exc:  # noqa: BLE001
+                log.warning(
+                    "round.end_paper_failed", asset=asset, error=str(exc)
+                )
         if state.order_manager:
+            # asset=None: cancel every market that shares the boundary.
             await state.order_manager.cancel_market(prev)
-            # Refresh in-memory state against the CLOB before purging. This
-            # marks orders the server already dropped as terminal, so
-            # `purge_round` can safely remove them. Orders whose cancel was
-            # NOT confirmed stay live and are kept tracked (late fills are
-            # still attributed instead of being silently lost).
             try:
                 await state.order_manager.reconcile()
             except Exception as exc:
                 log.warning("round.reconcile_failed", error=str(exc))
-            # M-V4-1 fix: drop the previous round's TrackedOrders /
-            # server_id mappings / pending fills so the maps do not grow
-            # unbounded across rounds.
             purged = await state.order_manager.purge_round(prev)
             if purged:
                 log.info(
                     "round.purged_prev_state",
                     prev_round_start=prev, purged=purged,
                 )
-        log.info("round.transition", prev_round_start=prev, new_round_start=round_start_ts)
+        log.info(
+            "round.transition",
+            prev_round_start=prev, new_round_start=round_start_ts,
+        )
 
     state.round_start_ts = round_start_ts
 
-    # ── Use WindowManager for market discovery ─────────────────────────────────
-    # Note: market subscription (token IDs) is handled in _on_market_discovered.
-    # Always read the market from the CURRENT WindowContext and reject any
-    # market that belongs to a different round. The previous version trusted
-    # `state.current_market`, which still held the expired previous-window
-    # market when discovery failed at the boundary — and then traded it for
-    # the entire next 15 minutes.
-    mkt = None
-    if state.wm:
-        ctx = state.wm.get("BTC")
+    # ── Seed the new round for every asset ──────────────────────────────
+    # A stale market from the previous round is rejected; the engine starts
+    # without tokens and is late-bound by `_on_market_discovered`.
+    om = getattr(state, "order_manager", None)
+    register_round_meta = getattr(om, "set_round_meta", None)
+    for asset in state.assets:
+        ctx = state.wm.get(asset) if state.wm else None
         mkt = ctx.market if ctx else None
-        if mkt is not None and mkt.round_start_ts and mkt.round_start_ts != round_start_ts:
+        if (
+            mkt is not None
+            and mkt.round_start_ts
+            and mkt.round_start_ts != round_start_ts
+        ):
             log.warning(
                 "round.stale_market_rejected",
+                asset=asset,
                 round_start_ts=round_start_ts,
                 stale_market_round_ts=mkt.round_start_ts,
                 stale_slug=mkt.slug or "",
             )
             mkt = None
-    state.current_market = mkt
-    if mkt is None:
-        log.warning(
-            "round.market_not_found",
-            round_start_ts=round_start_ts,
-            note="waiting for WindowManager retry discovery; engine starts "
-                 "without tokens and is late-bound by _on_market_discovered",
-        )
+        state.markets[asset] = mkt
 
-    # Notify engine of new round. Baseline is now seeded by
-    # `_on_window_baseline` (called from WM.tick after fetch_at_window_open)
-    # — see main.py / window_manager.py.
-    if state.engine:
-        await state.engine.on_new_round(round_start_ts, mkt)
-    if getattr(state, 'paper_broker', None) is not None:
-        try:
-            state.paper_broker.begin_round(round_start_ts, mkt)
-        except Exception as exc:  # noqa: BLE001
-            log.warning("paper.begin_round_failed", error=str(exc))
-        # Honour the WindowManager window pre-checks (late boot / big
-        # cross-window BTC gap). Previously these flags were set but never
-        # consumed, so the "skip this window" protection did nothing.
-        ctx = state.wm.get("BTC") if state.wm else None
-        if (
-            ctx is not None
-            and ctx.skip_until_next_window
-            and state.engine._round is not None
-        ):
-            state.engine._round.skip_reason = "window_precheck"
-            log.warning(
-                "round.skip",
+        eng = state.engines.get(asset)
+        if eng is not None:
+            try:
+                await eng.on_new_round(round_start_ts, mkt)
+            except Exception as exc:  # noqa: BLE001
+                log.warning(
+                    "round.start_engine_failed",
+                    asset=asset,
+                    error=str(exc),
+                )
+            if (
+                ctx is not None
+                and ctx.skip_until_next_window
+                and eng._round is not None
+            ):
+                eng._round.skip_reason = "window_precheck"
+                log.warning(
+                    "round.skip",
+                    asset=asset,
+                    round_start_ts=round_start_ts,
+                    reason="window_precheck",
+                    note="WindowManager flagged this window as unsafe "
+                         "(late boot)",
+                )
+        broker = state.paper_brokers.get(asset)
+        if broker is not None:
+            try:
+                broker.begin_round(round_start_ts, mkt)
+            except Exception as exc:  # noqa: BLE001
+                log.warning(
+                    "paper.begin_round_failed", asset=asset, error=str(exc)
+                )
+
+        if callable(register_round_meta):
+            register_round_meta(
                 round_start_ts=round_start_ts,
-                reason="window_precheck",
-                note="WindowManager flagged this window as unsafe "
-                     "(late boot or cross-window BTC drift)",
+                asset=asset,
+                slug=mkt.slug if mkt else None,
+                condition_id=mkt.condition_id if mkt else None,
+                up_token=mkt.up_token if mkt else None,
+                down_token=mkt.down_token if mkt else None,
+                tick_size=mkt.tick_size if mkt else 0.01,
+            )
+        if mkt is None:
+            # Drop the expired window's tokens from the shared cache and
+            # subscription set; the retry/late discovery will add the new
+            # market's tokens.
+            for token in state.market_tokens.get(asset, set()):
+                state.price_cache.clear_token(token)
+            state.market_tokens[asset] = set()
+            log.warning(
+                "round.market_not_found",
+                asset=asset,
+                round_start_ts=round_start_ts,
+                note="waiting for WindowManager retry discovery; engine "
+                     "starts without tokens and is late-bound by "
+                     "_on_market_discovered",
             )
 
-    # Register the round's market metadata for the history table. The
-    # `rounds` row itself is written lazily by OrderManager on the first
-    # fill. Writing it here (the old behaviour) created a round record for
-    # every 15-min window — with an empty wallet every BUY is rejected, yet
-    # those windows showed up as "未平仓" open positions in the dashboard.
-    mkt = state.current_market
-    om = getattr(state, "order_manager", None)
-    register_round_meta = getattr(om, "set_round_meta", None)
-    if callable(register_round_meta):
-        register_round_meta(
-            round_start_ts=round_start_ts,
-            slug=mkt.slug if mkt else None,
-            condition_id=mkt.condition_id if mkt else None,
-            up_token=mkt.up_token if mkt else None,
-            down_token=mkt.down_token if mkt else None,
-            tick_size=mkt.tick_size if mkt else 0.01,
-        )
+    primary = state.assets[0] if state.assets else "BTC"
+    state.current_market = state.markets.get(primary)
+
+    # Re-publish the union of live subscriptions (drops expired tokens even
+    # when one asset's discovery failed).
+    if state.market_ws:
+        try:
+            all_tokens: set[str] = set()
+            for tokens in state.market_tokens.values():
+                all_tokens.update(tokens)
+            state.market_ws.set_active_tokens(all_tokens)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("market.resubscribe_failed", error=str(exc))
+    if state.user_ws:
+        current_cids = {
+            m.condition_id
+            for m in state.markets.values()
+            if m is not None and getattr(m, "condition_id", "")
+        }
+        state.condition_ids = set(current_cids)
+        try:
+            state.user_ws.subscribe_markets(sorted(current_cids))
+        except Exception as exc:  # noqa: BLE001
+            log.warning("user_ws.resubscribe_failed", error=str(exc))
 
 
 # ---------------------------------------------------------------------------
@@ -2249,7 +2378,7 @@ _RESOLUTION_BATCH = 50
 
 
 async def _resolve_rounds_once(
-    state: AppState, attempts: dict[int, int]
+    state: AppState, attempts: dict[tuple[int, str], int]
 ) -> int:
     """Resolve ended rounds whose outcome is not yet in the DB.
 
@@ -2274,16 +2403,29 @@ async def _resolve_rounds_once(
         return 0
 
     resolved_count = 0
-    for round_ts, cid, slug, up_token, down_token in rows:
+    for row in rows:
+        if len(row) >= 6:
+            round_ts, cid, slug, up_token, down_token, asset = row[:6]
+            legacy_key = False
+        else:
+            # Legacy single-asset DB / test double.
+            round_ts, cid, slug, up_token, down_token = row[:5]
+            asset = "BTC"
+            legacy_key = True
         # Both token ids are required to attribute the held side. Rows
         # written by very old builds may lack them; they cannot be
         # settled from Gamma's UP/DOWN outcome alone.
         if not up_token or not down_token:
             continue
-        tries = attempts.get(round_ts, 0)
+        key = (
+            int(round_ts)
+            if legacy_key
+            else (int(round_ts), str(asset or "BTC").upper())
+        )
+        tries = attempts.get(key, 0)
         if tries >= _RESOLUTION_MAX_ATTEMPTS:
             continue
-        attempts[round_ts] = tries + 1
+        attempts[key] = tries + 1
         try:
             res = await asyncio.wait_for(
                 pm.get_market_resolution(cid, slug=slug or None),
@@ -2294,6 +2436,7 @@ async def _resolve_rounds_once(
         except Exception as exc:  # noqa: BLE001
             log.warning(
                 "round.resolve.failed",
+                asset=asset,
                 round_start_ts=round_ts, cid=(cid or "")[:12], error=str(exc),
             )
             continue
@@ -2301,17 +2444,25 @@ async def _resolve_rounds_once(
             continue
         up_won = bool(res.get("up_wins"))
         try:
-            db.set_round_resolution(round_ts, up_won)
+            try:
+                db.set_round_resolution(
+                    round_ts, up_won, asset=str(asset or "BTC").upper()
+                )
+            except TypeError:
+                # Legacy test double / older DB method.
+                db.set_round_resolution(round_ts, up_won)
         except Exception as exc:  # noqa: BLE001
             log.warning(
                 "round.resolve.persist_failed",
+                asset=asset,
                 round_start_ts=round_ts, error=str(exc),
             )
             continue
-        attempts.pop(round_ts, None)
+        attempts.pop(key, None)
         resolved_count += 1
         log.info(
             "round.resolved",
+            asset=asset,
             round_start_ts=round_ts,
             slug=slug or "",
             up_won=up_won,
@@ -2321,14 +2472,18 @@ async def _resolve_rounds_once(
     # Bound the attempts map on a long-lived process.
     if len(attempts) > 500:
         cutoff = int(time.time()) - _RESOLUTION_LOOKBACK_S
-        for ts in [t for t in attempts if t < cutoff]:
-            attempts.pop(ts, None)
+        stale = [
+            k for k in attempts
+            if (k[0] if isinstance(k, tuple) else k) < cutoff
+        ]
+        for key in stale:
+            attempts.pop(key, None)
     return resolved_count
 
 
 async def _resolution_loop() -> None:
     """Poll Gamma for the outcome of ended rounds (settlement accounting)."""
-    attempts: dict[int, int] = {}
+    attempts: dict[tuple[int, str], int] = {}
     while True:
         try:
             await _resolve_rounds_once(STATE, attempts)
@@ -2344,81 +2499,83 @@ async def _resolution_loop() -> None:
 # ---------------------------------------------------------------------------
 
 async def _paper_tick_loop(state: AppState) -> None:
-    """Drive the paper broker's resting GTD fill/expiry simulation."""
+    """Drive every paper broker's resting GTD fill/expiry simulation."""
     while True:
-        broker = state.paper_broker
-        if broker is not None:
+        for asset, broker in list(state.paper_brokers.items()):
             try:
                 broker.tick()
             except Exception:  # noqa: BLE001
-                log.exception("paper.tick_failed")
+                log.exception("paper.tick_failed", asset=asset)
         await asyncio.sleep(0.1)
 
 
 async def _midpoint_poll_loop() -> None:
-    """Poll /midpoint REST API every 2s to keep stable price cache updated."""
-    last_condition_id = ""
+    """Poll /midpoint for every asset every 2s to keep the cache fresh.
+
+    The strategy still decides solely from its 250 ms DecisionLoop tick;
+    this loop only refreshes the shared PriceCache. Seven assets × two
+    tokens are fetched concurrently — the signal-layer order-book depth
+    calls were removed with the pure-martingale refactor.
+    """
+    last_condition_ids: dict[str, str] = {}
     while True:
         await asyncio.sleep(2.0)
         s = STATE
         if not s.pm_client:
             continue
 
-        wm = s.wm
-        if not wm:
+        targets: list[tuple[str, object]] = []
+        for asset in s.assets:
+            ctx = s.wm.get(asset) if s.wm else None
+            mkt = ctx.market if ctx else s.markets.get(asset)
+            if (
+                mkt is None
+                or not getattr(mkt, "token_up_id", "")
+                or not getattr(mkt, "token_down_id", "")
+            ):
+                continue
+            targets.append((asset, mkt))
+
+        if not targets:
             continue
 
-        ctx = wm.get("BTC")
-        mkt = ctx.market if ctx else None
-        if not mkt or not mkt.token_up_id or not mkt.token_down_id:
-            continue
-
-        condition_id = mkt.condition_id or ""
-        up_token = mkt.token_up_id
-        down_token = mkt.token_down_id
-
-        # Log window transition when condition_id changes
-        if condition_id != last_condition_id and last_condition_id:
-            log.info(
-                "midpoint.window_changed",
-                prev_condition_id=last_condition_id[:16],
-                new_condition_id=condition_id[:16],
-                up_token=up_token[:16],
-                down_token=down_token[:16],
-                round_start_ts=mkt.round_start_ts,
-            )
-        last_condition_id = condition_id
-
-        try:
-            up_mid = await s.pm_client.get_midpoint(up_token)
-            down_mid = await s.pm_client.get_midpoint(down_token)
-            s.price_cache.midpoint[up_token] = up_mid
-            s.price_cache.midpoint[down_token] = down_mid
-            # Top-5 depth for the microstructure signal gates. Failure is
-            # best-effort; the WS best bid/ask remains available.
+        async def _mid(token_id: str) -> float:
             try:
-                books = await asyncio.gather(
-                    s.pm_client.get_order_book(up_token),
-                    s.pm_client.get_order_book(down_token),
-                    return_exceptions=True,
-                )
-                for token, book in zip((up_token, down_token), books):
-                    if isinstance(book, dict):
-                        s.price_cache.set_book(
-                            token, book.get("bids"), book.get("asks")
-                        )
-            except Exception as exc:  # noqa: BLE001
-                log.debug("midpoint.book_failed", error=str(exc))
+                return float(await s.pm_client.get_midpoint(token_id))
+            except Exception:  # noqa: BLE001
+                return 0.0
 
-            # B-1 fix (single-driver): the strategy decision loop is now
-            # driven solely by DecisionLoop on a 250ms tick. The midpoint
-            # poll here only refreshes the price cache; it no longer
-            # re-enters _evaluate. Previously both this loop and
-            # DecisionLoop would invoke _evaluate, which combined with the
-            # engine's _eval_inflight drop-on-re-entry guard produced
-            # redundant work and confusing log timing.
-        except Exception as exc:
-            log.warning("midpoint.poll error", condition_id=condition_id[:16], up_token=up_token[:16], down_token=down_token[:16], error=str(exc))
+        # Fetch all 14 midpoints concurrently so one slow endpoint cannot
+        # serialise the other six assets' price refresh.
+        async def _pair(mkt) -> tuple[float, float]:
+            return await asyncio.gather(
+                _mid(mkt.token_up_id), _mid(mkt.token_down_id)
+            )
+
+        results = await asyncio.gather(
+            *(_pair(mkt) for _asset, mkt in targets)
+        )
+        for (asset, mkt), (up_mid, down_mid) in zip(targets, results):
+            up_token = mkt.token_up_id
+            down_token = mkt.token_down_id
+            cid = mkt.condition_id or ""
+            prev_cid = last_condition_ids.get(asset, "")
+            if cid != prev_cid and prev_cid:
+                log.info(
+                    "midpoint.window_changed",
+                    asset=asset,
+                    prev_condition_id=prev_cid[:16],
+                    new_condition_id=cid[:16],
+                    up_token=up_token[:16],
+                    down_token=down_token[:16],
+                    round_start_ts=mkt.round_start_ts,
+                )
+            last_condition_ids[asset] = cid
+
+            if up_mid > 0:
+                s.price_cache.midpoint[up_token] = up_mid
+            if down_mid > 0:
+                s.price_cache.midpoint[down_token] = down_mid
 
 
 # ---------------------------------------------------------------------------
@@ -2426,8 +2583,10 @@ async def _midpoint_poll_loop() -> None:
 # ---------------------------------------------------------------------------
 
 
-def _audit_gtd_invariants(s: AppState) -> None:
-    """Audit the GTD invariants every STATUS tick (5 s).
+def _audit_gtd_invariants(
+    s: AppState, asset: str = "BTC", eng: "StrategyEngine | None" = None
+) -> None:
+    """Audit the GTD invariants every STATUS tick (5 s), per asset.
 
     Emits ERROR (not just a debug line) when one is violated so an operator
     can act immediately:
@@ -2436,7 +2595,7 @@ def _audit_gtd_invariants(s: AppState) -> None:
       3. a tier never spends more than its configured notional
       4. total committed exposure never exceeds the configured cap
     """
-    eng = s.engine
+    eng = eng or getattr(s, "engines", {}).get(asset) or s.engine
     om = s.order_manager
     if not eng or not eng._round or not om:
         return
@@ -2447,6 +2606,7 @@ def _audit_gtd_invariants(s: AppState) -> None:
     if committed > cap + 0.01:
         log.error(
             "invariant.round_over_committed",
+            asset=asset,
             committed=round(committed, 4),
             cap=cap,
             note="round exposure exceeds total_max_notional",
@@ -2460,7 +2620,14 @@ def _audit_gtd_invariants(s: AppState) -> None:
     # 2026-10-30: T1/T3 filled normally but warned every 5 s until the
     # window ended).
     live_by_tier: dict[str, list[str]] = {}
-    for order in om.open_orders_for_round(s.round_start_ts):
+    try:
+        live_orders = om.open_orders_for_round(
+            s.round_start_ts, asset=asset
+        )
+    except TypeError:
+        # Legacy single-asset test doubles / older managers take one arg.
+        live_orders = om.open_orders_for_round(s.round_start_ts)
+    for order in live_orders:
         live_by_tier.setdefault(order.tier_name, []).append(
             order.client_order_id
         )
@@ -2469,6 +2636,7 @@ def _audit_gtd_invariants(s: AppState) -> None:
         if tier.cost_filled > tier.notional + 0.01:
             log.error(
                 "invariant.tier_over_budget",
+                asset=asset,
                 tier=tier.tier,
                 spent=round(tier.cost_filled, 4),
                 notional=tier.notional,
@@ -2478,6 +2646,7 @@ def _audit_gtd_invariants(s: AppState) -> None:
         if live_ids and not tier.watching:
             log.warning(
                 "invariant.tier_placed_without_watcher",
+                asset=asset,
                 tier=tier.tier,
                 live_client_ids=live_ids[:4],
                 note="a live GTD for this tier has no TierWatcher; terminal "
@@ -2488,6 +2657,7 @@ def _audit_gtd_invariants(s: AppState) -> None:
         if len(client_ids) > 1:
             log.error(
                 "invariant.duplicate_live_orders",
+                asset=asset,
                 tier=tier_name,
                 count=len(client_ids),
                 client_ids=client_ids[:4],
@@ -2508,117 +2678,97 @@ async def _status_loop() -> None:
             continue
         last_status_ts = now
 
-        bc = s.binance_cache.last_price
-        gate_str = ""
-        if s.engine and s.engine._gate and bc > 0:
-            gs = s.engine._gate.state(bc)
-            flag = "PASS" if gs.within_limit else "FAIL"
-            # H-V6-1 fix: print baseline as well as drift so the log line
-            # is self-contained — operators can sanity-check the gate
-            # without cross-referencing earlier events. The previous
-            # format only printed drift, hiding the case where the
-            # baseline was never set (gate_str="").
-            gate_str = (
-                f"baseline={gs.binance_baseline:,.1f} drift={gs.drift:.4f}[{flag}] |"
-            )
-        elif s.engine and s.engine._round:
-            # H-V6-1 fix: explicitly surface the case where baseline is
-            # still missing so the operator can distinguish "gate PASS"
-            # from "baseline not seeded yet" — both produce an empty
-            # gate_str in the legacy format.
-            gate_str = "baseline=pending |"
-
         wm = s.wm
-        mkt = wm.get("BTC").market if wm and wm.get("BTC") else None
-        up_token = mkt.up_token if mkt else ""
-        down_token = mkt.down_token if mkt else ""
-        up_last = s.price_cache.get_midpoint(up_token) if up_token else 0
-        down_last = s.price_cache.get_midpoint(down_token) if down_token else 0
-
         next_in = wm.seconds_until_next() if wm else 0
-        period_s = wm.window_period_s() if wm else 900
-        # H-V6-15: STATUS no longer shows absolute window_end timestamp —
-        # operators found it useless (had to mentally diff against current
-        # time) and the rich status (e.g. `window_end=08:15:00(272s)`)
-        # crowded out the more useful "are we still inside the T1 entry
-        # window?" signal. Replace with:
-        #   - `remain=Xs/Ys`  — X = seconds left in current window,
-        #                        Y = total window length (e.g. 900 for BTC 15m)
-        #   - `window=[IN_T1|PAST_T1]` — IN_T1 means T1 entry is still
-        #                                allowed (elapsed < T1_ENTRY_WINDOW_S);
-        #                                PAST_T1 means we've crossed the
-        #                                time gate and no fresh T1 will fire
-        #                                this window.
-        # Clamp `next_in` to [0, period_s] because the 5s STATUS interval
-        # can sample right at the rollover where the boundary calc briefly
-        # returns a tiny negative number.
+        period_s = wm.window_period_s() if wm else 3600
         remain_s = max(0, min(period_s, next_in))
         elapsed_s = max(0, period_s - remain_s)
         t1_entry_window_s = strategy().T1_ENTRY_WINDOW_S
-        # `ENTER_OK` is the canonical IN_T1 label — it is the same predicate
-        # the engine uses inside `_check_t1_entry` to gate entry, so STATUS
-        # and engine are guaranteed to agree.
         t1_status = "IN_T1" if elapsed_s <= t1_entry_window_s else "PAST_T1"
-        # When the window is within 1s of ending, STATUS flips to `END` so
-        # operators immediately see "this round is over" without having to
-        # read the seconds count.
         if remain_s < 1.0:
             t1_status = "END"
-        window_str = f"window=[{t1_status}] remain={remain_s:.0f}s/{period_s:.0f}s"
-
-        # Position state
-        pos_str = ""
-        if s.engine and s.engine._round and s.engine._round.position:
-            pos = s.engine._round.position
-            tiers_str = ",".join(
-                f"T{t.tier}={'✓' if t.is_complete else ('⏳' if t.placed else '○')}"
-                for t in pos.tiers
-            )
-            # H-V6-12 (operator request): STATUS should show live position
-            # cost basis + unrealized PnL%, so operators can see fill impact
-            # at a glance instead of cross-referencing position.fill_recorded
-            # events. Up / Down midpoint is already on the line as up_last /
-            # down_last; pick the one matching position.entry_side.
-            held_mid = 0.0
-            if pos.entry_side == "UP":
-                held_mid = up_last
-            elif pos.entry_side == "DOWN":
-                held_mid = down_last
-            has_pos = pos.avg_cost > 0 and pos.total_qty > 0 and held_mid > 0
-            if has_pos:
-                unreal_pnl = (held_mid - pos.avg_cost) * pos.total_qty
-                unreal_pnl_pct = (held_mid - pos.avg_cost) / pos.avg_cost
-                pnl_pct_str = f"({unreal_pnl_pct * 100:+.1f}%)"
-                sign = "+" if unreal_pnl > 0 else ("-" if unreal_pnl < 0 else "")
-                upnl_str = f"${sign}{abs(unreal_pnl):.2f}{pnl_pct_str}"
-            else:
-                upnl_str = "$0.00"
-            # H-NEW-2026-07-11: also show the live take-profit target so
-            # operators see "how far away from TP" without cross-referencing
-            # position.fill_recorded events. Returns None when avg_cost<=0.
-            tp_target = pos.tp_target()
-            tp_str = f" tpTarget={tp_target:.4f}" if tp_target is not None else ""
-            side_str = pos.entry_side or "-"
-            pos_str = (
-                f" | side={side_str} tiers=[{tiers_str}]"
-                f" qty={pos.total_qty:.2f}"
-                f" avg={pos.avg_cost:.4f}"
-                f" cost=${pos.total_cost:.2f}"
-                f" mid={held_mid:.4f}"
-                f" uPnL={upnl_str}"
-                f"{tp_str}"
-            )
-
-        # Runtime audit of the duplicate / over-allocation invariants.
-        _audit_gtd_invariants(s)
+        window_str = (
+            f"window=[{t1_status}] remain={remain_s:.0f}s/{period_s:.0f}s"
+        )
 
         ks = getattr(s, "killswitch", None)
         stop_str = " [STOPPED]" if (ks is not None and ks.active) else ""
-        log.info(
-            f"STATUS{stop_str}  binance={bc:,.1f}  {gate_str}"
-            f"  {window_str}  "
-            f"UP={up_last:.4f}  DOWN={down_last:.4f}{pos_str}"
-        )
+
+        for asset in s.assets or ["BTC"]:
+            eng = s.engines.get(asset)
+            mkt = s.markets.get(asset)
+            up_token = getattr(mkt, "token_up_id", "") if mkt else ""
+            down_token = getattr(mkt, "token_down_id", "") if mkt else ""
+            up_last = (
+                s.price_cache.get_midpoint(up_token) if up_token else 0.0
+            )
+            down_last = (
+                s.price_cache.get_midpoint(down_token) if down_token else 0.0
+            )
+
+            pos_str = ""
+            mode_str = "-"
+            if eng is not None and eng._round is not None:
+                rs = eng._round
+                mode_str = rs.mode or "pending"
+                pos = rs.position
+                tiers_str = ",".join(
+                    f"T{t.tier}="
+                    f"{'✓' if t.is_complete else ('⏳' if t.placed else '○')}"
+                    for t in pos.tiers
+                )
+                held_mid = 0.0
+                if pos.entry_side == "UP":
+                    held_mid = up_last
+                elif pos.entry_side == "DOWN":
+                    held_mid = down_last
+                has_pos = (
+                    pos.avg_cost > 0 and pos.total_qty > 0 and held_mid > 0
+                )
+                if has_pos:
+                    unreal_pnl = (
+                        held_mid - pos.avg_cost
+                    ) * pos.total_qty
+                    unreal_pnl_pct = (
+                        held_mid - pos.avg_cost
+                    ) / pos.avg_cost
+                    sign = (
+                        "+" if unreal_pnl > 0
+                        else ("-" if unreal_pnl < 0 else "")
+                    )
+                    upnl_str = (
+                        f"${sign}{abs(unreal_pnl):.2f}"
+                        f"({unreal_pnl_pct * 100:+.1f}%)"
+                    )
+                else:
+                    upnl_str = "$0.00"
+                tp_target = pos.tp_target()
+                tp_str = (
+                    f" tpTarget={tp_target:.4f}"
+                    if tp_target is not None else ""
+                )
+                pos_str = (
+                    f" | side={pos.entry_side or '-'}"
+                    f" tiers=[{tiers_str}]"
+                    f" qty={pos.total_qty:.2f}"
+                    f" avg={pos.avg_cost:.4f}"
+                    f" cost=${pos.total_cost:.2f}"
+                    f" mid={held_mid:.4f}"
+                    f" uPnL={upnl_str}"
+                    f"{tp_str}"
+                )
+                _audit_gtd_invariants(s, asset, eng)
+
+            market_str = (
+                f"mkt={'ok' if mkt is not None else 'none'}"
+            )
+            if mkt is not None:
+                market_str += f" round={getattr(mkt, 'round_start_ts', 0)}"
+            log.info(
+                f"STATUS[{asset}]{stop_str}  {window_str}  mode={mode_str}"
+                f"  {market_str}  UP={up_last:.4f}  DOWN={down_last:.4f}"
+                f"{pos_str}"
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -2691,29 +2841,32 @@ async def main() -> None:
         gamma_api="https://gamma-api.polymarket.com",
         polymarket_host=cfg_strategy.POLYMARKET_HOST,
     )
+    s.assets = cfg_strategy.trade_assets or ["BTC"]
     s.market_svc = MarketService(
         pm=s.pm_client,
         threshold=0.5,
-        slug_interval="15m",
-        window_sec=900,
+        slug_interval=str(cfg_strategy.MARKET_SLUG_INTERVAL or "1h"),
+        window_sec=int(cfg_strategy.MARKET_WINDOW_SEC or 3600),
     )
-    # BinanceSpotService: REST-based BTC spot (K-line backtrack for window-open price)
-    s.binance_spot = BinanceSpotService()
-    # WindowManager: unified window lifecycle (discovery + price sync + BTC drift guard)
-    # WindowManager internally polls 15-min boundaries and fires _on_new_round callback.
+    # Pure price martingale: no Binance spot feed and no drift/baseline
+    # gate. WindowManager still discovers every asset's hourly market and
+    # fires the shared boundary callback.
+    s.binance_spot = None
     s.wm = WindowManager(
         market_svc=s.market_svc,
-        symbols=["BTC"],
+        symbols=s.assets,
         on_new_round=_on_new_round,
         on_market_discovered=_on_market_discovered,
-        binance_spot=s.binance_spot,
+        binance_spot=None,
         entry_cfg=None,
-        # H-V6-1 fix: forward the K-line backfilled BTC spot at window_open
-        # to the strategy engine's GateKeeper. Replaces the previous lazy
-        # baseline seed (latest WS trade at the moment WM polled the
-        # boundary) which sat 1-15s off from the true window_open price and
-        # made the gate FAIL right after every round transition.
-        on_window_baseline=_on_window_baseline,
+        round_period_s=int(general().ROUND_PERIOD_S),
+        on_window_baseline=None,
+    )
+    log.info(
+        "bot.universe",
+        assets=s.assets,
+        slug_interval=str(cfg_strategy.MARKET_SLUG_INTERVAL or "1h"),
+        window_s=int(cfg_strategy.MARKET_WINDOW_SEC or 3600),
     )
 
     # ── Execution layer ─────────────────────────────────────────────────
@@ -2748,93 +2901,85 @@ async def main() -> None:
     s.clob.register_pending = s.order_manager.register_pending_server_id
     s.heartbeat = HeartbeatLoop(s.clob)
 
-    # ── GTD expiry watcher ──────────────────────────────────────────────
-    s.gtd_expiry = GtdExpiryWatcher(
-        order_manager=s.order_manager,
-        round_state_provider=lambda: s.engine._round if s.engine else None,
-        poll_interval_s=2.0,
-    )
+    # ── Per-asset execution routers + Strategy engines ──────────────────
+    # Both executors stay live for every asset so PAPER_TRADING can be
+    # toggled from the config page without a restart. The mode is locked
+    # per round at T1. All routers share one OrderManager / CLOB / wallet.
+    for asset in s.assets:
+        live_router = ActionRouter(s, asset=asset)
+        paper_broker = PaperBroker(
+            market=f"{asset}-1h",
+            asset=asset,
+            interval="1h",
+            price_cache=s.price_cache,
+            db=s.db,
+            killswitch=s.killswitch,
+            t1_entry_window_s=float(cfg_strategy.T1_ENTRY_WINDOW_S),
+        )
+        mode_router = ModeRouter(s, live_router, paper_broker, asset=asset)
+        engine = StrategyEngine(
+            s.binance_cache,
+            s.price_cache,
+            mode_router,
+            killswitch=s.killswitch,
+            signals=None,
+            asset=asset,
+        )
+        paper_broker.engine = engine
+        mode_router.engine = engine
+        live_router._engine = engine
 
-    # ── External signal layer (2026-11-02) ──────────────────────────────
-    # The 5m confirmation feed needs the shared MarketWS, so it is bound
-    # later in the Feeds section. Everything else is independent.
-    s.event_calendar = event_calendar.from_config()
-    s.macro_signals = MacroSignals(
-        symbol="BTCUSDT",
-        poll_s=float(cfg_strategy.SIGNAL_MACRO_POLL_S or 60.0),
-    )
-    s.signals = SignalEngine(
-        ring=s.ring,
-        price_cache=s.price_cache,
-        macro=s.macro_signals,
-        events=s.event_calendar,
-    )
+        s.live_routers[asset] = live_router
+        s.mode_routers[asset] = mode_router
+        s.paper_brokers[asset] = paper_broker
+        s.engines[asset] = engine
+        s.decision_loops[asset] = DecisionLoop(
+            engine, tick_interval_s=0.25
+        )
+        s.gtd_expiries[asset] = GtdExpiryWatcher(
+            order_manager=s.order_manager,
+            round_state_provider=(
+                lambda eng=engine: eng._round
+            ),
+            poll_interval_s=2.0,
+        )
 
-    # ── Live/paper execution router + Strategy engine ────────────────────
-    # Both executors stay live so PAPER_TRADING can be toggled from the
-    # config page without a restart. The mode is locked per round at T1.
-    live_router = ActionRouter(s)
-    s.paper_broker = PaperBroker(
-        market="BTC-15m",
-        asset="BTC",
-        interval="15m",
-        price_cache=s.price_cache,
-        db=s.db,
-        killswitch=s.killswitch,
-        t1_entry_window_s=float(cfg_strategy.T1_ENTRY_WINDOW_S),
-    )
-    mode_router = ModeRouter(s, live_router, s.paper_broker)
-    s.engine = StrategyEngine(
-        s.binance_cache,
-        s.price_cache,
-        mode_router,
-        killswitch=s.killswitch,
-        signals=s.signals,
-    )
-    s.paper_broker.engine = s.engine
-    mode_router.engine = s.engine
-    s.router = mode_router
+    # Backward-compatible aliases for the primary asset (and for the many
+    # single-asset tests/helpers that still read state.engine).
+    primary = s.assets[0]
+    s.engine = s.engines[primary]
+    s.paper_broker = s.paper_brokers[primary]
+    s.decision_loop = s.decision_loops[primary]
+    s.gtd_expiry = s.gtd_expiries[primary]
+    s.router = RouterGroup(s.mode_routers)
+    # Any per-asset router's callback dispatches by order asset, so one
+    # installation is enough.
+    s.clob.fill_callback = s.live_routers[primary]._make_fill_callback()
     log.info(
         "execution.mode",
         configured=("paper" if cfg_strategy.PAPER_TRADING else "live"),
-        note="mode is applied to the next T1; an open round keeps its "
-             "entry mode",
+        assets=s.assets,
+        note="mode is applied to the next T1 of each asset; an open round "
+             "keeps its entry mode",
     )
     log.info(
-        "signals.configured",
-        enabled=bool(cfg_strategy.SIGNAL_GATES_ENABLED),
-        log_only=bool(cfg_strategy.SIGNAL_GATES_LOG_ONLY),
-        event_calendar=str(s.event_calendar.path),
+        "execution.universe",
+        assets=s.assets,
+        ladder=cfg_strategy.tier_notionals,
+        drops=cfg_strategy.tier_drop_pcts,
+        t1_entry_window_s=float(cfg_strategy.T1_ENTRY_WINDOW_S),
+        signal_gates="disabled",
     )
-
-    # ── Decision loop — drives StrategyEngine._evaluate() on a fixed tick ──
-    # Fixes audit B-1: before this loop existed, nothing invoked _evaluate,
-    # so the entire decision core was dead code.
-    s.decision_loop = DecisionLoop(s.engine, tick_interval_s=0.25)
 
     # ── Feeds ───────────────────────────────────────────────────────────
-    s.binance_feed = BinanceFeed(
-        cache=s.binance_cache,
-        ring=s.ring,
-        on_connect=_on_binance_connect,
-    )
+    # The pure martingale needs only the CLOB midpoints (REST poller +
+    # shared market WS). No Binance spot feed or 5m signal market is used.
+    s.binance_feed = None
     s.market_ws = MarketWS(
         cache=s.price_cache,
         on_connect=None,
         on_disconnect=None,
     )
-    # Read-only BTC 5m feed used only by the 15m signal gates. It samples
-    # REST midpoints (every ~2s) and does not need a second market WS.
-    s.signal_5m = Signal5mFeed(
-        pm=s.pm_client,
-        price_cache=s.price_cache,
-        market_ws=None,
-        asset="BTC",
-        window_sec=300,
-        window_s=float(cfg_strategy.SIGNAL_5M_WINDOW_S or 300.0),
-    )
-    if s.signals is not None:
-        s.signals.set_tf5m(s.signal_5m)
 
     # ── User WebSocket (order events) ────────────────────────────────────
     # Use the RESOLVED credentials, not cfg_strategy.*: when the operator
@@ -2860,20 +3005,12 @@ async def main() -> None:
         s.user_ws = None
 
     # ── Start services ──────────────────────────────────────────────────
-    await s.binance_feed.start()
     await s.market_ws.start()
     await s.wm.start()
-    # Signal feeds are best-effort: an outage must never stop the bot.
-    try:
-        if s.macro_signals is not None:
-            await s.macro_signals.start()
-        if s.signal_5m is not None:
-            await s.signal_5m.start()
-    except Exception as exc:  # noqa: BLE001
-        log.warning("signals.start_failed", error=str(exc))
-    s.gtd_expiry.start()
-    if s.decision_loop:
-        s.decision_loop.start()
+    for expiry in s.gtd_expiries.values():
+        expiry.start()
+    for loop in s.decision_loops.values():
+        loop.start()
 
     if s.user_ws:
         await s.user_ws.start()
@@ -2972,14 +3109,10 @@ async def main() -> None:
                 await asyncio.gather(*still_running, return_exceptions=True)
         STATE._bg_tasks.clear()
 
-    if s.gtd_expiry:
-        await s.gtd_expiry.stop()
-    if s.decision_loop:
-        await s.decision_loop.stop()
-    if s.signal_5m:
-        await s.signal_5m.stop()
-    if s.macro_signals:
-        await s.macro_signals.stop()
+    for expiry in s.gtd_expiries.values():
+        await expiry.stop()
+    for loop in s.decision_loops.values():
+        await loop.stop()
     if s.wm:
         await s.wm.stop()
     if s.market_ws:
@@ -3029,7 +3162,6 @@ def _make_maker_fill_callback(state: AppState):
     `_total_qty`. We track trades we've already fired for in a bounded
     LRU on the closure — trade_id is 36 chars and well-behaved.
     """
-    eng = state.engine
     om = state.order_manager
     _seen_trades: set[str] = set()
     _SEEN_TRADES_LIMIT = 1024
@@ -3040,7 +3172,7 @@ def _make_maker_fill_callback(state: AppState):
     _TRADE_TOTALS_LIMIT = 4096
 
     def on_maker_fill(fill, candidates=None) -> None:
-        if not eng or not om:
+        if not om:
             return
 
         # ------------------------------------------------------------------
@@ -3251,15 +3383,31 @@ def _make_maker_fill_callback(state: AppState):
         )
         om.mark_filled(order_id)
 
-        # Route to engine with authoritative asset_id. Engine treats
+        # Route to the engine that owns this order's asset. Engine treats
         # `fill_size` as the per-event delta after the B-3 deduper / Lock
         # refactor (see engine.on_order_filled docstring). `fill_size_inc`
         # was derived above from either the REST delta or the WS
         # maker-row amount (minus the previous cumulative).
+        engines = getattr(state, "engines", None)
+        if engines:
+            eng = engines.get(str(tracked.asset).upper())
+        else:
+            # Legacy single-asset test stubs only expose state.engine.
+            eng = getattr(state, "engine", None)
+        if eng is None:
+            log.error(
+                "router.maker_fill.no_engine",
+                asset=tracked.asset,
+                order_id=order_id[:16],
+                note="fill mirrored into OrderManager but no engine owns "
+                     "this asset — position state was not advanced",
+            )
+            return
         eng.on_order_filled(asset_id, order_id, fill_price, fill_size_inc)
 
         log.info(
             "router.maker_fill",
+            asset=tracked.asset,
             maker_order_id=order_id,    # full id — never truncate
             asset_id=asset_id[:16],
             chosen_maker_amount=chosen[2],
@@ -3281,8 +3429,6 @@ def _make_user_ws_order_callback(state: AppState):
     Handles PLACEMENT (bind server order id), UPDATE (size_matched),
     and CANCELLATION events from the UserWS order channel.
     """
-    eng = state.engine
-
     def on_order(ev) -> None:  # ev: OrderEvent from user_ws.py
         # H-NEW-2026-07-11-3 (audit, prod 14:30 round): WSS User Channel
         # pushes order.UPDATE events with the AUTHORITATIVE cumulative
@@ -3294,7 +3440,8 @@ def _make_user_ws_order_callback(state: AppState):
         # closes the cross-tier mis-trigger window (T1 actually fills at
         # 14:31:15.620 but TierWatcher only learns at 14:31:16+ via REST
         # — T2 was already placed at 14:31:14).
-        if not eng:
+        om = state.order_manager
+        if not om:
             return
 
         order_id = ev.order_id
@@ -3306,9 +3453,15 @@ def _make_user_ws_order_callback(state: AppState):
             # knows about but the engine has not credited — otherwise
             # close_tp_order() would drop that residual from the position
             # forever.
-            om = state.order_manager
-            pos = eng._round.position if eng._round else None
-            tracked = om.by_server_id(order_id) if om else None
+            tracked = om.by_server_id(order_id)
+            eng = state.engines.get(
+                str(tracked.asset).upper()
+            ) if tracked else None
+            pos = (
+                eng._round.position
+                if eng is not None and eng._round
+                else None
+            )
             if (
                 pos is not None
                 and tracked is not None
@@ -3327,13 +3480,18 @@ def _make_user_ws_order_callback(state: AppState):
                             note="booked matched shares observed before the "
                                  "cancellation closed the TP snapshot",
                         )
-            eng.on_order_cancelled(order_id, reason="user_ws")
+            if eng is not None:
+                eng.on_order_cancelled(order_id, reason="user_ws")
+            else:
+                log.warning(
+                    "router.order_cancel.no_engine",
+                    order_id=order_id[:16],
+                    note="cancellation observed but no engine owns this "
+                         "asset; engine tier state was not cleared",
+                )
             return
 
         if evt_type == "UPDATE":
-            om = state.order_manager
-            if not om:
-                return
             tracked = om.by_server_id(order_id)
             if not tracked:
                 # Not ours — could be a stale UPDATE for an order we
@@ -3382,14 +3540,21 @@ def _make_user_ws_order_callback(state: AppState):
             # the residual GTD gets cancelled within ~1ms of the fill
             # (instead of waiting up to `_poll_s` seconds for the next
             # REST balance read).
-            router = state.router
-            if router is not None:
-                watcher = router.watcher_for_server_order(order_id)
-                if watcher is not None:
-                    watcher.receive_update(new_size_matched)
+            getter = getattr(state, "watcher_for_order", None)
+            if callable(getter):
+                watcher = getter(order_id)
+            else:
+                router = getattr(state, "router", None)
+                watcher = (
+                    router.watcher_for_server_order(order_id)
+                    if router is not None else None
+                )
+            if watcher is not None:
+                watcher.receive_update(new_size_matched)
             log.info(
                 "router.order_update.mirror_only",
                 order_id=order_id,        # full hash
+                asset=tracked.asset,
                 token=tracked.token_id[:16],
                 tier=tracked.tier_name,
                 size_matched=new_size_matched,

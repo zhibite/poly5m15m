@@ -249,3 +249,29 @@ dialog.modal[open] { animation: modal-in .18s ease-out; }
 .bt-conclusion { font-size: 13px; line-height: 1.65; color: #c9c9d6; background: #0a0a14; border: 1px solid #1e1e3a; border-left: 3px solid #7c3aed; border-radius: 8px; padding: 14px 16px; margin-bottom: 18px; }
 .bt-h3 { font-size: 13px; font-weight: 600; color: #9ca3af; margin: 20px 0 10px; text-transform: uppercase; letter-spacing: .05em; }
 .bt-assumptions { font-size: 12px; line-height: 1.7; color: #6b7280; margin-top: 18px; padding-top: 14px; border-top: 1px solid #1e1e3a; }
+
+/* ── Multi-asset dashboard (2026-11-03) ─────────────────────────────── */
+.asset-tabs { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 12px; }
+.asset-tab {
+  background: #12121f;
+  border: 1px solid #1e1e3a;
+  color: #a0a0b0;
+  border-radius: 6px;
+  padding: 6px 12px;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all .15s ease;
+}
+.asset-tab:hover { border-color: #3b3b63; color: #e0e0e0; }
+.asset-tab.active { background: #1e1b4b; border-color: #7c3aed; color: #e0e0e0; }
+.asset-link {
+  background: none;
+  border: none;
+  color: #a78bfa;
+  font-weight: 700;
+  font-size: 12px;
+  cursor: pointer;
+  padding: 0;
+}
+.asset-link:hover { text-decoration: underline; }

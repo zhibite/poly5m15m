@@ -1,10 +1,10 @@
 ###############################################################################
-# Polymarket BTC 15m Up/Down bot configuration
+# Polymarket multi-asset 1h Up/Down bot configuration
 ###############################################################################
 
 [GENERAL]
-ROUND_PERIOD_S = 900
-WINDOW_PRE_OPEN_S = 300
+ROUND_PERIOD_S = 3600
+WINDOW_PRE_OPEN_S = 600
 
 [BINANCE]
 WS_URL = "wss://stream.binance.com:9443/ws/btcusdt@trade"

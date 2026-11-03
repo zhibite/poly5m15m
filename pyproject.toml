@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "polymarket-gtd"
 version = "0.1.0"
-description = "Polymarket BTC 15m Up/Down martingale bot (post-only GTD)"
+description = "Polymarket multi-asset 1h Up/Down martingale bot (GTD entries)"
 requires-python = ">=3.11"
 dependencies = [
     "websockets>=12",

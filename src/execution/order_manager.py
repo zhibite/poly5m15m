@@ -65,6 +65,7 @@ class TrackedOrder:
     placed_size: float = 0.0
     size_matched: float = 0.0
     status: Literal["placed", "live", "filled", "cancelled", "expired"] = "placed"
+    asset: str = "BTC"  # BTC / ETH / BNB / XRP / SOL / DOGE / HYPE
 
 
 class OrderManager:
@@ -147,6 +148,7 @@ class OrderManager:
         self,
         round_start_ts: int,
         *,
+        asset: str = "BTC",
         slug: str | None = None,
         condition_id: str | None = None,
         up_token: str | None = None,
@@ -156,18 +158,16 @@ class OrderManager:
     ) -> None:
         """Register the current round's market metadata for lazy persistence.
 
-        Production 2026-10-30: `_on_new_round` used to INSERT a `rounds` row
-        at every 15-minute boundary, before — and regardless of — any order.
-        With an empty wallet (every BUY rejected by the CLOB) those windows
-        still appeared in the dashboard history as "未平仓" (open position)
-        rounds. Rounds are now written by `_ensure_round_row` on the first
-        fill, i.e. only when a buy actually happened; this method just
-        remembers the metadata that row needs.
+        Keyed by `(round_start_ts, asset)` because all seven assets share
+        the same hourly boundary. Rounds are written by `_ensure_round_row`
+        on the first fill, i.e. only when a buy actually happened; this
+        method just remembers the metadata that row needs.
 
         Called from `_on_new_round` (window open) and `_on_market_discovered`
         (late discovery, when the market was not listed at the boundary).
         """
-        self._round_meta[int(round_start_ts)] = {
+        key = (int(round_start_ts), str(asset).upper())
+        self._round_meta[key] = {
             "slug": slug,
             "condition_id": condition_id,
             "up_token": up_token,
@@ -180,8 +180,8 @@ class OrderManager:
         # metadata, and that late fill still needs the old round's metadata
         # for its lazy history row. Anything older can no longer fill.
         cutoff = int(round_start_ts) - 3600
-        for ts in [t for t in self._round_meta if t < cutoff]:
-            self._round_meta.pop(ts, None)
+        for key in [k for k in self._round_meta if k[0] < cutoff]:
+            self._round_meta.pop(key, None)
 
     def _ensure_round_row(self, order: TrackedOrder) -> None:
         """INSERT the round row for `order`, idempotently (best effort).
@@ -196,13 +196,21 @@ class OrderManager:
         if upsert is None:
             return
         meta = (getattr(self, "_round_meta", None) or {}).get(
-            order.round_start_ts, {}
+            (order.round_start_ts, str(order.asset).upper()), {}
         )
         try:
-            upsert(round_start_ts=order.round_start_ts, **meta)
+            upsert(
+                round_start_ts=order.round_start_ts,
+                asset=order.asset,
+                **meta,
+            )
         except Exception as exc:  # noqa: BLE001
             # Never let dashboard persistence break the trading path.
-            log.warning("order_manager.db_persist_round_failed", error=str(exc))
+            log.warning(
+                "order_manager.db_persist_round_failed",
+                asset=order.asset,
+                error=str(exc),
+            )
 
     def _persist_order(self, order: TrackedOrder) -> None:
         """Mirror a freshly created TrackedOrder into SQLite (best effort)."""
@@ -222,6 +230,7 @@ class OrderManager:
                 lifetime_s=int(order.lifetime_s),
                 expires_at=int(order.expires_at),
                 placed_at=int(order.placed_at),
+                asset=order.asset,
             )
             if order.status != "placed" or order.size_matched > 0:
                 self._persist_status(order)
@@ -313,6 +322,7 @@ class OrderManager:
                 ts_ms=int(time.time() * 1000),
                 trader_side=trader_side,
                 fee=fee,
+                asset=order.asset,
             )
         except Exception as exc:  # noqa: BLE001
             log.warning("order_manager.db_persist_fill_failed", error=str(exc))
@@ -558,11 +568,15 @@ class OrderManager:
     # Public read access
     # ------------------------------------------------------------------
 
-    def open_orders_for_round(self, round_start_ts: int) -> list[TrackedOrder]:
+    def open_orders_for_round(
+        self, round_start_ts: int, asset: str | None = None
+    ) -> list[TrackedOrder]:
+        wanted = str(asset).upper() if asset else None
         return [
             o for o in self._orders.values()
             if o.round_start_ts == round_start_ts
             and o.status in ("placed", "live")
+            and (wanted is None or str(o.asset).upper() == wanted)
         ]
 
     def by_server_id(self, server_order_id: str) -> TrackedOrder | None:
@@ -795,6 +809,7 @@ class OrderManager:
         tier_name: str,
         tick_size: float,
         lifetime_s: int | None = None,
+        asset: str = "BTC",
     ) -> TrackedOrder | None:
         """Place a GTD BUY at the engine's exact strategy price.
 
@@ -842,10 +857,15 @@ class OrderManager:
         # ActionRouter invocations could each call place_buy and post two
         # GTDs on the book, double-spending the tier's notional budget.
         # Cost is mechanical: an `open_orders_for_round` scan + early return.
-        for o in self.open_orders_for_round(round_start_ts):
-            if o.tier_name == tier_name and o.status in ("placed", "live"):
+        for o in self.open_orders_for_round(round_start_ts, asset=asset):
+            if (
+                o.tier_name == tier_name
+                and o.token_id == token_id
+                and o.status in ("placed", "live")
+            ):
                 log.warning(
                     "order_manager.buy_by_strategy_price.duplicate_tier",
+                    asset=asset,
                     token=token_id[:16],
                     tier=tier_name,
                     round=round_start_ts,
@@ -862,6 +882,7 @@ class OrderManager:
             lifetime_s=lifetime,
             # Skip the orderbook snap — keep the exact strategy price.
             price_lock=True,
+            asset=asset,
         )
 
     async def place_market_buy(
@@ -872,6 +893,7 @@ class OrderManager:
         round_start_ts: int,
         tier_name: str,
         tick_size: float,
+        asset: str = "BTC",
     ) -> TrackedOrder | None:
         """Buy `notional` USDC with a FAK market order (taker).
 
@@ -889,13 +911,19 @@ class OrderManager:
         price = float(limit_price)
         if price <= 0 or notional <= 0:
             return None
-        cid = f"{round_start_ts}-{tier_name}-{uuid.uuid4().hex[:8]}"
+        cid = f"{round_start_ts}-{asset}-{tier_name}-{uuid.uuid4().hex[:8]}"
 
         async with self._lock:
-            for existing in self.open_orders_for_round(round_start_ts):
-                if existing.tier_name == tier_name:
+            for existing in self.open_orders_for_round(
+                round_start_ts, asset=asset
+            ):
+                if (
+                    existing.tier_name == tier_name
+                    and existing.token_id == token_id
+                ):
                     log.warning(
                         "order_manager.market_buy.duplicate_tier",
+                        asset=asset,
                         token=token_id[:16],
                         tier=tier_name,
                         round=round_start_ts,
@@ -955,6 +983,7 @@ class OrderManager:
                 expires_at=0.0,
                 placed_at=time.time(),
                 status="filled",
+                asset=asset,
             )
             self._orders[cid] = order
             self._persist_order(order)
@@ -990,6 +1019,7 @@ class OrderManager:
         round_start_ts: int,
         tier_name: str,
         tick_size: float,
+        asset: str = "BTC",
     ) -> TrackedOrder | None:
         """Taker exit for a compact position (<5 shares).
 
@@ -1006,7 +1036,7 @@ class OrderManager:
         )
         if size <= 0:
             return None
-        cid = f"{round_start_ts}-{tier_name}-{uuid.uuid4().hex[:8]}"
+        cid = f"{round_start_ts}-{asset}-{tier_name}-{uuid.uuid4().hex[:8]}"
 
         async with self._lock:
             result = await self._clob.place_fak_sell_marketable(
@@ -1056,6 +1086,7 @@ class OrderManager:
                 expires_at=0.0,
                 placed_at=time.time(),
                 status="filled",
+                asset=asset,
             )
             self._orders[cid] = order
             self._persist_order(order)
@@ -1089,6 +1120,7 @@ class OrderManager:
         tier_name: str,
         tick_size: float,
         lifetime_s: int | None = None,
+        asset: str = "BTC",
     ) -> TrackedOrder | None:
         """Place a GTD SELL at an exact price (no orderbook snap).
 
@@ -1113,6 +1145,7 @@ class OrderManager:
             tick_size=tick_size,
             lifetime_s=gtd_lifetime,
             price_lock=True,   # use engine's exact price (no ask snap)
+            asset=asset,
         )
 
     # H-NEW-2026-07-15 (audit follow-up): `place_buy_by_notional` was
@@ -1135,6 +1168,7 @@ class OrderManager:
         tick_size: float,
         lifetime_s: int | None = None,
         price_lock: bool = False,
+        asset: str = "BTC",
     ) -> TrackedOrder | None:
         """Place a GTD BUY order. Returns TrackedOrder or None.
 
@@ -1176,7 +1210,7 @@ class OrderManager:
         cfg_lifetime = self._s.GTD_LIFETIME_S
         lifetime_s = int(lifetime_s) if lifetime_s is not None else cfg_lifetime
         effective_lifetime = max(lifetime_s, _CC.GTD_MIN_SEC + 1)
-        cid = f"{round_start_ts}-{tier_name}-{uuid.uuid4().hex[:8]}"
+        cid = f"{round_start_ts}-{asset}-{tier_name}-{uuid.uuid4().hex[:8]}"
 
         # H-NEW-2026-07-11: production callers always pass
         # `price_lock=True` via `place_buy_by_strategy_price`, so we post
@@ -1199,10 +1233,16 @@ class OrderManager:
             # TOCTOU: two concurrent callers can both pass it before either
             # acquires the lock. Re-check under the lock so a tier can never
             # have two live BUY GTDs (double-spending its notional).
-            for existing in self.open_orders_for_round(round_start_ts):
-                if existing.tier_name == tier_name:
+            for existing in self.open_orders_for_round(
+                round_start_ts, asset=asset
+            ):
+                if (
+                    existing.tier_name == tier_name
+                    and existing.token_id == token_id
+                ):
                     log.warning(
                         "order_manager.buy.duplicate_tier_rejected",
+                        asset=asset,
                         token=token_id[:16],
                         tier=tier_name,
                         round=round_start_ts,
@@ -1293,6 +1333,7 @@ class OrderManager:
                 expires_at=float(expiration_ts),
                 placed_at=time.time(),
                 status="live",
+                asset=asset,
             )
             self._orders[cid] = order
             self._persist_order(order)
@@ -1340,6 +1381,7 @@ class OrderManager:
         # exact bid as the order price. Used by the TP path so the actual
         # sale price matches the trigger-condition bid (no spread surprise).
         price_lock: bool = False,
+        asset: str = "BTC",
     ) -> TrackedOrder | None:
         """
         Place a GTD limit SELL at `price` (typically the current bid).
@@ -1361,7 +1403,7 @@ class OrderManager:
             from src.execution.clob_client import CLOBClient as _CC
             gtd_lifetime = lifetime_s if lifetime_s is not None else TP_GTD_LIFETIME_S
             effective_lifetime = max(gtd_lifetime, _CC.GTD_MIN_SEC + 1)
-            cid = f"{round_start_ts}-{tier_name}-{uuid.uuid4().hex[:8]}"
+            cid = f"{round_start_ts}-{asset}-{tier_name}-{uuid.uuid4().hex[:8]}"
 
             # H-NEW-2026-07-11: production callers always pass
             # `price_lock=True` via `place_gtd_sell_at_price`, so we post
@@ -1467,6 +1509,7 @@ class OrderManager:
                 placed_at=time.time(),
                 status="live",
                 size_matched=result.tokens,
+                asset=asset,
             )
             self._orders[cid] = order
             self._persist_order(order)
@@ -1519,12 +1562,13 @@ class OrderManager:
         round_start_ts: int,
         tier_name: str,
         tick_size: float,
+        asset: str = "BTC",
     ) -> TrackedOrder | None:
         """Place a FAK market SELL order."""
         if self._blocked("place_sell"):
             return None
         async with self._lock:
-            cid = f"{round_start_ts}-{tier_name}-{uuid.uuid4().hex[:8]}"
+            cid = f"{round_start_ts}-{asset}-{tier_name}-{uuid.uuid4().hex[:8]}"
 
             # H-NEW-2026-07-11: TP SELL uses the engine's exact tp target price
             # (passed in via `price`); no orderbook snap.
@@ -1563,6 +1607,7 @@ class OrderManager:
                 expires_at=0,
                 placed_at=time.time(),
                 status="filled",
+                asset=asset,
             )
             self._orders[cid] = order
             self._persist_order(order)
@@ -1700,10 +1745,19 @@ class OrderManager:
             # forever and freeze the DecisionLoop + round rollover.
             return await self._cancel_locked(client_id, reason=reason)
 
-    async def cancel_market(self, round_start_ts: int) -> list[str]:
-        """Cancel all open orders for a round. Returns list of cancelled client_ids."""
+    async def cancel_market(
+        self, round_start_ts: int, asset: str | None = None
+    ) -> list[str]:
+        """Cancel all open orders for a round.
+
+        `asset=None` cancels every asset that shares the round (the normal
+        hourly rollover); pass an asset to scope the cancel to one market.
+        Returns the list of cancelled client_ids.
+        """
         async with self._lock:
-            to_cancel = self.open_orders_for_round(round_start_ts)
+            to_cancel = self.open_orders_for_round(
+                round_start_ts, asset=asset
+            )
             if not to_cancel:
                 return []
 
@@ -2023,7 +2077,9 @@ class OrderManager:
         await self.reconcile()
         self._startup_reconciled = True
 
-    async def purge_round(self, round_start_ts: int) -> int:
+    async def purge_round(
+        self, round_start_ts: int, asset: str | None = None
+    ) -> int:
         """Drop in-memory state for orders belonging to a finished round.
 
         M-V4-1 fix (audit v4): without this, `_orders` / `_by_server` /
@@ -2045,15 +2101,18 @@ class OrderManager:
             # `<=` (not `==`) so terminal orders from older rounds are also
             # collected — otherwise a single never-confirmed cancel could
             # keep an old-round entry alive forever.
+            wanted = str(asset).upper() if asset else None
             stale = [
                 cid for cid, o in self._orders.items()
                 if o.round_start_ts <= round_start_ts
                 and o.status not in ("placed", "live")
+                and (wanted is None or str(o.asset).upper() == wanted)
             ]
             skipped_live = sum(
                 1 for o in self._orders.values()
                 if o.round_start_ts <= round_start_ts
                 and o.status in ("placed", "live")
+                and (wanted is None or str(o.asset).upper() == wanted)
             )
             for cid in stale:
                 o = self._orders.pop(cid, None)
