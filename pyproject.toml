@@ -13,6 +13,7 @@ dependencies = [
     "pydantic>=2.6",
     "pydantic-settings>=2.2",
     "python-dotenv>=1.0",
+    "tzdata>=2024.1",
     "loguru>=0.7",
     "structlog>=24.1",
     "py-clob-client-v2>=1.0,<2",

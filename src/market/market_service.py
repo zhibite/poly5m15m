@@ -62,17 +62,28 @@ class MarketService:
             tokens = m.get("tokens", [])
             if len(tokens) < 2:
                 continue
+            # `get_asset_updown_markets` attaches the exact window start for
+            # both the legacy epoch slugs and the dated ET hourly slugs.
             try:
-                window_ts = int(m.get("_event_slug", "").split("-")[-1])
-                window_start = datetime.fromtimestamp(window_ts, tz=timezone.utc)
-                window_end = datetime.fromtimestamp(
-                    window_ts + self._window_sec,
-                    tz=timezone.utc,
-                )
-            except Exception:
-                window_ts = int(now.timestamp()) // self._window_sec * self._window_sec
-                window_start = datetime.fromtimestamp(window_ts, tz=timezone.utc)
-                window_end = end_dt
+                window_ts = int(m.get("_window_start_ts") or 0)
+            except (TypeError, ValueError):
+                window_ts = 0
+            if window_ts <= 0:
+                # Legacy fallback: the final slug segment is the epoch.
+                try:
+                    window_ts = int(
+                        m.get("_event_slug", "").split("-")[-1]
+                    )
+                except (TypeError, ValueError):
+                    window_ts = (
+                        int(now.timestamp()) // self._window_sec
+                        * self._window_sec
+                    )
+            window_start = datetime.fromtimestamp(window_ts, tz=timezone.utc)
+            window_end = datetime.fromtimestamp(
+                window_ts + self._window_sec,
+                tz=timezone.utc,
+            )
 
             # Only accept the market whose window CONTAINS `now`. The
             # previous check (`endDate > now`) also accepted the NEXT

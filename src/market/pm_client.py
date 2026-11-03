@@ -8,14 +8,99 @@ import json
 import os
 import time
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 import httpx
 
 from src.infra.logging import get_logger
 
+try:  # Python 3.9+
+    from zoneinfo import ZoneInfo
+except Exception:  # pragma: no cover - ancient runtime
+    ZoneInfo = None  # type: ignore[assignment]
+
 log = get_logger(__name__)
+
+# Hourly Up/Down markets use an Eastern-Time dated slug, e.g.
+#   bitcoin-up-or-down-november-3-2026-6am-et
+# These are the aliases Polymarket has used for each asset. We probe every
+# alias and keep the legacy `{asset}-updown-1h-<epoch>` form as a fallback.
+_HOURLY_SLUG_NAMES: dict[str, tuple[str, ...]] = {
+    "BTC": ("bitcoin", "btc"),
+    "ETH": ("ethereum", "eth"),
+    "BNB": ("bnb", "binance-coin", "binancecoin"),
+    "XRP": ("xrp", "ripple"),
+    "SOL": ("solana", "sol"),
+    "DOGE": ("dogecoin", "doge"),
+    "HYPE": ("hyperliquid", "hype"),
+}
+
+_ET: object
+try:
+    if ZoneInfo is None:
+        raise RuntimeError("zoneinfo unavailable")
+    _ET = ZoneInfo("America/New_York")
+except Exception:  # pragma: no cover - no tzdata installed
+    # Fixed EST is correct in winter but one hour off during EDT. The
+    # `tzdata` package is a project dependency, so this is only a safety
+    # net for minimal images without a tz database.
+    _ET = timezone(timedelta(hours=-5))
+    log.warning(
+        "pm_client.tzdata_missing",
+        note="America/New_York unavailable; falling back to fixed UTC-5. "
+             "Install the tzdata package for correct DST handling.",
+    )
+
+
+def _et_hour_candidates(
+    asset: str, now_ts: float, window_sec: int, hours: tuple[int, ...]
+) -> list[tuple[str, int]]:
+    """Build dated ET hourly slugs for the current/previous/next hour.
+
+    Returns `(slug, window_start_ts)` pairs, newest-relevant first. The
+    window start is the UTC epoch of the ET hour boundary, which is what
+    `MarketService` uses to build `window_start`/`window_end`.
+    """
+    names = _HOURLY_SLUG_NAMES.get(asset.upper(), (asset.lower(),))
+    et_now = datetime.fromtimestamp(now_ts, timezone.utc).astimezone(_ET)
+    base_et = et_now.replace(minute=0, second=0, microsecond=0)
+    out: list[tuple[str, int]] = []
+    seen: set[str] = set()
+    for delta_h in hours:
+        dt = base_et + timedelta(hours=delta_h)
+        window_start_ts = int(dt.timestamp())
+        month = dt.strftime("%B").lower()
+        day = dt.day
+        year = dt.year
+        hour12 = dt.hour % 12 or 12
+        ampm = "am" if dt.hour < 12 else "pm"
+        # Polymarket shipped both with and without the year; probe both.
+        for year_part in (f"-{year}", ""):
+            for name in names:
+                slug = (
+                    f"{name}-up-or-down-{month}-{day}{year_part}"
+                    f"-{hour12}{ampm}-et"
+                )
+                if slug in seen:
+                    continue
+                seen.add(slug)
+                out.append((slug, window_start_ts))
+    return out
+
+
+def _market_is_live(market: dict) -> bool:
+    """Reject closed/archived rows and zombie slugs from another year."""
+    if _as_bool(market.get("closed")) or _as_bool(market.get("archived")):
+        return False
+    if market.get("active") is not None and not _as_bool(market.get("active")):
+        return False
+    end = _parse_end_dt(
+        str(market.get("endDate") or market.get("end_date") or "")
+    )
+    if end is not None and end.timestamp() <= time.time():
+        return False
+    return True
 
 
 def _parse_end_dt(raw: str) -> Optional[datetime]:
@@ -147,8 +232,16 @@ class PolymarketClient:
         limit: int = 5,
     ) -> list[dict]:
         """
-        Fetch active up/down ladder markets for the given asset (15m default, …).
-        Slug shape: `{asset.lower()}-updown-{slug_interval}-{unix_slot}`.
+        Fetch active up/down ladder markets for the given asset.
+
+        5m / 15m / 4h:
+            `{asset.lower()}-updown-{slug_interval}-{unix_slot}`
+
+        1h:
+            `{name}-up-or-down-{month}-{day}-{year}-{hour}{am|pm}-et`
+            e.g. `bitcoin-up-or-down-november-3-2026-6am-et`.
+            The year-less variant and the legacy
+            `{asset.lower()}-updown-1h-{unix_slot}` form are also probed.
         """
         if slug_interval is None:
             slug_interval = self.DEFAULT_UPDOWN_INTERVAL_SLUG
@@ -156,18 +249,43 @@ class PolymarketClient:
             window_sec = self.DEFAULT_UPDOWN_WINDOW_SEC
         asset = asset.upper()
         c = await self._client()
-        prefix = f"{asset.lower()}-updown-{slug_interval}"
         now = int(time.time())
         if window_sec <= 0:
             window_sec = self.DEFAULT_UPDOWN_WINDOW_SEC
         base = (now // window_sec) * window_sec
-        cand_ts = [base, base - window_sec, base + window_sec]
-        seen: set[int] = set()
-        candidates = [ts for ts in cand_ts if ts > 0 and not (ts in seen or seen.add(ts))]
+        interval = str(slug_interval).strip().lower()
+
+        candidates: list[tuple[str, int]] = []
+        legacy_prefix = f"{asset.lower()}-updown-{slug_interval}"
+        if interval in ("1h", "60m", "hourly"):
+            # Current ET hour first, then the legacy epoch slug, then the
+            # adjacent hours as a boundary/lag fallback.
+            candidates.extend(
+                _et_hour_candidates(asset, now, window_sec, (0,))
+            )
+            candidates.append((f"{legacy_prefix}-{base}", base))
+            candidates.extend(
+                _et_hour_candidates(asset, now, window_sec, (-1, 1))
+            )
+            for ts in (base - window_sec, base + window_sec):
+                candidates.append((f"{legacy_prefix}-{ts}", ts))
+        else:
+            for ts in (base, base - window_sec, base + window_sec):
+                candidates.append((f"{legacy_prefix}-{ts}", ts))
+
+        # Deduplicate candidate slugs while preserving priority order.
+        ordered: list[tuple[str, int]] = []
+        seen_slugs: set[str] = set()
+        for slug, window_start_ts in candidates:
+            if window_start_ts <= 0 or slug in seen_slugs:
+                continue
+            seen_slugs.add(slug)
+            ordered.append((slug, window_start_ts))
 
         markets: list[dict] = []
-        for ts in candidates:
-            slug = f"{prefix}-{ts}"
+        tried: list[str] = []
+        for slug, window_start_ts in ordered:
+            tried.append(slug)
             try:
                 resp = await c.get(
                     f"{self.settings.gamma_api}/events",
@@ -181,9 +299,20 @@ class PolymarketClient:
                     events = [events] if events else []
 
                 for ev in events:
-                    if prefix not in (ev.get("slug") or ""):
+                    ev_slug = str(ev.get("slug") or "").strip()
+                    if not ev_slug:
                         continue
-                    for m in ev.get("markets", []):
+                    # Accept only the exact slug we asked for (or a row
+                    # that adds a suffix), never another timestamp.
+                    if ev_slug != slug and not ev_slug.startswith(slug + "-"):
+                        continue
+                    if _as_bool(ev.get("closed")) or _as_bool(ev.get("archived")):
+                        continue
+                    for m in (ev.get("markets") or []):
+                        if not isinstance(m, dict):
+                            continue
+                        if not _market_is_live(m):
+                            continue
                         raw_ids = m.get("clobTokenIds") or "[]"
                         if isinstance(raw_ids, list):
                             token_ids = raw_ids
@@ -279,19 +408,31 @@ class PolymarketClient:
                                 "price": str(_price_at(idx_down)),
                             },
                         ]
-                        m["_event_slug"] = ev.get("slug", "")
+                        m["_event_slug"] = ev_slug
+                        m["_window_start_ts"] = window_start_ts
                         m["_up_price"] = _price_at(idx_up)
                         m["_down_price"] = _price_at(idx_down)
                         m["_neg_risk"] = False
                         markets.append(m)
-                if not markets and asset:
-                    log.debug(
-                        "get_asset_updown_markets returned 0 markets",
-                        asset=asset, slug_interval=slug_interval, window_sec=window_sec, prefix=prefix,
+                if markets:
+                    log.info(
+                        "get_asset_updown_markets matched",
+                        asset=asset,
+                        slug=ev_slug,
+                        window_start_ts=window_start_ts,
                     )
+                    break
             except Exception as e:
                 log.debug("Slug query failed", slug=slug, error=str(e))
 
+        if not markets:
+            log.info(
+                "get_asset_updown_markets no match",
+                asset=asset,
+                interval=slug_interval,
+                window_sec=window_sec,
+                tried=tried[:12],
+            )
         return markets[:limit]
 
     async def get_markets_by_condition_id(self, condition_id: str) -> Optional[dict]:
