@@ -30,6 +30,7 @@ not at the live FAK limit minus slippage.
 from __future__ import annotations
 
 import argparse
+import csv
 import dataclasses
 import json
 import math
@@ -259,18 +260,33 @@ def replay(
     def tp_target() -> float:
         return min(0.99, avg * (1.0 + p.tp_pct(n_avg)))
 
-    def buy_more(tier: int, price: float, role: str) -> None:
+    def buy_more(
+        tier: int, size_price: float, fill_price: float, role: str
+    ) -> None:
+        """Fill a tier.
+
+        `size_price` is the order's limit/strategy price: the CLOB order
+        is sized as `notional / size_price`.  `fill_price` is what the
+        order actually traded at; for a marketable order this can be
+        below the limit (price improvement), but the share count must
+        still be based on the limit, not on the improved fill price.
+        """
         nonlocal qty, avg, bought_qty, bought_cost, fees, n_avg
         nonlocal highest_tier, t4_filled, t4_avg, tp_armed, max_shares
+        if size_price <= 0 or fill_price <= 0:
+            return
         notional = p.notional(tier)
-        shares = notional / price
+        shares = notional / size_price
         if shares <= 1e-9:
             return
         qty += shares
         bought_qty += shares
-        bought_cost += shares * price
+        bought_cost += shares * fill_price
         avg = bought_cost / bought_qty
-        fee = taker_fee(shares, price, p.taker_fee_rate) if role == "TAKER" else 0.0
+        fee = (
+            taker_fee(shares, fill_price, p.taker_fee_rate)
+            if role == "TAKER" else 0.0
+        )
         fees += fee
         n_avg += 1
         tier_filled[tier - 1] = True
@@ -279,7 +295,7 @@ def replay(
         max_shares = max(max_shares, qty)
         if tier == 4:
             t4_filled = True
-            t4_avg = price
+            t4_avg = fill_price
         tp_armed = False  # the TP target changed
 
     def sell(qty_sold: float, price: float, role: str) -> None:
@@ -301,7 +317,10 @@ def replay(
         # 1) A resting next-tier GTD fills at its limit.
         if resting is not None:
             if price <= resting["trigger"]:
-                buy_more(resting["tier"], resting["trigger"], "MAKER")
+                buy_more(
+                    resting["tier"], resting["trigger"],
+                    resting["trigger"], "MAKER",
+                )
                 resting = None
             elif t >= resting["armed_at"] + p.gtd_lifetime_s:
                 resting = None
@@ -323,8 +342,9 @@ def replay(
             if trigger <= 0 or price > fire:
                 break
             if price <= trigger:
-                # Marketable at arm time: paper broker fills at the mid.
-                buy_more(next_tier, price, "TAKER")
+                # Marketable at arm time: size on the trigger (the GTD
+                # limit), fill at the observed mid (price improvement).
+                buy_more(next_tier, trigger, price, "TAKER")
             else:
                 resting = {
                     "tier": next_tier,
@@ -444,6 +464,72 @@ def _rounds(
     return list(conn.execute(sql, args))
 
 
+def _month_key(ts: int) -> str:
+    return datetime.fromtimestamp(int(ts), tz=timezone.utc).strftime("%Y-%m")
+
+
+def _detail_block(rs: list[RoundResult], p: Params) -> dict[str, Any]:
+    """Detailed metrics for one asset / month / tier slice."""
+    entries = [r for r in rs if r.exit != "NO_ENTRY"]
+    if not entries:
+        return {
+            "windows": len(rs),
+            "entries": 0,
+            "no_entry": len(rs),
+            "wins": 0,
+            "losses": 0,
+            "win_rate": None,
+            "pnl": 0.0,
+            "avg": 0.0,
+            "profit_factor": None,
+            "max_drawdown": 0.0,
+            "fees": 0.0,
+            "exits": {},
+            "t4_entries": 0,
+            "t4_pnl": 0.0,
+            "t4_win_rate": None,
+            "t1_3_pnl": 0.0,
+        }
+    wins = [r for r in entries if r.pnl > 1e-9]
+    losses = [r for r in entries if r.pnl < -1e-9]
+    gross_win = sum(r.pnl for r in wins)
+    gross_loss = -sum(r.pnl for r in losses)
+    cum = peak = max_dd = 0.0
+    for r in sorted(rs, key=lambda x: (x.window_start, x.asset)):
+        cum += r.pnl
+        peak = max(peak, cum)
+        max_dd = min(max_dd, cum - peak)
+    exits: dict[str, int] = {}
+    for r in entries:
+        exits[r.exit] = exits.get(r.exit, 0) + 1
+    t4 = [r for r in entries if r.highest_tier == 4]
+    t4_wins = [r for r in t4 if r.pnl > 1e-9]
+    return {
+        "windows": len(rs),
+        "entries": len(entries),
+        "no_entry": len(rs) - len(entries),
+        "wins": len(wins),
+        "losses": len(losses),
+        "win_rate": round(len(wins) / len(entries), 4),
+        "pnl": round(sum(r.pnl for r in entries), 4),
+        "avg": round(sum(r.pnl for r in entries) / len(entries), 4),
+        "profit_factor": (
+            round(gross_win / gross_loss, 4) if gross_loss > 1e-12 else None
+        ),
+        "max_drawdown": round(max_dd, 4),
+        "fees": round(sum(r.fees for r in rs), 4),
+        "exits": exits,
+        "t4_entries": len(t4),
+        "t4_pnl": round(sum(r.pnl for r in t4), 4),
+        "t4_win_rate": (
+            round(len(t4_wins) / len(t4), 4) if t4 else None
+        ),
+        "t1_3_pnl": round(
+            sum(r.pnl for r in entries if r.highest_tier < 4), 4
+        ),
+    }
+
+
 def _summary(results: list[RoundResult], p: Params) -> dict[str, Any]:
     entries = [r for r in results if r.exit != "NO_ENTRY"]
     no_entry = [r for r in results if r.exit == "NO_ENTRY"]
@@ -478,6 +564,18 @@ def _summary(results: list[RoundResult], p: Params) -> dict[str, Any]:
         rs = [r for r in entries if r.side == side]
         by_side[side] = _summary_block(rs, p)
 
+    by_month: dict[str, dict[str, Any]] = {}
+    for month in sorted({_month_key(r.window_start) for r in results}):
+        rs = [r for r in results if _month_key(r.window_start) == month]
+        by_month[month] = _detail_block(rs, p)
+
+    period = None
+    if results:
+        period = {
+            "start": min(r.window_start for r in results),
+            "end": max(r.window_start for r in results) + 3600,
+        }
+
     return {
         "params": dataclasses.asdict(p),
         "windows": len(results),
@@ -504,6 +602,8 @@ def _summary(results: list[RoundResult], p: Params) -> dict[str, Any]:
         "by_asset": by_asset,
         "by_highest_tier": by_highest,
         "by_side": by_side,
+        "by_month": by_month,
+        "period": period,
     }
 
 
@@ -593,6 +693,28 @@ def _print_summary(s: dict[str, Any]) -> None:
                 f"{side}: n={b['entries']:5d} pnl={b['pnl']:+9.2f} "
                 f"win_rate={b['win_rate']:.3f}"
             )
+    months = s.get("by_month") or {}
+    if months:
+        print("\n=== by month ===")
+        print(
+            f"{'month':8} {'win':>5} {'entry':>6} {'no_ent':>6} "
+            f"{'win%':>7} {'pnl':>10} {'avg':>8} {'pf':>6} "
+            f"{'maxdd':>9} {'T4n':>5} {'T4pnl':>10} {'T4win%':>7}"
+        )
+        for month, b in months.items():
+            wr = b["win_rate"]
+            t4wr = b["t4_win_rate"]
+            pf = b["profit_factor"]
+            print(
+                f"{month:8} {b['wins']:5d} {b['entries']:6d} "
+                f"{b['no_entry']:6d} "
+                f"{(wr if wr is not None else 0):7.3f} "
+                f"{b['pnl']:+10.2f} {b['avg']:+8.3f} "
+                f"{(pf if pf is not None else 0):6.2f} "
+                f"{b['max_drawdown']:+9.2f} {b['t4_entries']:5d} "
+                f"{b['t4_pnl']:+10.2f} "
+                f"{(t4wr if t4wr is not None else 0):7.3f}"
+            )
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -603,6 +725,10 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--end", default=None, help="ISO date or unix ts (exclusive)")
     ap.add_argument("--max-rounds", type=int, default=None)
     ap.add_argument("--output", default=None, help="write the JSON report here")
+    ap.add_argument(
+        "--trades-csv", default=None,
+        help="write one row per replayed window to this CSV",
+    )
     ap.add_argument("--progress", type=int, default=0, help="progress every N rounds")
     ap.add_argument("--entry-price-cap", type=float, default=Params.entry_price_cap)
     ap.add_argument("--price-pre-margin", type=float, default=Params.price_pre_margin)
@@ -700,6 +826,42 @@ def main(argv: list[str] | None = None) -> int:
         with open(args.output, "w", encoding="utf-8") as fh:
             json.dump(summary, fh, ensure_ascii=False, indent=2)
         print(f"\nwrote {args.output}")
+    if args.trades_csv:
+        with open(args.trades_csv, "w", newline="", encoding="utf-8") as fh:
+            writer = csv.writer(fh)
+            writer.writerow([
+                "month", "asset", "window_start_utc", "slug", "side",
+                "entry_utc", "entry_price", "exit", "pnl", "fees",
+                "cost", "proceeds", "qty_left", "highest_tier",
+                "t4_filled", "n_fills",
+            ])
+            for r in results:
+                writer.writerow([
+                    _month_key(r.window_start),
+                    r.asset,
+                    datetime.fromtimestamp(
+                        r.window_start, tz=timezone.utc
+                    ).isoformat(),
+                    r.slug,
+                    r.side or "",
+                    (
+                        datetime.fromtimestamp(
+                            r.entry_ts, tz=timezone.utc
+                        ).isoformat()
+                        if r.entry_ts else ""
+                    ),
+                    "" if r.entry_price is None else round(r.entry_price, 6),
+                    r.exit,
+                    round(r.pnl, 6),
+                    round(r.fees, 6),
+                    round(r.cost, 6),
+                    round(r.proceeds, 6),
+                    round(r.qty_left, 6),
+                    r.highest_tier,
+                    int(r.t4_filled),
+                    r.n_fills,
+                ])
+        print(f"wrote {args.trades_csv}")
     return 0
 
 
