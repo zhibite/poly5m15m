@@ -229,7 +229,11 @@ function renderRounds(rounds) {
       <td>${modePill(r.mode)}</td>
       <td>${assetPill(r.asset)}</td>
       <td class="mono">${iso(r.started_at) === '--' ? utc(r.round_start_ts) : iso(r.started_at)}</td>
-      <td class="mono muted">${r.slug || r.round_start_ts}</td>
+      <td class="slug-cell">
+        ${r.slug
+          ? `<a class="slug-link" href="https://polymarket.com/event/${encodeURIComponent(r.slug)}" target="_blank" rel="noopener noreferrer" title="${r.slug}"><span class="slug-text">${r.slug}</span><span class="slug-ext">↗</span></a>`
+          : `<span class="muted mono">${r.round_start_ts}</span>`}
+      </td>
       <td class="mono">$${fmt(r.buy_cost, 2)}</td>
       <td class="mono">$${fmt(r.sell_proceeds, 2)}</td>
       <td class="mono">${settle}</td>

@@ -282,3 +282,29 @@ dialog.modal[open] { animation: modal-in .18s ease-out; }
   margin: -4px 0 12px;
   line-height: 1.6;
 }
+
+/* Round slug column: keep the long ET slug compact, ellipsize it, and link
+   to the live Polymarket event. */
+.slug-cell { width: 240px; max-width: 240px; }
+.slug-link {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  max-width: 100%;
+  color: inherit;
+  text-decoration: none;
+}
+.slug-text {
+  display: block;
+  max-width: 212px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.slug-link:hover .slug-text { color: #a78bfa; text-decoration: underline; }
+.slug-ext { color: #a78bfa; font-size: 11px; flex: 0 0 auto; }
+
+@media (max-width: 900px) {
+  .slug-cell { width: 170px; max-width: 170px; }
+  .slug-text { max-width: 142px; }
+}
