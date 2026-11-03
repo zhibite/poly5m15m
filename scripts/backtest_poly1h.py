@@ -139,6 +139,7 @@ class RoundResult:
     fees: float = 0.0
     cost: float = 0.0
     proceeds: float = 0.0
+    settlement: float = 0.0
     qty_left: float = 0.0
     highest_tier: int = 1
     t4_filled: bool = False
@@ -446,6 +447,7 @@ def replay(
     result.fees = fees
     result.cost = bought_cost
     result.proceeds = proceeds
+    result.settlement = settlement
     result.qty_left = qty
     result.highest_tier = highest_tier
     result.t4_filled = t4_filled
@@ -856,8 +858,8 @@ def main(argv: list[str] | None = None) -> int:
             writer.writerow([
                 "month", "asset", "window_start_utc", "slug", "side",
                 "entry_utc", "entry_price", "exit", "pnl", "fees",
-                "cost", "proceeds", "qty_left", "highest_tier",
-                "t4_filled", "n_fills",
+                "cost", "proceeds", "settlement", "qty_left",
+                "highest_tier", "t4_filled", "n_fills",
             ])
             for r in results:
                 writer.writerow([
@@ -880,6 +882,7 @@ def main(argv: list[str] | None = None) -> int:
                     round(r.fees, 6),
                     round(r.cost, 6),
                     round(r.proceeds, 6),
+                    round(r.settlement, 6),
                     round(r.qty_left, 6),
                     r.highest_tier,
                     int(r.t4_filled),
