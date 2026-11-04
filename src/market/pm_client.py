@@ -1,92 +1,20 @@
 """
 pm_client.py — Polymarket Gamma + CLOB v2 public API client.
-Handles market discovery, midpoint prices, fee rates, and resolution queries.
+Handles 5m/15m market discovery, tick size, fee rates, and resolution queries.
 """
 
-import asyncio
 import json
 import os
 import time
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from typing import Optional
 
 import httpx
 
 from src.infra.logging import get_logger
 
-try:  # Python 3.9+
-    from zoneinfo import ZoneInfo
-except Exception:  # pragma: no cover - ancient runtime
-    ZoneInfo = None  # type: ignore[assignment]
-
 log = get_logger(__name__)
-
-# Hourly Up/Down markets use an Eastern-Time dated slug, e.g.
-#   bitcoin-up-or-down-november-3-2026-6am-et
-# These are the aliases Polymarket has used for each asset. We probe every
-# alias and keep the legacy `{asset}-updown-1h-<epoch>` form as a fallback.
-_HOURLY_SLUG_NAMES: dict[str, tuple[str, ...]] = {
-    "BTC": ("bitcoin", "btc"),
-    "ETH": ("ethereum", "eth"),
-    "BNB": ("bnb", "binance-coin", "binancecoin"),
-    "XRP": ("xrp", "ripple"),
-    "SOL": ("solana", "sol"),
-    "DOGE": ("dogecoin", "doge"),
-    "HYPE": ("hyperliquid", "hype"),
-}
-
-_ET: object
-try:
-    if ZoneInfo is None:
-        raise RuntimeError("zoneinfo unavailable")
-    _ET = ZoneInfo("America/New_York")
-except Exception:  # pragma: no cover - no tzdata installed
-    # Fixed EST is correct in winter but one hour off during EDT. The
-    # `tzdata` package is a project dependency, so this is only a safety
-    # net for minimal images without a tz database.
-    _ET = timezone(timedelta(hours=-5))
-    log.warning(
-        "pm_client.tzdata_missing",
-        note="America/New_York unavailable; falling back to fixed UTC-5. "
-             "Install the tzdata package for correct DST handling.",
-    )
-
-
-def _et_hour_candidates(
-    asset: str, now_ts: float, window_sec: int, hours: tuple[int, ...]
-) -> list[tuple[str, int]]:
-    """Build dated ET hourly slugs for the current/previous/next hour.
-
-    Returns `(slug, window_start_ts)` pairs, newest-relevant first. The
-    window start is the UTC epoch of the ET hour boundary, which is what
-    `MarketService` uses to build `window_start`/`window_end`.
-    """
-    names = _HOURLY_SLUG_NAMES.get(asset.upper(), (asset.lower(),))
-    et_now = datetime.fromtimestamp(now_ts, timezone.utc).astimezone(_ET)
-    base_et = et_now.replace(minute=0, second=0, microsecond=0)
-    out: list[tuple[str, int]] = []
-    seen: set[str] = set()
-    for delta_h in hours:
-        dt = base_et + timedelta(hours=delta_h)
-        window_start_ts = int(dt.timestamp())
-        month = dt.strftime("%B").lower()
-        day = dt.day
-        year = dt.year
-        hour12 = dt.hour % 12 or 12
-        ampm = "am" if dt.hour < 12 else "pm"
-        # Polymarket shipped both with and without the year; probe both.
-        for year_part in (f"-{year}", ""):
-            for name in names:
-                slug = (
-                    f"{name}-up-or-down-{month}-{day}{year_part}"
-                    f"-{hour12}{ampm}-et"
-                )
-                if slug in seen:
-                    continue
-                seen.add(slug)
-                out.append((slug, window_start_ts))
-    return out
 
 
 def _market_is_live(market: dict) -> bool:
@@ -230,18 +158,16 @@ class PolymarketClient:
         slug_interval: str | None = None,
         window_sec: int | None = None,
         limit: int = 5,
+        start_ts: int | None = None,
     ) -> list[dict]:
         """
         Fetch active up/down ladder markets for the given asset.
 
-        5m / 15m / 4h:
+        Slug shape:
             `{asset.lower()}-updown-{slug_interval}-{unix_slot}`
 
-        1h:
-            `{name}-up-or-down-{month}-{day}-{year}-{hour}{am|pm}-et`
-            e.g. `bitcoin-up-or-down-november-3-2026-6am-et`.
-            The year-less variant and the legacy
-            `{asset.lower()}-updown-1h-{unix_slot}` form are also probed.
+        `start_ts` requests one exact window (used by the arbitrage
+        pairing); without it the current/adjacent windows are probed.
         """
         if slug_interval is None:
             slug_interval = self.DEFAULT_UPDOWN_INTERVAL_SLUG
@@ -253,22 +179,14 @@ class PolymarketClient:
         if window_sec <= 0:
             window_sec = self.DEFAULT_UPDOWN_WINDOW_SEC
         base = (now // window_sec) * window_sec
-        interval = str(slug_interval).strip().lower()
 
         candidates: list[tuple[str, int]] = []
         legacy_prefix = f"{asset.lower()}-updown-{slug_interval}"
-        if interval in ("1h", "60m", "hourly"):
-            # Current ET hour first, then the legacy epoch slug, then the
-            # adjacent hours as a boundary/lag fallback.
-            candidates.extend(
-                _et_hour_candidates(asset, now, window_sec, (0,))
-            )
-            candidates.append((f"{legacy_prefix}-{base}", base))
-            candidates.extend(
-                _et_hour_candidates(asset, now, window_sec, (-1, 1))
-            )
-            for ts in (base - window_sec, base + window_sec):
-                candidates.append((f"{legacy_prefix}-{ts}", ts))
+        if start_ts is not None and int(start_ts) > 0:
+            # Exact window requested. The arbitrage discovery needs the
+            # specific 5m window that ends with a 15m window, which is not
+            # necessarily aligned with `now`.
+            candidates.append((f"{legacy_prefix}-{int(start_ts)}", int(start_ts)))
         else:
             for ts in (base, base - window_sec, base + window_sec):
                 candidates.append((f"{legacy_prefix}-{ts}", ts))
@@ -469,71 +387,6 @@ class PolymarketClient:
             log.debug("get_order_book failed", token_id=token_id[:12], error=str(e))
             return None
 
-    async def get_midpoint(self, token_id: str) -> float:
-        """Get current midpoint price (bid+ask)/2 for a token from CLOB."""
-        c = await self._client()
-        try:
-            resp = await c.get(
-                f"{self.settings.polymarket_host}/midpoint",
-                params={"token_id": token_id},
-                timeout=3.0,
-            )
-            resp.raise_for_status()
-            data = resp.json()
-            return float(data.get("mid", 0.0))
-        except Exception:
-            return 0.0
-
-    async def get_last_trade_prices_batch(
-        self, token_ids: list[str]
-    ) -> dict[str, float]:
-        """
-        Batch fetch last trade prices for multiple tokens.
-        CLOB: GET /last-trades-prices?token_ids=id1,id2,...
-        Returns: {"token_id": price}
-        """
-        if not token_ids:
-            return {}
-        c = await self._client()
-        try:
-            resp = await c.get(
-                f"{self.settings.polymarket_host}/last-trades-prices",
-                params={"token_ids": ",".join(token_ids)},
-                timeout=5.0,
-            )
-            resp.raise_for_status()
-            data = resp.json()
-            result: dict[str, float] = {}
-            # The endpoint has returned both shapes across deployments:
-            #   {"<token_id>": "0.53", ...}  (dict)
-            #   [{"token_id": "...", "price": "0.53"}, ...]  (list)
-            # Support both; the previous duplicate definitions only handled
-            # one shape each, and the surviving one assumed a dict.
-            if isinstance(data, dict):
-                for tid, price_val in data.items():
-                    if tid not in token_ids:
-                        continue
-                    try:
-                        result[tid] = float(price_val)
-                    except (TypeError, ValueError):
-                        result[tid] = 0.0
-            elif isinstance(data, list):
-                for entry in data:
-                    if not isinstance(entry, dict):
-                        continue
-                    tid = entry.get("token_id") or entry.get("asset_id")
-                    if not tid or tid not in token_ids:
-                        continue
-                    try:
-                        result[tid] = float(entry.get("price", 0.0))
-                    except (TypeError, ValueError):
-                        result[tid] = 0.0
-            for tid in token_ids:
-                result.setdefault(tid, 0.0)
-            return result
-        except Exception:
-            return {tid: 0.0 for tid in token_ids}
-
     async def get_tick_size(self, token_id: str) -> str:
         """Get minimum tick size for a token (v2 CLOB API)."""
         c = await self._client()
@@ -677,14 +530,3 @@ class PolymarketClient:
             level = "debug" if is_422 else "warning"
             getattr(log, level)("get_market_resolution failed", condition_id=condition_id[:12], error=str(e))
             return None
-
-
-def parse_window_end(market: dict | None) -> Optional[datetime]:
-    if not market:
-        return None
-    raw = market.get("endDate") or market.get("end_date") or ""
-    return _parse_end_dt(raw)
-
-
-async def safe_gather(*coros):
-    return await asyncio.gather(*coros, return_exceptions=True)

@@ -1,12 +1,11 @@
 """Test-run environment defaults.
 
-``.env.docker`` is loaded by the settings classes in tests too. Production
-may set ``PAUSE_NEW_ENTRIES=true`` while the backtest collects history;
-unit tests exercise the trading logic, so force the pause off here. Tests
-that need the pause set ``PAUSE_NEW_ENTRIES`` on their own config stub.
+The arbitrage tests construct their own ArbSettings; these defaults keep
+the process deterministic and prevent a test from starting the dashboard.
 """
 from __future__ import annotations
 
 import os
 
-os.environ["PAUSE_NEW_ENTRIES"] = "false"
+os.environ.setdefault("ARB_PAPER_TRADING", "true")
+os.environ.setdefault("ARB_WEB_ENABLED", "false")

@@ -1,24 +1,15 @@
 """Regression tests for `market_ws._process` against the real Polymarket
 Market Channel payload schema.
 
-History:
-  H-V6-9 (2026-07-11): the previous code looked for a nested
-  `best_bid_ask: { bids: [...], asks: [...] }` dict, but the real
-  Polymarket event is a TOP-LEVEL scalar pair on a dedicated
-  `event_type: "best_bid_ask"` message. The original test pinned that
-  parsing via `cache.best_bid[token]` / `cache.best_ask[token]`.
+The 5m/15m arbitrage engine uses the top of book as its trigger:
+  * `best_bid_ask` -> scalar `best_bid` / `best_ask`
+  * `book`         -> top-of-book + top-5 depth
+  * `price_change` -> per-asset `best_bid` / `best_ask`
 
-  H-NEW-2026-07-15: the `best_bid` / `best_ask` cache fields were
-  REMOVED from `PriceCache` entirely. Strategy now trades off REST
-  midpoint + WS `last_trade_price` only. Orderbook events
-  (`best_bid_ask`, `book`, `price_change.price_changes[].best_bid`)
-  are intentionally NOT parsed in `_process` — see the comment at
-  the top of that branch in `market_ws.py`.
-
-  The schema-shape regressions are still valuable: a future drift in
-  the `last_trade_price` / `price_change` paths must surface as a
-  failing test. These tests now assert what is actually consumed by
-  the strategy, not the abandoned orderbook cache fields.
+`last_trade_price` and REST midpoint remain separate fields; they are
+not used by the arbitrage pre-screen. These tests pin the wire shapes and
+the one-sided / zero-side update semantics (a missing side must not drop
+the other; a zero side must not leave a stale quote behind).
 """
 from __future__ import annotations
 
@@ -37,15 +28,8 @@ def _make_ws() -> tuple[MarketWS, PriceCache]:
 
 
 @pytest.mark.asyncio
-async def test_best_bid_ask_event_is_ignored() -> None:
-    """`event_type: "best_bid_ask"` carries only the top-of-book pair.
-
-    H-NEW-2026-07-15: PriceCache no longer stores best_bid / best_ask —
-    the strategy uses REST midpoint + WS last_trade_price. The event
-    must not crash, must not write to any cache field, and must not
-    leak the scalar pair into last_trade_price (this is an orderbook
-    snapshot, not a trade execution).
-    """
+async def test_best_bid_ask_event_updates_top_of_book() -> None:
+    """The dedicated BBA event carries the scalar pair used as a trigger."""
     ws, cache = _make_ws()
     msg = {
         "event_type": "best_bid_ask",
@@ -58,7 +42,12 @@ async def test_best_bid_ask_event_is_ignored() -> None:
     }
     await ws._process(json.dumps(msg))
 
-    # No field should be populated from a best_bid_ask event.
+    assert cache.best_bid["TOKEN_UP"] == pytest.approx(0.42)
+    assert cache.best_ask["TOKEN_UP"] == pytest.approx(0.55)
+    assert cache.bbo_ts["TOKEN_UP"] > 0
+    assert cache.bid_ts["TOKEN_UP"] > 0
+    assert cache.ask_ts["TOKEN_UP"] > 0
+    # This is an orderbook snapshot, not a trade.
     assert cache.last_trade_price.get("TOKEN_UP") is None
     assert cache.midpoint.get("TOKEN_UP") is None
 
@@ -102,19 +91,19 @@ async def test_price_change_event_updates_last_trade_price_for_each_token() -> N
     # BOTH tokens must have last_trade_price set, not just the first.
     assert cache.last_trade_price["TOKEN_UP"] == pytest.approx(0.5)
     assert cache.last_trade_price["TOKEN_DOWN"] == pytest.approx(0.5)
+    # Each price_changes row also refreshes that token's BBO.
+    assert cache.best_bid["TOKEN_UP"] == pytest.approx(0.5)
+    assert cache.best_ask["TOKEN_UP"] == pytest.approx(0.6)
+    assert cache.best_bid["TOKEN_DOWN"] == pytest.approx(0.4)
+    assert cache.best_ask["TOKEN_DOWN"] == pytest.approx(0.5)
     # midpoint is populated by the REST poller, NOT by WS events.
     assert cache.midpoint.get("TOKEN_UP") is None
     assert cache.midpoint.get("TOKEN_DOWN") is None
 
 
 @pytest.mark.asyncio
-async def test_book_event_is_ignored() -> None:
-    """`event_type: "book"` is the full L2 snapshot — orderbook, not trade.
-
-    H-NEW-2026-07-15: the book event is intentionally NOT parsed; it
-    neither crashes nor populates any cache field. The strategy's
-    orderbook view comes from REST midpoint polling, not WS.
-    """
+async def test_book_event_updates_top_of_book_and_depth() -> None:
+    """The book snapshot seeds the BBO and top-5 depth."""
     ws, cache = _make_ws()
     msg = {
         "event_type": "book",
@@ -132,9 +121,25 @@ async def test_book_event_is_ignored() -> None:
     }
     await ws._process(json.dumps(msg))
 
-    # No cache field should be populated from a book event.
+    assert cache.best_bid["TOKEN_UP"] == pytest.approx(0.50)
+    assert cache.best_ask["TOKEN_UP"] == pytest.approx(0.55)
+    assert cache.bid_depth["TOKEN_UP"] == pytest.approx(300)
+    assert cache.ask_depth["TOKEN_UP"] == pytest.approx(50)
+    assert cache.bbo_ts["TOKEN_UP"] > 0
+    assert cache.bid_ts["TOKEN_UP"] > 0
+    assert cache.ask_ts["TOKEN_UP"] > 0
     assert cache.last_trade_price.get("TOKEN_UP") is None
     assert cache.midpoint.get("TOKEN_UP") is None
+
+    # A later full snapshot with an empty ask side must clear the old ask.
+    await ws._process(json.dumps({
+        "event_type": "book",
+        "asset_id": "TOKEN_UP",
+        "bids": [{"price": "0.50", "size": "200"}],
+        "asks": [],
+    }))
+    assert cache.best_ask["TOKEN_UP"] == 0.0
+    assert cache.ask_depth["TOKEN_UP"] == 0.0
 
 
 @pytest.mark.asyncio
@@ -171,10 +176,74 @@ async def test_legacy_nested_best_bid_ask_is_ignored() -> None:
 
 
 @pytest.mark.asyncio
+async def test_one_sided_bba_preserves_the_other_side() -> None:
+    ws, cache = _make_ws()
+    await ws._process(json.dumps({
+        "event_type": "best_bid_ask",
+        "asset_id": "TOKEN_UP",
+        "best_bid": "0.42",
+    }))
+    assert cache.best_bid["TOKEN_UP"] == pytest.approx(0.42)
+    assert "TOKEN_UP" not in cache.best_ask
+    assert cache.bid_ts["TOKEN_UP"] > 0
+    assert cache.ask_ts.get("TOKEN_UP", 0.0) == 0.0
+
+    await ws._process(json.dumps({
+        "event_type": "best_bid_ask",
+        "asset_id": "TOKEN_UP",
+        "best_ask": "0.55",
+    }))
+    assert cache.best_bid["TOKEN_UP"] == pytest.approx(0.42)
+    assert cache.best_ask["TOKEN_UP"] == pytest.approx(0.55)
+    assert cache.ask_ts["TOKEN_UP"] > 0
+
+
+@pytest.mark.asyncio
+async def test_zero_side_clears_the_old_quote() -> None:
+    ws, cache = _make_ws()
+    await ws._process(json.dumps({
+        "event_type": "best_bid_ask",
+        "asset_id": "TOKEN_UP",
+        "best_bid": "0.42",
+        "best_ask": "0.55",
+    }))
+    await ws._process(json.dumps({
+        "event_type": "best_bid_ask",
+        "asset_id": "TOKEN_UP",
+        "best_bid": "0",
+    }))
+    # The emptied bid is 0, not a stale 0.42; the ask is untouched.
+    assert cache.best_bid["TOKEN_UP"] == 0.0
+    assert cache.best_ask["TOKEN_UP"] == pytest.approx(0.55)
+
+
+@pytest.mark.asyncio
+async def test_batched_array_is_processed() -> None:
+    ws, cache = _make_ws()
+    batch = [
+        {
+            "event_type": "best_bid_ask",
+            "asset_id": "TOKEN_UP",
+            "best_bid": "0.42",
+            "best_ask": "0.55",
+        },
+        {
+            "event_type": "best_bid_ask",
+            "asset_id": "TOKEN_DOWN",
+            "best_bid": "0.43",
+            "best_ask": "0.56",
+        },
+    ]
+    await ws._process(json.dumps(batch))
+    assert cache.best_bid["TOKEN_UP"] == pytest.approx(0.42)
+    assert cache.best_ask["TOKEN_DOWN"] == pytest.approx(0.56)
+
+
+@pytest.mark.asyncio
 async def test_no_crash_on_malformed_message() -> None:
     ws, _ = _make_ws()
     # Garbage input must not kill the WS reader.
     await ws._process("not json at all")
-    await ws._process(json.dumps([1, 2, 3]))  # array, not dict
+    await ws._process(json.dumps([1, 2, 3]))  # array without dict events
     await ws._process(json.dumps({"event_type": "best_bid_ask"}))  # no asset_id
     # No assertion — just confirms the coroutine returned cleanly.

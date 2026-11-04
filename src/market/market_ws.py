@@ -41,6 +41,13 @@ class PriceCache:
     # Microstructure snapshot for the external-signal gates (2026-11-02).
     best_bid: dict[str, float] = field(default_factory=dict)
     best_ask: dict[str, float] = field(default_factory=dict)
+    # Local receive timestamp for each best bid/ask, used by the arbitrage
+    # engine to reject stale quotes. `bbo_ts` is the last update of either
+    # side; `bid_ts` / `ask_ts` are per-side so a bid-only update cannot
+    # make an old ask look fresh.
+    bbo_ts: dict[str, float] = field(default_factory=dict)
+    bid_ts: dict[str, float] = field(default_factory=dict)
+    ask_ts: dict[str, float] = field(default_factory=dict)
     bid_depth: dict[str, float] = field(default_factory=dict)
     ask_depth: dict[str, float] = field(default_factory=dict)
     # token -> deque[(ts_seconds, signed_shares)] over the last few minutes
@@ -61,27 +68,44 @@ class PriceCache:
     def set_best_bid_ask(
         self, token: str, bid: object, ask: object
     ) -> None:
-        """Update the top of book from a WS BBA / price_change event."""
-        try:
-            b = float(bid)  # type: ignore[arg-type]
-            a = float(ask)  # type: ignore[arg-type]
-        except (TypeError, ValueError):
+        """Update the top of book from a WS BBA / price_change event.
+
+        Each side is parsed independently: a payload that carries only
+        ``best_ask`` must not be dropped because ``best_bid`` is absent.
+        A zero side is stored as 0 so a previously non-empty side cannot
+        linger as a stale quote; callers that require a two-sided book
+        (the arbitrage pre-screen) will then fall back to REST.
+        """
+        def _num(value: object) -> float | None:
+            if value is None or value == "":
+                return None
+            try:
+                return float(value)  # type: ignore[arg-type]
+            except (TypeError, ValueError):
+                return None
+
+        b = _num(bid)
+        a = _num(ask)
+        if b is None and a is None:
             return
-        if b > 0:
-            self.best_bid[token] = b
-        if a > 0:
-            self.best_ask[token] = a
+        now = time.time()
+        if b is not None:
+            self.best_bid[token] = b if b > 0 else 0.0
+            self.bid_ts[token] = now
+        if a is not None:
+            self.best_ask[token] = a if a > 0 else 0.0
+            self.ask_ts[token] = now
+        self.bbo_ts[token] = now
 
     def set_book(
         self, token: str, bids: object, asks: object, levels: int = 5
     ) -> None:
-        """Store top-of-book depth from a REST /book response."""
-        def _levels(side: object) -> tuple[float, float]:
+        """Store top-of-book depth from a WS book snapshot."""
+        def _levels(side: object, *, highest: bool) -> tuple[float, float]:
             if not isinstance(side, list):
                 return 0.0, 0.0
-            best = 0.0
-            depth = 0.0
-            for row in side[:levels]:
+            rows: list[tuple[float, float]] = []
+            for row in side:
                 if not isinstance(row, dict):
                     continue
                 try:
@@ -91,19 +115,31 @@ class PriceCache:
                     continue
                 if px <= 0 or sz <= 0:
                     continue
-                if best <= 0:
-                    best = px
-                depth += sz
+                rows.append((px, sz))
+            # The wire order is normally best-first, but sort defensively
+            # so an unsorted snapshot cannot put a worse level in `best`.
+            rows.sort(key=lambda item: item[0], reverse=highest)
+            if not rows:
+                return 0.0, 0.0
+            best = rows[0][0]
+            depth = sum(size for _, size in rows[: max(1, int(levels))])
             return best, depth
 
-        best_bid, bid_depth = _levels(bids)
-        best_ask, ask_depth = _levels(asks)
-        if best_bid > 0:
+        # A full book snapshot: an empty side is a real state (0), not an
+        # absent field, so clear it instead of leaving a stale quote.
+        now = time.time()
+        if isinstance(bids, list):
+            best_bid, bid_depth = _levels(bids, highest=True)
             self.best_bid[token] = best_bid
             self.bid_depth[token] = bid_depth
-        if best_ask > 0:
+            self.bid_ts[token] = now
+        if isinstance(asks, list):
+            best_ask, ask_depth = _levels(asks, highest=False)
             self.best_ask[token] = best_ask
             self.ask_depth[token] = ask_depth
+            self.ask_ts[token] = now
+        if isinstance(bids, list) or isinstance(asks, list):
+            self.bbo_ts[token] = now
 
     def record_trade(
         self, token: str, signed_size: float, ts: float | None = None
@@ -163,6 +199,9 @@ class PriceCache:
         self.midpoint.pop(token, None)
         self.best_bid.pop(token, None)
         self.best_ask.pop(token, None)
+        self.bbo_ts.pop(token, None)
+        self.bid_ts.pop(token, None)
+        self.ask_ts.pop(token, None)
         self.bid_depth.pop(token, None)
         self.ask_depth.pop(token, None)
         self.trade_flow.pop(token, None)
@@ -254,6 +293,10 @@ class MarketWS:
     def subscribed_tokens(self) -> frozenset[str]:
         return frozenset(self._pending_tokens)
 
+    @property
+    def connected(self) -> bool:
+        return self._ws is not None and self._ws.state == WsState.OPEN
+
     async def start(self) -> None:
         self._running = True
         self._task = asyncio.create_task(self._run())
@@ -334,7 +377,13 @@ class MarketWS:
         except json.JSONDecodeError:
             return
 
-        # Skip non-dict messages (some WS messages may be arrays)
+        # Some deployments batch several events into one JSON array. Process
+        # each element rather than dropping the whole batch.
+        if isinstance(msg, list):
+            for item in msg:
+                if isinstance(item, dict):
+                    await self._process(json.dumps(item))
+            return
         if not isinstance(msg, dict):
             return
 
@@ -398,16 +447,22 @@ class MarketWS:
         # trades off midpoint + last trade, but the signal layer uses the
         # top of book and depth.
         if event_type in ("best_bid_ask", "bbo") and token and in_active:
-            bb = msg.get("best_bid") or msg.get("bestBid")
-            ba = msg.get("best_ask") or msg.get("bestAsk")
+            bb = msg.get("best_bid")
+            if bb is None:
+                bb = msg.get("bestBid")
+            ba = msg.get("best_ask")
+            if ba is None:
+                ba = msg.get("bestAsk")
             if bb is not None or ba is not None:
                 self._cache.set_best_bid_ask(token, bb, ba)
         elif event_type == "book" and token and in_active:
-            self._cache.set_book(
-                token,
-                msg.get("bids") or msg.get("buys"),
-                msg.get("asks") or msg.get("sells"),
-            )
+            bids = msg.get("bids")
+            if bids is None:
+                bids = msg.get("buys")
+            asks = msg.get("asks")
+            if asks is None:
+                asks = msg.get("sells")
+            self._cache.set_book(token, bids, asks)
 
         # price_change → per-asset updates (each carries its own best_bid/ask)
         pcs = msg.get("price_changes", [])
@@ -435,6 +490,12 @@ class MarketWS:
                 ba = pc.get("best_ask")
                 if bb is not None or ba is not None:
                     self._cache.set_best_bid_ask(pc_token, bb, ba)
+                else:
+                    # The book changed but the payload did not carry a new
+                    # BBA. Invalidate both sides so the arbitrage engine
+                    # falls back to a REST snapshot instead of trading on
+                    # the previous quote.
+                    self._cache.set_best_bid_ask(pc_token, 0.0, 0.0)
 
 
         # last_trade_price (top-level field on dedicated event_type)

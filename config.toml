@@ -1,24 +1,87 @@
 ###############################################################################
-# Polymarket multi-asset 1h Up/Down bot configuration
+# Polymarket 5m/15m BTC/ETH covered-arbitrage bot
+#
+# Environment variables override this file (`ARB_<KEY>`), and .env overrides
+# both. See src/arb/config.py for the full field list.
 ###############################################################################
 
-[GENERAL]
-ROUND_PERIOD_S = 3600
-WINDOW_PRE_OPEN_S = 600
+[ARB]
+# ── universe / mode ──────────────────────────────────────────────────────
+ENABLED = true
+ASSETS = "BTC,ETH"
+# Paper is the safe default. Live requires PAPER_TRADING=false AND
+# LIVE_ENABLED=true, plus valid CLOB credentials.
+PAPER_TRADING = true
+LIVE_ENABLED = false
 
-[BINANCE]
-WS_URL = "wss://stream.binance.com:9443/ws/btcusdt@trade"
-RECONNECT_BASE_S = 1.0
-RECONNECT_MAX_S = 30.0
-BUFFER_RETENTION_S = 1200
+# ── loop cadence ─────────────────────────────────────────────────────────
+TICK_S = 0.25
+DISCOVERY_S = 5.0
+MARKET_META_REFRESH_S = 60.0
+SETTLEMENT_POLL_S = 3.0
+SETTLEMENT_MAX_WAIT_S = 300.0
+STATUS_S = 1.0
 
-[ROUND_CLOCK]
-TIMEZONE = "local"
+# ── sizing / exposure ────────────────────────────────────────────────────
+MAX_SHARES_PER_PAIR = 100.0
+MIN_SHARES_PER_PAIR = 5.0
+MAX_NOTIONAL_PER_PAIR = 20.0
+MAX_OPEN_POSITIONS = 4
+MAX_OPEN_NOTIONAL = 80.0
+MAX_DAILY_LOSS_USD = 50.0
+MAX_CONSECUTIVE_FAILURES = 5
+FAILURE_COOLDOWN_S = 60.0
 
-[BASELINE]
-WINDOW_S = 300
-MIN_SAMPLES = 30
+# ── fees / edge ──────────────────────────────────────────────────────────
+# Official formula: fee = shares * FEE_RATE * p * (1 - p), taker only.
+FEE_RATE = 0.07
+FEE_BUFFER_PCT = 0.10
+FEE_BUFFER_USD = 0.01
+MIN_EDGE_USD = 0.02
+MIN_EDGE_PCT = 0.001
+SAME_MARKET_MIN_EDGE_USD = 0.02
+SAME_MARKET_MIN_EDGE_PCT = 0.001
 
-[LOG]
-LEVEL = "INFO"
-HEARTBEAT_S = 5
+# ── strike / pairing ─────────────────────────────────────────────────────
+# auto = prefer an explicit description strike, fall back to Binance open.
+STRIKE_SOURCE = "auto"
+# Reject a pair whose two strikes are closer than this. The gap protects
+# against a Binance-vs-Chainlink ordering flip near the boundary.
+MIN_STRIKE_GAP_BPS = 5.0
+STRIKE_SETTLE_S = 2.0
+STOP_OPEN_BEFORE_END_S = 20.0
+MIN_SECONDS_TO_END_S = 15.0
+MAX_QUOTE_AGE_S = 1.5
+MAX_BOOK_LEVELS = 20
+COOLDOWN_S = 5.0
+
+# ── execution ────────────────────────────────────────────────────────────
+# unwind = sell unmatched excess immediately (safe default)
+# complete = first try to buy the shortfall on the failed leg
+LEG_RISK_POLICY = "unwind"
+MAX_LEG_SLIPPAGE_TICKS = 1
+# Live token balances settle 1-3 s after a FAK buy; keep the unwind retry
+# window long enough to cover that lag.
+UNWIND_RETRIES = 5
+UNWIND_RETRY_DELAY_S = 0.5
+SELL_SLIPPAGE_PCT = 2.0
+USE_MARKET_WS = true
+ALLOW_CROSS_MARKET = true
+ALLOW_SAME_MARKET = true
+# All four legs (5m UP/DOWN + 15m UP/DOWN) pay exactly $2 per matched
+# set and do not need the strikes. This is the most robust variant.
+ALLOW_COMPLETE_SET = true
+REQUIRE_SAME_RESOLUTION_SOURCE = true
+# Paper allows unknown sources for data collection; live fails closed.
+ALLOW_UNKNOWN_RESOLUTION_SOURCE = false
+
+# ── web dashboard ────────────────────────────────────────────────────────
+WEB_ENABLED = true
+WEB_HOST = "0.0.0.0"
+WEB_PORT = 8031
+WEB_USERNAME = "admin"
+# Set ARB_WEB_PASSWORD in the environment (never commit a password here).
+WEB_PASSWORD = ""
+
+# ── logging ──────────────────────────────────────────────────────────────
+LOG_LEVEL = "INFO"
