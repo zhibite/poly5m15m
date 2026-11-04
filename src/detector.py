@@ -21,9 +21,9 @@ from __future__ import annotations
 
 import time
 
-from src.arb.config import ArbSettings
-from src.arb.fees import taker_fee, walk_asks
-from src.arb.models import (
+from src.config import ArbSettings
+from src.fees import taker_fee, walk_asks
+from src.models import (
     ArbPair,
     ArbMarket,
     Book,
@@ -33,7 +33,7 @@ from src.arb.models import (
     Opportunity,
 )
 from src.infra.logging import get_logger
-from src.market.models import Side
+from src.models import Side
 
 log = get_logger(__name__)
 

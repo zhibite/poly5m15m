@@ -22,11 +22,11 @@ import asyncio
 import time
 from typing import Protocol
 
-from src.arb.books import BookService
-from src.arb.config import ArbSettings
-from src.arb.detector import ArbDetector
-from src.arb.fees import taker_fee, walk_bids, walk_budget
-from src.arb.models import (
+from src.books import BookService
+from src.config import ArbSettings
+from src.detector import ArbDetector
+from src.fees import taker_fee, walk_bids, walk_budget
+from src.models import (
     Book,
     ExecutionResult,
     Fill,
@@ -34,7 +34,7 @@ from src.arb.models import (
     LegPlan,
     Opportunity,
 )
-from src.arb.store import ArbStore
+from src.store import ArbStore
 from src.execution.clob_client import CLOBClient
 from src.infra.logging import get_logger
 

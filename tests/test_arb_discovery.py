@@ -5,10 +5,10 @@ from datetime import datetime, timezone
 
 import pytest
 
-from src.arb.config import ArbSettings
-from src.arb.discovery import ArbDiscovery
-from src.arb.store import ArbStore
-from src.market.models import Side
+from src.config import ArbSettings
+from src.discovery import ArbDiscovery
+from src.store import ArbStore
+from src.models import Side
 
 END_TS = 1_781_131_500
 START_5 = END_TS - 300

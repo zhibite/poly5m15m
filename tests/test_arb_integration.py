@@ -6,13 +6,13 @@ from datetime import datetime, timezone
 
 import pytest
 
-from src.arb.books import BookService
-from src.arb.config import ArbSettings
-from src.arb.detector import ArbDetector
-from src.arb.discovery import ArbDiscovery
-from src.arb.executor import PairExecutor, PaperBroker
-from src.arb.settlement import SettlementWatcher
-from src.arb.store import ArbStore
+from src.books import BookService
+from src.config import ArbSettings
+from src.detector import ArbDetector
+from src.discovery import ArbDiscovery
+from src.executor import PairExecutor, PaperBroker
+from src.settlement import SettlementWatcher
+from src.store import ArbStore
 
 
 def _iso(ts: int) -> str:

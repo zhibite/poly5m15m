@@ -15,7 +15,7 @@ import time
 
 import httpx
 
-from src.arb.config import ArbSettings
+from src.config import ArbSettings
 from src.infra.logging import get_logger
 
 log = get_logger(__name__)

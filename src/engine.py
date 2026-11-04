@@ -17,16 +17,16 @@ import json
 import time
 from datetime import datetime, timezone
 
-from src.arb.books import BookService
-from src.arb.config import ArbSettings
-from src.arb.detector import ArbDetector
-from src.arb.discovery import ArbDiscovery, window_starts
-from src.arb.executor import PairExecutor
-from src.arb.models import ArbMarket, ArbPair, Opportunity
-from src.arb.reference import ReferencePriceService
-from src.arb.settlement import SettlementWatcher
-from src.arb.status import atomic_write_json
-from src.arb.store import ArbStore
+from src.books import BookService
+from src.config import ArbSettings
+from src.detector import ArbDetector
+from src.discovery import ArbDiscovery, window_starts
+from src.executor import PairExecutor
+from src.models import ArbMarket, ArbPair, Opportunity
+from src.reference import ReferencePriceService
+from src.settlement import SettlementWatcher
+from src.status import atomic_write_json
+from src.store import ArbStore
 from src.infra.logging import get_logger
 from src.market.pm_client import PolymarketClient
 

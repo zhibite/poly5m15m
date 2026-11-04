@@ -3,9 +3,9 @@ from __future__ import annotations
 
 import json
 
-from src.arb.config import ArbSettings
-from src.arb.engine import ArbEngine
-from src.arb.killswitch import KillSwitch
+from src.config import ArbSettings
+from src.engine import ArbEngine
+from src.killswitch import KillSwitch
 
 
 def _engine(path) -> tuple[ArbEngine, KillSwitch]:

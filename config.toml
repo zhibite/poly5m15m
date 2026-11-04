@@ -2,7 +2,7 @@
 # Polymarket 5m/15m BTC/ETH covered-arbitrage bot
 #
 # Environment variables override this file (`ARB_<KEY>`), and .env overrides
-# both. See src/arb/config.py for the full field list.
+# both. See src/config.py for the full field list.
 ###############################################################################
 
 [ARB]
@@ -82,6 +82,8 @@ WEB_PORT = 8031
 WEB_USERNAME = "admin"
 # Set ARB_WEB_PASSWORD in the environment (never commit a password here).
 WEB_PASSWORD = ""
+# Login session lifetime (seconds); in-memory, lost on restart.
+WEB_SESSION_TTL_S = 604800
 
 # ── logging ──────────────────────────────────────────────────────────────
 LOG_LEVEL = "INFO"

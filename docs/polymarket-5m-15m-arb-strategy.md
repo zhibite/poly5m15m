@@ -456,29 +456,33 @@ Dashboard 现在包含：
 
 ```
 src/main.py                 新入口：只启动套利 bot
-src/arb/config.py           ArbSettings（env ARB_* + config.toml [ARB]）
-src/arb/models.py           ArbMarket / ArbPair / Book / Opportunity / Fill
-src/arb/fees.py             taker fee 公式、ask/bid 深度走单
-src/arb/reference.py        Binance 窗口 open / 现价
-src/arb/discovery.py        市场发现、5m/15m 配对、strike/结算源解析
-src/arb/books.py            WS BBO + REST /orderbook 深度
-src/arb/detector.py         两腿跨市场 / 四腿 complete-set / 同市场机会检测（纯函数）
-src/arb/executor.py         PaperBroker / LiveBroker / 双腿成交与 unwind
-src/arb/settlement.py       Gamma 结算 + invariant
-src/arb/store.py            SQLite：markets/pairs/opportunities/positions/fills/settlements
-src/arb/engine.py           discovery / trading / status 三个循环
-src/arb/web.py              只读 dashboard（默认 8031）
-src/arb/status.py           原子写 data/arb_status.json
+src/config.py               ArbSettings (ARB_*) + CredentialsSettings
+src/models.py               Side / ArbMarket / ArbPair / Book / Opportunity / Fill
+src/fees.py                 taker fee 公式、ask/bid 深度走单
+src/reference.py            Binance 窗口 open / 现价
+src/discovery.py            市场发现、5m/15m 配对、strike/结算源解析
+src/books.py                WS BBO + REST /orderbook 深度
+src/detector.py             两腿跨市场 / 四腿 complete-set / 同市场机会检测（纯函数）
+src/executor.py             PaperBroker / LiveBroker / 双腿成交与 unwind
+src/settlement.py           Gamma 结算 + invariant
+src/store.py                SQLite：markets/pairs/opportunities/positions/fills/settlements
+src/engine.py               discovery / trading / status 三个循环
+src/killswitch.py           文件式 kill switch
+src/status.py               原子写 data/arb_status.json
+src/web/                    FastAPI + 中文模板/静态资源 + 登录页
+src/market/                 pm_client / market_ws
+src/execution/              clob_client / clob_l1_auth
+src/infra/                  structlog
 ```
 
 复用底层：
 
-- `src/market/pm_client.py`：Gamma/CLOB 公共接口（新增了精确 `start_ts` 发现参数）；
-- `src/market/market_ws.py`：CLOB 盘口 WS（新增 `bbo_ts` / `connected`）；
+- `src/market/pm_client.py`：Gamma/CLOB 公共接口（精确 `start_ts` 发现参数）；
+- `src/market/market_ws.py`：CLOB 盘口 WS（`bbo_ts` / `bid_ts` / `ask_ts` / `connected`）；
 - `src/execution/clob_client.py`：FAK BUY/SELL、余额、订单状态；
-- `src/clob_l1_auth.py`：L2 凭证派生；
-- `src/strategy/killswitch.py`：独立 kill switch 文件；
-- `src/infra/logging.py`：structlog。
+- `src/execution/clob_l1_auth.py`：L2 凭证派生；
+- `src/killswitch.py`：独立 kill switch 文件；
+- `src/web/`：登录页、中文看板、成交记录页。
 
 > 旧 1h 策略、dashboard、backtest、旧 DB/feeds 已在 2026-11-04 的清理中物理删除；
 > 仅保留新 bot 实际依赖的 `clob_client`、`pm_client`、`market_ws`、`killswitch`、

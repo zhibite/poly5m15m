@@ -76,9 +76,20 @@ cp .env.example .env      # 可选；Paper 可以不改
 python -m src.main
 ```
 
-Dashboard：<http://127.0.0.1:8031/>
+Dashboard：<http://127.0.0.1:8031/>（未登录会跳转到 `/login`）
+成交记录：<http://127.0.0.1:8031/trades>
 状态文件：`data/arb_status.json`
 数据库：`data/arb.db`
+
+### 登录与会话
+
+- 登录页：`/login`，中文界面；账号 `ARB_WEB_USERNAME`（默认 `admin`），
+  密码 `ARB_WEB_PASSWORD`（或旧的 `WEB_PASSWORD`）。
+- 登录成功后写入 HttpOnly / SameSite=Lax 会话 Cookie；会话保存在进程内存，
+  `ARB_WEB_SESSION_TTL_S`（默认 604800 秒 = 7 天）后过期；重启/重新部署后需要重新登录。
+- 连续 10 次登录失败（5 分钟窗口）会暂时返回 429。
+- 未设置密码时看板公开，`/login` 会提示先配置 `ARB_WEB_PASSWORD`。
+- 看板、成交记录、登录页均为中文；`/healthz` 和 `/api/health` 不需要登录。
 
 ---
 
@@ -97,9 +108,14 @@ docker compose up -d --build
 
 ```bash
 curl -fsS http://127.0.0.1:8031/healthz
+# 兼容旧配置：
+curl -fsS http://127.0.0.1:8031/api/health
 ```
 
-`/healthz` 不需要认证；`/` 和 `/api/status` 受 `ARB_WEB_PASSWORD` 保护。
+- `/healthz` 和 `/api/health` 不需要认证；
+- `/`、`/trades`、`/api/status` 受 `ARB_WEB_PASSWORD` 保护；
+- **Coolify 健康检查请用 `/healthz` 或 `/api/health`**。不要用 `/`：未登录时 `/` 会 302 到
+  `/login`，Coolify 可能把容器判成 unhealthy。
 
 ---
 

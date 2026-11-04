@@ -15,12 +15,12 @@ import re
 import time
 from datetime import datetime, timezone
 
-from src.arb.config import ArbSettings
-from src.arb.models import ArbMarket, ArbPair
-from src.arb.reference import ReferencePriceService
-from src.arb.store import ArbStore
+from src.config import ArbSettings
+from src.models import ArbMarket, ArbPair
+from src.reference import ReferencePriceService
+from src.store import ArbStore
 from src.infra.logging import get_logger
-from src.market.models import Side
+from src.models import Side
 from src.market.pm_client import PolymarketClient
 
 log = get_logger(__name__)

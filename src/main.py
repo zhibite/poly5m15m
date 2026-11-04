@@ -20,18 +20,18 @@ from __future__ import annotations
 import asyncio
 import signal
 
-from src.arb.books import BookService
-from src.arb.config import arb_settings
-from src.arb.detector import ArbDetector
-from src.arb.discovery import ArbDiscovery
-from src.arb.engine import ArbEngine
-from src.arb.executor import LiveBroker, PairExecutor, PaperBroker
-from src.arb.killswitch import KillSwitch
-from src.arb.reference import ReferencePriceService
-from src.arb.settlement import SettlementWatcher
-from src.arb.store import ArbStore
-from src.arb.web import create_app
-from src.clob_l1_auth import ClobL1Error, create_or_derive_clob_api_creds
+from src.books import BookService
+from src.config import arb_settings
+from src.detector import ArbDetector
+from src.discovery import ArbDiscovery
+from src.engine import ArbEngine
+from src.executor import LiveBroker, PairExecutor, PaperBroker
+from src.killswitch import KillSwitch
+from src.reference import ReferencePriceService
+from src.settlement import SettlementWatcher
+from src.store import ArbStore
+from src.web.app import create_app
+from src.execution.clob_l1_auth import ClobL1Error, create_or_derive_clob_api_creds
 from src.config import credentials
 from src.execution.clob_client import CLOBClient
 from src.infra.logging import configure_logging, get_logger
@@ -201,9 +201,7 @@ async def _run() -> None:
     web_server = None
     if cfg.WEB_ENABLED:
         try:
-            web_server = _DashboardServer.build(
-                create_app(cfg.status_path, cfg), cfg
-            )
+            web_server = _DashboardServer.build(create_app(cfg), cfg)
             web_task = asyncio.create_task(
                 web_server.serve(), name="arb-dashboard"
             )

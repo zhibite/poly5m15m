@@ -5,17 +5,17 @@ import time
 
 import pytest
 
-from src.arb.config import ArbSettings
-from src.arb.detector import ArbDetector
-from src.arb.discovery import (
+from src.config import ArbSettings
+from src.detector import ArbDetector
+from src.discovery import (
     parse_resolution_source,
     parse_strike,
     sources_compatible,
     window_starts,
 )
-from src.arb.fees import taker_fee, walk_asks
-from src.arb.models import ArbMarket, ArbPair, Book, Level, Opportunity
-from src.market.models import Side
+from src.fees import taker_fee, walk_asks
+from src.models import ArbMarket, ArbPair, Book, Level, Opportunity
+from src.models import Side
 
 
 def _market(

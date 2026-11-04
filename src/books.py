@@ -16,8 +16,8 @@ import asyncio
 import time
 from dataclasses import dataclass
 
-from src.arb.config import ArbSettings
-from src.arb.models import Book, Level
+from src.config import ArbSettings
+from src.models import Book, Level
 from src.infra.logging import get_logger
 from src.market.market_ws import MarketWS, PriceCache
 from src.market.pm_client import PolymarketClient

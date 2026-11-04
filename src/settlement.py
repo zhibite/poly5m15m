@@ -21,8 +21,8 @@ import asyncio
 import json
 import time
 
-from src.arb.config import ArbSettings
-from src.arb.store import ArbStore
+from src.config import ArbSettings
+from src.store import ArbStore
 from src.infra.logging import get_logger
 from src.market.pm_client import PolymarketClient
 

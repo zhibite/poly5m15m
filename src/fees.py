@@ -13,7 +13,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from src.arb.models import Level
+from src.models import Level
 
 
 def taker_fee(shares: float, price: float, rate: float) -> float:

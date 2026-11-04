@@ -1,0 +1,120 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>套利看板 - Polymarket 5m/15m</title>
+<link rel="stylesheet" href="/static/style.css?v=__ASSET_VERSION__">
+</head>
+<body>
+<nav>
+  <span class="brand">POLY 5M/15M</span>
+  <a href="/" class="active">看板</a>
+  <a href="/trades">成交记录</a>
+  <div class="nav-right">
+    <span id="live-dot" class="live-dot offline"></span>
+    <span id="live-label">连接中</span>
+    <span id="clock"></span>
+    <span id="auth-area" class="nav-auth"></span>
+  </div>
+</nav>
+
+<div class="container">
+  <div class="page-head">
+    <div>
+      <h1>Polymarket 5m/15m 套利看板</h1>
+      <div class="page-sub">BTC / ETH · 无风险 covered arbitrage</div>
+    </div>
+    <div class="head-meta">
+      <div>模式 <span id="mode" class="pill">—</span></div>
+      <div>状态 <span id="ks" class="pill">—</span></div>
+      <div id="updated" class="muted">—</div>
+    </div>
+  </div>
+
+  <div id="alert-box"></div>
+
+  <div class="stats-row">
+    <div class="stat-card">
+      <div class="stat-label">今日已实现盈亏</div>
+      <div id="pnl-today" class="stat-value">—</div>
+      <div id="fee-rate" class="stat-sub">—</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">持仓数</div>
+      <div id="open-pos" class="stat-value">—</div>
+      <div id="open-cost" class="stat-sub">—</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">机会数</div>
+      <div id="opps" class="stat-value">—</div>
+      <div class="stat-sub">检测到的无风险机会</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">已付手续费</div>
+      <div id="fees-total" class="stat-value">—</div>
+      <div id="fees-today" class="stat-sub">—</div>
+    </div>
+  </div>
+
+  <div class="section">
+    <h2>配对</h2>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>资产</th><th>结束时间</th><th>5m 行权价</th><th>15m 行权价</th>
+            <th>价差 (bps)</th><th>方向</th><th>卖一价和</th><th>模式</th><th>剩余 (秒)</th>
+          </tr>
+        </thead>
+        <tbody id="pairs">
+          <tr><td colspan="9" class="no-data">正在发现市场…</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <div class="section">
+    <h2>最近仓位</h2>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>ID</th><th>资产</th><th>类型</th><th>份数</th>
+            <th>买入成本</th><th>卖出回款</th><th>手续费</th><th>状态</th><th>盈亏</th>
+          </tr>
+        </thead>
+        <tbody id="positions">
+          <tr><td colspan="9" class="no-data">暂无仓位</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <div class="section">
+    <h2>最近机会</h2>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>时间</th><th>资产</th><th>类型</th><th>份数</th>
+            <th>成本</th><th>预估手续费</th><th>保底利润</th><th>边际</th><th>已执行</th>
+          </tr>
+        </thead>
+        <tbody id="opportunities">
+          <tr><td colspan="9" class="no-data">暂无机会</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+</div>
+
+<footer id="health">—</footer>
+
+<script src="/static/arb.js?v=__ASSET_VERSION__"></script>
+<script src="/static/auth-nav.js?v=__ASSET_VERSION__"></script>
+<script>
+  ARB.start([ARB.renderStats, ARB.renderPairs, ARB.renderPositions, ARB.renderOpportunities]);
+</script>
+</body>
+</html>

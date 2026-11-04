@@ -6,9 +6,9 @@ import time
 
 import pytest
 
-from src.arb.config import ArbSettings
-from src.arb.executor import PairExecutor
-from src.arb.models import (
+from src.config import ArbSettings
+from src.executor import PairExecutor
+from src.models import (
     ArbMarket,
     ArbPair,
     Book,
@@ -18,8 +18,8 @@ from src.arb.models import (
     Level,
     Opportunity,
 )
-from src.arb.store import ArbStore
-from src.market.models import Side
+from src.store import ArbStore
+from src.models import Side
 
 
 def _cfg(**overrides) -> ArbSettings:

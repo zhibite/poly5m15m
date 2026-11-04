@@ -9,7 +9,13 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
 
-from src.market.models import Side
+
+class Side(Enum):
+    UP = "UP"
+    DOWN = "DOWN"
+
+    def opposite(self) -> "Side":
+        return Side.DOWN if self == Side.UP else Side.UP
 
 
 class Kind(str, Enum):
