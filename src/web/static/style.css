@@ -310,9 +310,6 @@ dialog.modal[open] { animation: modal-in .18s ease-out; }
   .slug-text { max-width: 142px; }
 }
 
-/* ── Real-time UP/DOWN market cards ─────────────────────────────────── */
-.market-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 16px; }
-.market-grid .price-card { margin-bottom: 0; height: 100%; }
 
 /* ── Config page: select / text / checkbox / readonly ────────────────── */
 .field select, .field input[type=text] {
@@ -354,3 +351,12 @@ dialog.modal[open] { animation: modal-in .18s ease-out; }
   .pair-grid { grid-template-columns: 1fr; }
   .pair-direction { font-size: 16px; }
 }
+
+/* ── Real-time UP/DOWN market list ───────────────────────────────────── */
+.market-table td { vertical-align: top; }
+.market-table .up { color: #34d399; }
+.market-table .down { color: #f87171; }
+.market-table .market-mid { font-size: 18px; font-weight: 700; line-height: 1.2; }
+.market-table .market-mid.up { color: #34d399; }
+.market-table .market-mid.down { color: #f87171; }
+.market-table .market-quote { font-size: 11px; margin-top: 2px; }

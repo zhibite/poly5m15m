@@ -134,11 +134,11 @@
   }
 
   function renderMarkets(s) {
-    const box = $('markets');
-    if (!box) return;
+    const body = $('markets');
+    if (!body) return;
     const markets = s.markets || [];
     if (!markets.length) {
-      box.innerHTML = '<div class="no-data">暂无实时行情</div>';
+      body.innerHTML = '<tr><td colspan="5" class="no-data">暂无实时行情</td></tr>';
       return;
     }
     const price = (v) => (v === null || v === undefined) ? '—' : Number(v).toFixed(4);
@@ -153,27 +153,22 @@
         age: (q.age === null || q.age === undefined) ? '—' : Number(q.age).toFixed(1),
       };
     };
-    box.innerHTML = markets.map((m) => {
+    body.innerHTML = markets.map((m) => {
       const up = quote(m.up);
       const down = quote(m.down);
-      return `<div class="price-card">
-        <div class="price-head">
-          <span class="price-title">${esc(m.asset)} ${esc(m.interval)} · ${esc(m.start_utc)}–${esc(m.end_utc)}</span>
-          <span class="muted">ask 更新 ${up.age}s / ${down.age}s</span>
-        </div>
-        <div class="tokens">
-          <div class="token-item up">
-            <div class="token-label">UP</div>
-            <div class="token-price">${up.mid}</div>
-            <div class="muted mono">买 ${up.bid} / 卖 ${up.ask} · 最新 ${up.last}</div>
-          </div>
-          <div class="token-item down">
-            <div class="token-label">DOWN</div>
-            <div class="token-price">${down.mid}</div>
-            <div class="muted mono">买 ${down.bid} / 卖 ${down.ask} · 最新 ${down.last}</div>
-          </div>
-        </div>
-      </div>`;
+      return `<tr>
+        <td><b>${esc(m.asset)}</b> <span class="muted">${esc(m.interval)}</span></td>
+        <td class="muted">${esc(m.start_utc)}–${esc(m.end_utc)}</td>
+        <td>
+          <div class="market-mid up">${up.mid}</div>
+          <div class="muted market-quote">买 ${up.bid} / 卖 ${up.ask} · 最新 ${up.last}</div>
+        </td>
+        <td>
+          <div class="market-mid down">${down.mid}</div>
+          <div class="muted market-quote">买 ${down.bid} / 卖 ${down.ask} · 最新 ${down.last}</div>
+        </td>
+        <td class="muted">ask ${up.age}s / ${down.age}s</td>
+      </tr>`;
     }).join('');
   }
 
