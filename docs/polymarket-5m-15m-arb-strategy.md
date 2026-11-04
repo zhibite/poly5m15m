@@ -468,12 +468,17 @@ src/settlement.py           Gamma 结算 + invariant
 src/store.py                SQLite：markets/pairs/opportunities/positions/fills/settlements
 src/engine.py               discovery / trading / status 三个循环
 src/killswitch.py           文件式 kill switch
+src/runtime_config.py       配置页可改参数 + data/runtime_config.json
 src/status.py               原子写 data/arb_status.json
-src/web/                    FastAPI + 中文模板/静态资源 + 登录页
+src/web/                    FastAPI + 中文看板/成交记录/登录/配置页
 src/market/                 pm_client / market_ws
 src/execution/              clob_client / clob_l1_auth
 src/infra/                  structlog
 ```
+
+看板首页会展示当前 BTC/ETH 5m/15m 市场的 UP/DOWN 买一/卖一/中间价/最新成交；
+`/config` 支持运行时修改风控、手续费、配对、执行和循环参数，并持久化到
+`data/runtime_config.json`。模式、资产、端口、路径等系统项只读，需重启生效。
 
 复用底层：
 

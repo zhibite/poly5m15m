@@ -78,8 +78,30 @@ python -m src.main
 
 Dashboard：<http://127.0.0.1:8031/>（未登录会跳转到 `/login`）
 成交记录：<http://127.0.0.1:8031/trades>
+运行配置：<http://127.0.0.1:8031/config>
 状态文件：`data/arb_status.json`
 数据库：`data/arb.db`
+运行时配置覆盖：`data/runtime_config.json`
+
+### 看板实时价格
+
+首页顶部展示 BTC / ETH 当前 5m / 15m 市场的 **UP / DOWN 买一、卖一、中间价、最新成交**。
+数据来自 CLOB 行情 WS；ask 超过 `MAX_QUOTE_AGE_S` 未更新时页面会显示报价年龄，
+引擎会回退 REST 深度，不会用旧价格成交。
+
+### 配置页
+
+`/config`（登录后）可以修改：
+
+- 风控 / 仓位：单对份数、单对成本、最大持仓、当日亏损等
+- 手续费 / 边际：taker 费率、缓冲、最小保底利润
+- 配对 / Strike：strike 来源、最小间距、报价年龄、结算前停止时间
+- 执行：腿风险策略、unwind 重试、滑点、两腿/四腿开关
+- 循环：tick、发现、结算轮询、状态写入间隔
+
+保存后写入 `data/runtime_config.json`，对当前进程**立即生效**，重启后继续应用。
+模式、资产、端口、DB/状态路径、MarketWS 等系统项显示为只读，需修改环境变量并重启。
+配置页还提供 **停止开新仓 / 恢复运行**，等价于写入/删除 `data/arb_emergency_stop.json`。
 
 ### 登录与会话
 

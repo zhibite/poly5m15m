@@ -22,7 +22,7 @@ from src.config import ArbSettings
 from src.detector import ArbDetector
 from src.discovery import ArbDiscovery, window_starts
 from src.executor import PairExecutor
-from src.models import ArbMarket, ArbPair, Opportunity
+from src.models import ArbMarket, ArbPair, Opportunity, Side
 from src.reference import ReferencePriceService
 from src.settlement import SettlementWatcher
 from src.status import atomic_write_json
@@ -377,17 +377,80 @@ class ArbEngine:
     def _write_status(self) -> None:
         now = time.time()
         pairs = []
+        fee_rate = float(self._cfg.FEE_RATE)
+        buffer_pct = float(self._cfg.FEE_BUFFER_PCT)
+        buffer_usd = float(self._cfg.FEE_BUFFER_USD)
+        nominal_shares = max(1.0, float(self._cfg.MIN_SHARES_PER_PAIR))
         for pair in sorted(self._pairs.values(), key=lambda p: p.end_ts):
-            ask_5 = ask_15 = ask_sum = None
-            if pair.direction_5m and pair.direction_15m:
-                token5 = pair.m5.token_for(pair.direction_5m)
-                token15 = pair.m15.token_for(pair.direction_15m)
-                bbo = self._books.bbo([token5, token15])
-                b5, b15 = bbo.get(token5), bbo.get(token15)
-                ask_5 = b5.ask if b5 else None
-                ask_15 = b15.ask if b15 else None
-                if ask_5 and ask_15:
-                    ask_sum = round(ask_5 + ask_15, 4)
+            tokens = [
+                pair.m5.token_up,
+                pair.m5.token_down,
+                pair.m15.token_up,
+                pair.m15.token_down,
+            ]
+            bbo = self._books.bbo(tokens)
+
+            def _ask(token: str) -> float | None:
+                quote = bbo.get(token)
+                if quote is None or not quote.ask or quote.ask <= 0:
+                    return None
+                return quote.ask
+
+            up5 = _ask(pair.m5.token_up)
+            down5 = _ask(pair.m5.token_down)
+            up15 = _ask(pair.m15.token_up)
+            down15 = _ask(pair.m15.token_down)
+
+            side5 = pair.direction_5m
+            side15 = pair.direction_15m
+            ask5 = (
+                up5 if side5 == Side.UP
+                else down5 if side5 == Side.DOWN
+                else None
+            )
+            ask15 = (
+                up15 if side15 == Side.UP
+                else down15 if side15 == Side.DOWN
+                else None
+            )
+            ask_sum = (
+                round(ask5 + ask15, 4)
+                if ask5 is not None and ask15 is not None
+                else None
+            )
+
+            def _fee(a: float | None, b: float | None) -> float | None:
+                if a is None or b is None:
+                    return None
+                return fee_rate * (a * (1.0 - a) + b * (1.0 - b))
+
+            def _required(payoff: float, fee: float | None) -> float | None:
+                if fee is None:
+                    return None
+                buffered = fee * (1.0 + buffer_pct) + buffer_usd / nominal_shares
+                return round(payoff - buffered, 6)
+
+            fee2 = _fee(ask5, ask15)
+            required2 = _required(1.0, fee2)
+            gap2 = (
+                round(ask_sum - required2, 6)
+                if ask_sum is not None and required2 is not None
+                else None
+            )
+
+            complete_sum = None
+            complete_fee = None
+            complete_required = None
+            complete_gap = None
+            if all(v is not None for v in (up5, down5, up15, down15)):
+                complete_sum = round(up5 + down5 + up15 + down15, 4)
+                complete_fee = fee_rate * sum(
+                    v * (1.0 - v) for v in (up5, down5, up15, down15)
+                )
+                complete_required = _required(2.0, complete_fee)
+                if complete_required is not None:
+                    complete_gap = round(complete_sum - complete_required, 6)
+
             pairs.append(
                 {
                     "asset": pair.asset,
@@ -399,19 +462,49 @@ class ArbEngine:
                     "strike_15m": pair.strike_15m,
                     "gap_bps": pair.gap_bps,
                     "direction": (
-                        f"{pair.direction_5m.value}/{pair.direction_15m.value}"
-                        if pair.direction_5m and pair.direction_15m
+                        f"{side5.value}/{side15.value}"
+                        if side5 and side15
                         else None
                     ),
-                    "ask_5m": ask_5,
-                    "ask_15m": ask_15,
+                    "side_5m": side5.value if side5 else None,
+                    "side_15m": side15.value if side15 else None,
+                    "ask_up_5m": up5,
+                    "ask_down_5m": down5,
+                    "ask_up_15m": up15,
+                    "ask_down_15m": down15,
+                    "ask_5m": ask5,
+                    "ask_15m": ask15,
                     "ask_sum": ask_sum,
+                    "fee_2leg": round(fee2, 6) if fee2 is not None else None,
+                    "required_2leg": required2,
+                    "gap_2leg": gap2,
+                    "complete_ask_sum": complete_sum,
+                    "complete_fee": (
+                        round(complete_fee, 6)
+                        if complete_fee is not None
+                        else None
+                    ),
+                    "complete_required": complete_required,
+                    "complete_gap": complete_gap,
                     "ready": pair.ready,
                     "complete_ready": pair.markets_ready,
                     "reason": pair.reason,
                     "seconds_left": round(pair.seconds_left(now), 1),
                 }
             )
+
+        markets = []
+        for market in sorted(
+            self._current.values(),
+            key=lambda m: (
+                m.asset != "BTC",
+                m.asset,
+                0 if m.interval == "5m" else 1,
+            ),
+        ):
+            if market.end_ts < now - 1:
+                continue
+            markets.append(self._market_payload(market, now))
 
         opportunities = []
         for row in self._store.recent_opportunities(20):
@@ -476,6 +569,7 @@ class ArbEngine:
                 else {"active": False}
             ),
             "pairs": pairs,
+            "markets": markets,
             "positions": positions,
             "fills": fills,
             "opportunities": opportunities,
@@ -492,6 +586,48 @@ class ArbEngine:
             },
         }
         atomic_write_json(self._cfg.status_path, payload)
+
+    def _market_payload(self, market, now: float) -> dict:
+        """UP/DOWN best bid/ask/mid/last for one active 5m/15m market."""
+        bbo = self._books.bbo([market.token_up, market.token_down])
+
+        def side(token: str) -> dict:
+            quote = bbo.get(token)
+            if quote is None:
+                return {
+                    "bid": None, "ask": None, "mid": None,
+                    "last": None, "age": None,
+                }
+            mid = None
+            if quote.bid and quote.ask:
+                mid = (quote.bid + quote.ask) / 2.0
+            return {
+                "bid": quote.bid,
+                "ask": quote.ask,
+                "mid": mid,
+                "last": self._books.last_price(token),
+                "age": (
+                    round(quote.ask_age(now), 2)
+                    if quote.ask_ts > 0
+                    else None
+                ),
+            }
+
+        return {
+            "asset": market.asset,
+            "interval": market.interval,
+            "slug": market.slug,
+            "start_ts": market.start_ts,
+            "end_ts": market.end_ts,
+            "start_utc": datetime.fromtimestamp(
+                market.start_ts, tz=timezone.utc
+            ).strftime("%H:%M"),
+            "end_utc": datetime.fromtimestamp(
+                market.end_ts, tz=timezone.utc
+            ).strftime("%H:%M"),
+            "up": side(market.token_up),
+            "down": side(market.token_down),
+        }
 
     def _books_connected(self) -> bool:
         return bool(getattr(self._books, "ws_connected", False))

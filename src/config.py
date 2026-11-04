@@ -232,4 +232,13 @@ class ArbSettings(BaseSettings):
 
 @lru_cache(maxsize=1)
 def arb_settings() -> ArbSettings:
-    return ArbSettings()
+    cfg = ArbSettings()
+    # Persisted config-page overrides are applied once, after env/TOML, so
+    # they survive a redeploy without editing Coolify variables.
+    try:
+        from src.runtime_config import apply_overrides
+
+        apply_overrides(cfg)
+    except Exception:  # noqa: BLE001
+        pass
+    return cfg

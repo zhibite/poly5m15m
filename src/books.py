@@ -116,6 +116,13 @@ class BookService:
         ts = float(self._cache.bbo_ts.get(token, 0.0))
         return float("inf") if ts <= 0 else max(0.0, time.time() - ts)
 
+    def last_price(self, token: str) -> float | None:
+        """Last WS trade price, if one has been observed for this token."""
+        if self._cache is None:
+            return None
+        value = self._cache.last_trade_price.get(token, 0.0)
+        return value if value > 0 else None
+
     # ── REST snapshots ──────────────────────────────────────────────────
     async def fetch_books(
         self, tokens: list[str], *, max_age: float = 0.0

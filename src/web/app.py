@@ -20,14 +20,17 @@ from __future__ import annotations
 import hashlib
 import json
 from pathlib import Path
+from typing import Any
 
 from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
+from src import runtime_config
 from src.config import ArbSettings, arb_settings
 from src.infra.logging import get_logger
+from src.killswitch import KillSwitch
 from src.web import auth
 
 log = get_logger(__name__)
@@ -55,6 +58,10 @@ ASSET_VERSION = _asset_version()
 class LoginPayload(BaseModel):
     username: str = ""
     password: str = ""
+
+
+class ConfigUpdate(BaseModel):
+    values: dict[str, Any] = {}
 
 
 def _safe_next(value: str | None) -> str:
@@ -201,10 +208,61 @@ def create_app(cfg: ArbSettings | None = None) -> FastAPI:
             return redirect
         return _render("trades.html")
 
+    @app.get("/config", response_class=HTMLResponse)
+    async def config_page(request: Request):
+        redirect = _login_redirect(request)
+        if redirect is not None:
+            return redirect
+        return _render("config.html")
+
     # ── API ─────────────────────────────────────────────────────────────
     @app.get("/api/status")
     async def api_status(request: Request) -> dict:
         _require_api_auth(request)
         return _load_status(status_path)
+
+    @app.get("/api/config")
+    async def api_get_config(request: Request) -> dict:
+        _require_api_auth(request)
+        return runtime_config.config_payload(cfg)
+
+    @app.post("/api/config")
+    async def api_update_config(
+        payload: ConfigUpdate, request: Request
+    ) -> dict:
+        _require_api_auth(request)
+        try:
+            updated, restart = runtime_config.update_config(cfg, payload.values)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except Exception as exc:  # noqa: BLE001
+            log.exception("web.config_save_failed", error=str(exc))
+            raise HTTPException(status_code=500, detail="配置保存失败") from exc
+        return {
+            "updated": updated,
+            "restart_required": restart,
+            "config": runtime_config.config_payload(cfg),
+        }
+
+    @app.get("/api/control")
+    async def api_control(request: Request) -> dict:
+        _require_api_auth(request)
+        return KillSwitch.load(cfg.killswitch_path).snapshot()
+
+    @app.post("/api/control/stop")
+    async def api_control_stop(request: Request) -> dict:
+        _require_api_auth(request)
+        switch = KillSwitch.load(cfg.killswitch_path)
+        switch.engage("dashboard")
+        log.warning("web.control.stop", reason=switch.reason)
+        return switch.snapshot()
+
+    @app.post("/api/control/start")
+    async def api_control_start(request: Request) -> dict:
+        _require_api_auth(request)
+        switch = KillSwitch.load(cfg.killswitch_path)
+        switch.release()
+        log.warning("web.control.start")
+        return switch.snapshot()
 
     return app

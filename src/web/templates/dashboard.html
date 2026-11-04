@@ -11,6 +11,7 @@
   <span class="brand">POLY 5M/15M</span>
   <a href="/" class="active">看板</a>
   <a href="/trades">成交记录</a>
+  <a href="/config">配置</a>
   <div class="nav-right">
     <span id="live-dot" class="live-dot offline"></span>
     <span id="live-label">连接中</span>
@@ -58,19 +59,18 @@
   </div>
 
   <div class="section">
-    <h2>配对</h2>
-    <div class="table-wrap">
-      <table>
-        <thead>
-          <tr>
-            <th>资产</th><th>结束时间</th><th>5m 行权价</th><th>15m 行权价</th>
-            <th>价差 (bps)</th><th>方向</th><th>卖一价和</th><th>模式</th><th>剩余 (秒)</th>
-          </tr>
-        </thead>
-        <tbody id="pairs">
-          <tr><td colspan="9" class="no-data">正在发现市场…</td></tr>
-        </tbody>
-      </table>
+    <h2>BTC / ETH 5m / 15m UP/DOWN 实时价格</h2>
+    <div id="markets" class="market-grid">
+      <div class="no-data">正在加载行情…</div>
+    </div>
+  </div>
+
+  <div class="section">
+    <h2>配对信号
+      <span class="muted" style="font-size:11px;font-weight:400">卖一价和 ≤ 触发线 才可下单；触发线已含手续费估算</span>
+    </h2>
+    <div id="pairs" class="pair-grid">
+      <div class="no-data">正在发现市场…</div>
     </div>
   </div>
 
@@ -114,7 +114,7 @@
 <script src="/static/arb.js?v=__ASSET_VERSION__"></script>
 <script src="/static/auth-nav.js?v=__ASSET_VERSION__"></script>
 <script>
-  ARB.start([ARB.renderStats, ARB.renderPairs, ARB.renderPositions, ARB.renderOpportunities]);
+  ARB.start([ARB.renderStats, ARB.renderMarkets, ARB.renderPairs, ARB.renderPositions, ARB.renderOpportunities]);
 </script>
 </body>
 </html>

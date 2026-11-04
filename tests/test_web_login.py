@@ -88,12 +88,19 @@ def test_login_dashboard_trades_and_logout(tmp_path):
     page = client.get("/")
     assert page.status_code == 200
     assert "套利看板" in page.text
+    assert "UP/DOWN 实时价格" in page.text
+    assert "配对信号" in page.text
     assert "最近仓位" in page.text
 
     trades = client.get("/trades")
     assert trades.status_code == 200
     assert "成交记录" in trades.text
     assert "最近成交" in trades.text
+
+    config = client.get("/config")
+    assert config.status_code == 200
+    assert "运行配置" in config.text
+    assert "保存配置" in config.text
 
     status = client.get("/api/status")
     assert status.status_code == 200

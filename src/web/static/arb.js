@@ -133,23 +133,139 @@
     text('fee-rate', '费率 ' + (s.fee_rate ?? '—'));
   }
 
+  function renderMarkets(s) {
+    const box = $('markets');
+    if (!box) return;
+    const markets = s.markets || [];
+    if (!markets.length) {
+      box.innerHTML = '<div class="no-data">暂无实时行情</div>';
+      return;
+    }
+    const price = (v) => (v === null || v === undefined) ? '—' : Number(v).toFixed(4);
+    const quote = (q) => {
+      q = q || {};
+      const mid = (q.bid && q.ask) ? (q.bid + q.ask) / 2 : q.mid;
+      return {
+        mid: price(mid),
+        bid: price(q.bid),
+        ask: price(q.ask),
+        last: price(q.last),
+        age: (q.age === null || q.age === undefined) ? '—' : Number(q.age).toFixed(1),
+      };
+    };
+    box.innerHTML = markets.map((m) => {
+      const up = quote(m.up);
+      const down = quote(m.down);
+      return `<div class="price-card">
+        <div class="price-head">
+          <span class="price-title">${esc(m.asset)} ${esc(m.interval)} · ${esc(m.start_utc)}–${esc(m.end_utc)}</span>
+          <span class="muted">ask 更新 ${up.age}s / ${down.age}s</span>
+        </div>
+        <div class="tokens">
+          <div class="token-item up">
+            <div class="token-label">UP</div>
+            <div class="token-price">${up.mid}</div>
+            <div class="muted mono">买 ${up.bid} / 卖 ${up.ask} · 最新 ${up.last}</div>
+          </div>
+          <div class="token-item down">
+            <div class="token-label">DOWN</div>
+            <div class="token-price">${down.mid}</div>
+            <div class="muted mono">买 ${down.bid} / 卖 ${down.ask} · 最新 ${down.last}</div>
+          </div>
+        </div>
+      </div>`;
+    }).join('');
+  }
+
+  const sideText = (v) => v === 'UP' ? '涨' : v === 'DOWN' ? '跌' : '—';
+  const fmtPrice = (v) => (v === null || v === undefined || isNaN(v))
+    ? '—'
+    : Number(v).toLocaleString(undefined, {
+        minimumFractionDigits: 2, maximumFractionDigits: 2
+      });
+
+  function meter(label, sum, required, fee) {
+    if (sum === null || sum === undefined || required === null || required === undefined) {
+      return `<div class="pair-meter">
+        <div class="meter-label"><span>${esc(label)}</span><span class="muted">行情不足</span></div>
+      </div>`;
+    }
+    const good = sum <= required;
+    const gap = sum - required;
+    const lo = required - 0.05;
+    const hi = required + 0.05;
+    const pct = Math.max(0, Math.min(100, ((sum - lo) / (hi - lo)) * 100));
+    const feeText = (fee === null || fee === undefined)
+      ? ''
+      : `手续费≈${(fee * 100).toFixed(1)}¢/份`;
+    return `<div class="pair-meter">
+      <div class="meter-label">
+        <span>${esc(label)} <span class="muted">${esc(feeText)}</span></span>
+        <b class="${good ? 'green' : 'red'}">${num(sum, 4)}</b>
+      </div>
+      <div class="meter-track">
+        <div class="meter-fill ${good ? 'good' : ''}" style="width:${pct}%"></div>
+        <div class="meter-threshold"></div>
+      </div>
+      <div class="meter-foot">
+        <span>触发线 ≤ ${num(required, 4)}</span>
+        <span class="${good ? 'green' : 'red'}">${good
+          ? '已低于触发线 ' + num(Math.abs(gap), 4)
+          : '还差 ' + num(gap, 4)}</span>
+      </div>
+    </div>`;
+  }
+
   function renderPairs(s) {
-    const body = $('pairs');
-    if (!body) return;
+    const box = $('pairs');
+    if (!box) return;
     const pairs = s.pairs || [];
-    body.innerHTML = pairs.length ? pairs.map((p) => {
-      const modes = [];
-      if (p.ready) modes.push('两腿');
-      if (p.complete_ready) modes.push('四腿');
-      const modeCell = modes.length
-        ? pill(modes.join('+'), 'filled')
-        : pill(REASON[p.reason] || '未就绪', 'pending');
-      return row([
-        esc(p.asset), esc(p.end_utc), num(p.strike_5m, 2), num(p.strike_15m, 2),
-        num(p.gap_bps, 1), esc(direction(p.direction)), num(p.ask_sum, 3),
-        modeCell, num(p.seconds_left, 0)
-      ]);
-    }).join('') : empty(9, '暂无配对');
+    if (!pairs.length) {
+      box.innerHTML = '<div class="no-data">暂无配对窗口（每 15 分钟最后 5 分钟出现）</div>';
+      return;
+    }
+    box.innerHTML = pairs.map((p) => {
+      const badges = [];
+      if (p.ready) badges.push(pill('两腿就绪', 'filled'));
+      if (p.complete_ready) badges.push(pill('四腿就绪', 'watching'));
+      if (!badges.length) badges.push(pill(REASON[p.reason] || '未就绪', 'pending'));
+
+      const side5 = sideText(p.side_5m);
+      const side15 = sideText(p.side_15m);
+      const direction = (p.side_5m && p.side_15m)
+        ? `买 <b>5m ${side5}</b> + <b>15m ${side15}</b>`
+        : '<span class="muted">方向待定（缺少 strike）</span>';
+
+      const legs = [];
+      if (p.ask_5m !== null && p.ask_5m !== undefined) {
+        legs.push(`<span class="pill ${p.side_5m === 'UP' ? 'buy' : 'sell'}">5m ${side5} · ask ${num(p.ask_5m, 3)}</span>`);
+      }
+      if (p.ask_15m !== null && p.ask_15m !== undefined) {
+        legs.push(`<span class="pill ${p.side_15m === 'UP' ? 'buy' : 'sell'}">15m ${side15} · ask ${num(p.ask_15m, 3)}</span>`);
+      }
+
+      return `<div class="pair-card">
+        <div class="pair-top">
+          <span class="pair-title">${esc(p.asset)} · 5m × 15m</span>
+          <span>${badges.join(' ')}</span>
+        </div>
+        <div class="pair-direction">${direction}</div>
+        <div class="pair-meta">
+          <span>结束 <b>${esc(p.end_utc)}</b></span>
+          <span>剩余 <b>${num(p.seconds_left, 0)}s</b></span>
+          <span>strike 间距 <b>${num(p.gap_bps, 1)} bps</b></span>
+        </div>
+        ${meter('两腿卖一价和', p.ask_sum, p.required_2leg, p.fee_2leg)}
+        ${p.complete_ask_sum !== null && p.complete_ask_sum !== undefined
+          ? meter('四腿完整组合价和', p.complete_ask_sum, p.complete_required, p.complete_fee)
+          : ''}
+        <div class="pair-strikes">
+          <span>5m 行权价 <b>${fmtPrice(p.strike_5m)}</b></span>
+          <span>15m 行权价 <b>${fmtPrice(p.strike_15m)}</b></span>
+        </div>
+        <div class="pair-legs">${legs.join('') || '<span class="muted">暂无方向腿报价</span>'}</div>
+      </div>`;
+    }).join('');
   }
 
   function renderPositions(s) {
@@ -215,6 +331,7 @@
   window.ARB = {
     start,
     renderStats,
+    renderMarkets,
     renderPairs,
     renderPositions,
     renderFills,

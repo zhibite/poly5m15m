@@ -309,3 +309,48 @@ dialog.modal[open] { animation: modal-in .18s ease-out; }
   .slug-cell { width: 170px; max-width: 170px; }
   .slug-text { max-width: 142px; }
 }
+
+/* ── Real-time UP/DOWN market cards ─────────────────────────────────── */
+.market-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 16px; }
+.market-grid .price-card { margin-bottom: 0; height: 100%; }
+
+/* ── Config page: select / text / checkbox / readonly ────────────────── */
+.field select, .field input[type=text] {
+  background: #12122a; border: 1px solid #2a2a4a; color: #e0e0e0;
+  border-radius: 6px; padding: 8px 10px; font-size: 14px; width: 100%;
+}
+.field select:focus, .field input[type=text]:focus {
+  outline: none; border-color: #7c3aed;
+}
+.field input[type=checkbox] {
+  width: 18px; height: 18px; accent-color: #7c3aed;
+}
+.field.readonly input, .field.readonly select {
+  opacity: .55; cursor: not-allowed;
+}
+
+/* ── Pair signal cards ───────────────────────────────────────────────── */
+.pair-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(380px, 1fr)); gap: 16px; }
+.pair-grid .no-data { grid-column: 1 / -1; }
+.pair-card { background: #0a0a14; border: 1px solid #1e1e3a; border-radius: 10px; padding: 16px; }
+.pair-top { display: flex; justify-content: space-between; align-items: center; gap: 10px; }
+.pair-title { font-size: 15px; font-weight: 700; }
+.pair-direction { margin-top: 8px; font-size: 18px; font-weight: 700; color: #e0e0e0; }
+.pair-direction b { color: #a78bfa; }
+.pair-meta { display: flex; flex-wrap: wrap; gap: 6px 16px; margin-top: 6px; font-size: 12px; color: #6b7280; }
+.pair-meta b { color: #c9c9d6; font-weight: 600; font-variant-numeric: tabular-nums; }
+.pair-meter { margin-top: 12px; }
+.meter-label { display: flex; justify-content: space-between; gap: 12px; font-size: 12px; color: #9ca3af; }
+.meter-label b { font-variant-numeric: tabular-nums; }
+.meter-track { position: relative; height: 8px; margin-top: 6px; background: #1e1e3a; border-radius: 4px; overflow: hidden; }
+.meter-fill { height: 100%; background: #ef4444; transition: width .4s ease; }
+.meter-fill.good { background: #10b981; }
+.meter-threshold { position: absolute; left: 50%; top: -3px; bottom: -3px; width: 2px; background: #a78bfa; }
+.meter-foot { display: flex; justify-content: space-between; gap: 12px; margin-top: 5px; font-size: 11px; color: #6b7280; }
+.pair-strikes { display: flex; flex-wrap: wrap; gap: 6px 18px; margin-top: 10px; font-size: 12px; color: #9ca3af; }
+.pair-strikes b { color: #e0e0e0; font-variant-numeric: tabular-nums; }
+.pair-legs { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px; }
+@media (max-width: 760px) {
+  .pair-grid { grid-template-columns: 1fr; }
+  .pair-direction { font-size: 16px; }
+}
